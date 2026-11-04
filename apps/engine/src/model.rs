@@ -91,7 +91,11 @@ impl KvCache {
         // dims. The host path keeps f32 entries because its attention reads the
         // cache as plain slices.
         let device = compute.device_name().is_some();
-        let slots = if device { per_layer.div_ceil(2) } else { per_layer };
+        let slots = if device {
+            per_layer.div_ceil(2)
+        } else {
+            per_layer
+        };
         let mut keys = Vec::with_capacity(config.n_layers);
         let mut values = Vec::with_capacity(config.n_layers);
         for _ in 0..config.n_layers {
@@ -315,7 +319,8 @@ impl<'a> Model<'a> {
                 )));
             }
         }
-        self.compute.embeddings(&self.token_embd, tokens, &mut x, 0)?;
+        self.compute
+            .embeddings(&self.token_embd, tokens, &mut x, 0)?;
 
         let mut scratch = Scratch::new(&self.compute, config, n)?;
         for (index, layer) in self.layers.iter().enumerate() {
@@ -393,31 +398,20 @@ impl<'a> Model<'a> {
             n,
         )?;
 
-        self.compute.rope(
+        // q, k and v leave the projections together: the query is rotated in
+        // place, the key is rotated into the cache, and the value is copied
+        // beside it, all in one launch.
+        self.compute.rope_append(
             &mut scratch.q,
-            0,
+            &mut scratch.k,
+            &scratch.v,
+            &mut kv.keys[index],
+            &mut kv.values[index],
             rope,
             n,
             config.n_head,
-            config.head_dim,
-            start,
-        )?;
-        self.compute.rope(
-            &mut scratch.k,
-            0,
-            rope,
-            n,
             config.n_head_kv,
             config.head_dim,
-            start,
-        )?;
-        self.compute.kv_append(
-            &mut kv.keys[index],
-            &mut kv.values[index],
-            &scratch.k,
-            &scratch.v,
-            n,
-            kv_dim,
             start,
         )?;
 
@@ -442,8 +436,16 @@ impl<'a> Model<'a> {
             n,
         )?;
 
-        self.compute
-            .matmul_add(&layer.wo, &scratch.attn, 0, None, n, x, 0, &mut scratch.projected)?;
+        self.compute.matmul_add(
+            &layer.wo,
+            &scratch.attn,
+            0,
+            None,
+            n,
+            x,
+            0,
+            &mut scratch.projected,
+        )?;
 
         let normed = self.compute.norm_prepare(
             x,

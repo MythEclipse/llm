@@ -355,18 +355,11 @@ impl Compute {
                 return gpu.matmul_decode_group(&entries, source, x_offset, k, None);
             }
             if let Some(buffer) = prepared.buffer.as_ref() {
-                return gpu.matmul_prompt_group(&entries, buffer, n, k);
+                return gpu.matmul_prompt_group(&entries, buffer, n, k, None);
             }
         }
         for member in members.iter_mut() {
-            self.matmul(
-                member.weight,
-                x,
-                x_offset,
-                n,
-                member.out,
-                member.out_offset,
-            )?;
+            self.matmul(member.weight, x, x_offset, n, member.out, member.out_offset)?;
         }
         Ok(())
     }
@@ -445,10 +438,12 @@ impl Compute {
         y_offset: usize,
         temp: &mut Activation,
     ) -> Result<(), EngineError> {
+        // The residual add rides in the matmul epilogue on every device path,
+        // decode and prompt alike: writing the product to a scratch buffer and
+        // adding it afterwards costs a second pass over the whole hidden state.
         if let (Some(gpu), Activation::Device(source), Activation::Device(target)) =
             (&self.gpu, x, &mut *y)
             && weight.dtype == DType::Q8_0
-            && n == 1
         {
             let pointer = target.pointer();
             return gpu.matmul(
@@ -549,6 +544,62 @@ impl Compute {
             }
             _ => unreachable!("activation belongs to the other backend"),
         }
+    }
+
+    /// RoPE on the query, RoPE on the key written straight into the cache, and
+    /// the value copied beside it. One launch on the device; the host backend
+    /// runs the same three passes it would have run anyway.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_append(
+        &self,
+        query: &mut Activation,
+        key: &mut Activation,
+        value: &Activation,
+        keys: &mut Activation,
+        values: &mut Activation,
+        table: &RopeTable,
+        tokens: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        start: usize,
+    ) -> Result<(), EngineError> {
+        if let (
+            Some(gpu),
+            Activation::Device(query),
+            Activation::Device(key),
+            Activation::Device(value),
+            Activation::Device(keys),
+            Activation::Device(values),
+        ) = (
+            &self.gpu,
+            &mut *query,
+            &mut *key,
+            value,
+            &mut *keys,
+            &mut *values,
+        ) {
+            let kv_dim = n_head_kv * head_dim;
+            return gpu.rope_append(
+                query,
+                key,
+                value,
+                keys,
+                values,
+                tokens,
+                n_head,
+                n_head_kv,
+                head_dim,
+                table.n_rot(),
+                table.base(),
+                start,
+                kv_dim,
+            );
+        }
+        let kv_dim = n_head_kv * head_dim;
+        self.rope(query, 0, table, tokens, n_head, head_dim, start)?;
+        self.rope(key, 0, table, tokens, n_head_kv, head_dim, start)?;
+        self.kv_append(keys, values, key, value, tokens, kv_dim, start)
     }
 
     #[allow(clippy::too_many_arguments)]

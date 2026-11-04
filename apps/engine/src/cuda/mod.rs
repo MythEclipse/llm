@@ -15,11 +15,11 @@ use std::sync::Mutex;
 use half::f16;
 
 use sys::{
-    ATTRIBUTE_MULTIPROCESSORS, Context, Device, DevicePtr, Event, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED,
-    Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet,
-    cuDeviceGetAttribute, cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy,
-    cuEventElapsedTime, cuEventRecord,
-    cuCtxSynchronize, cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
+    ATTRIBUTE_MULTIPROCESSORS, Context, Device, DevicePtr, Event,
+    FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2,
+    cuCtxSetCurrent, cuCtxSynchronize, cuDeviceGet, cuDeviceGetAttribute, cuDeviceGetName,
+    cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy, cuEventElapsedTime, cuEventRecord,
+    cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
     cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
     error_message,
 };
@@ -128,6 +128,7 @@ struct Kernels {
     fill_f32: Function,
     axpby_f32: Function,
     rope: Function,
+    rope_append: Function,
     kv_append: Function,
     attention: Function,
     attention_prefill: Function,
@@ -206,11 +207,7 @@ impl Gpu {
 
             let mut multiprocessors = 0i32;
             check(
-                cuDeviceGetAttribute(
-                    &raw mut multiprocessors,
-                    ATTRIBUTE_MULTIPROCESSORS,
-                    device,
-                ),
+                cuDeviceGetAttribute(&raw mut multiprocessors, ATTRIBUTE_MULTIPROCESSORS, device),
                 "cuDeviceGetAttribute",
             )?;
 
@@ -245,6 +242,7 @@ impl Gpu {
                 fill_f32: load("fill_f32")?,
                 axpby_f32: load("axpby_f32")?,
                 rope: load("rope")?,
+                rope_append: load("rope_append")?,
                 kv_append: load("kv_append")?,
                 attention: load("attention")?,
                 attention_prefill: reserve_shared(
@@ -414,8 +412,8 @@ impl Gpu {
                     &owned
                 }
             };
-            // A single matrix is a group of one; the bias never reaches the
-            // prompt path, which keeps its residual add as a separate pass.
+            // A single matrix is a group of one, so the residual add fits in the
+            // epilogue instead of costing a separate pass over the hidden state.
             return self.matmul_prompt_group(
                 &[GroupEntry {
                     identity,
@@ -427,6 +425,7 @@ impl Gpu {
                 prepared,
                 n,
                 k,
+                bias,
             );
         }
         let (scales, quants) = self.quantized(identity, weights)?;
@@ -581,6 +580,7 @@ impl Gpu {
     }
 
     /// Computes `y = alpha*y + beta*x` for a contiguous f32 range.
+    #[allow(clippy::too_many_arguments)]
     pub fn axpby_f32(
         &self,
         y: &DeviceBuffer,
@@ -633,6 +633,52 @@ impl Gpu {
         ];
         self.launch(
             self.kernels.rope,
+            (blocks(total), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Query rotation, key rotation straight into the cache, and the value copy,
+    /// in one launch: the three passes the layer needs before attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_append(
+        &self,
+        query: &DeviceBuffer,
+        key: &DeviceBuffer,
+        value: &DeviceBuffer,
+        keys: &DeviceBuffer,
+        values: &DeviceBuffer,
+        tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        base: f32,
+        start: usize,
+        kv_dim: usize,
+    ) -> Result<(), EngineError> {
+        let total = tokens * q_heads * (head_dim / 2);
+        let mut args = [
+            Arg::Pointer(query.pointer),
+            Arg::Pointer(key.pointer),
+            Arg::Pointer(value.pointer),
+            Arg::Pointer(keys.pointer),
+            Arg::Pointer(values.pointer),
+            Arg::Int(tokens as i32),
+            Arg::Int(q_heads as i32),
+            Arg::Int(kv_heads as i32),
+            Arg::Int(head_dim as i32),
+            Arg::Int((head_dim / 2) as i32),
+            Arg::Int(n_rot as i32),
+            Arg::Float(base),
+            Arg::Int(start as i32),
+            Arg::Int(kv_dim as i32),
+        ];
+        self.launch(
+            self.kernels.rope_append,
             (blocks(total), 1, 1),
             (256, 1, 1),
             0,
@@ -978,7 +1024,12 @@ impl Gpu {
             );
             let (scales, quants) = self.quantized(entry.identity, entry.bytes)?;
             rows += entry.out;
-            resolved.push((scales, quants, entry.out, shifted(entry.y.pointer, entry.y_offset)));
+            resolved.push((
+                scales,
+                quants,
+                entry.out,
+                shifted(entry.y.pointer, entry.y_offset),
+            ));
         }
         while resolved.len() < MMA_GROUP_MAX {
             resolved.push((resolved[0].0, resolved[0].1, 0, resolved[0].3));
@@ -1025,6 +1076,7 @@ impl Gpu {
         prepared: &Prepared,
         n: usize,
         k: usize,
+        bias: Option<(DevicePtr, usize)>,
     ) -> Result<(), EngineError> {
         if n > MMA_TOKENS {
             return Err(EngineError::Unsupported(format!(
@@ -1035,6 +1087,10 @@ impl Gpu {
             !group.is_empty() && group.len() <= MMA_GROUP_MAX,
             "prompt matmul group holds one to four matrices"
         );
+        assert!(
+            bias.is_none() || group.len() == 1,
+            "a residual add belongs to a single-matrix group"
+        );
         let act_quants = prepared.0;
         let act_scales = shifted(prepared.0, n * k / 4);
         let mut resolved = Vec::with_capacity(group.len());
@@ -1042,7 +1098,12 @@ impl Gpu {
         for entry in group {
             let (scales, quants) = self.quantized(entry.identity, entry.bytes)?;
             row_tiles += entry.out.div_ceil(MMA_ROWS * MMA_WARPS);
-            resolved.push((scales, quants, entry.out, shifted(entry.y.pointer, entry.y_offset)));
+            resolved.push((
+                scales,
+                quants,
+                entry.out,
+                shifted(entry.y.pointer, entry.y_offset),
+            ));
         }
         while resolved.len() < MMA_GROUP_MAX {
             resolved.push((resolved[0].0, resolved[0].1, 0, resolved[0].3));
@@ -1074,6 +1135,8 @@ impl Gpu {
             Arg::Int(token_tiles as i32),
             Arg::Int(plan.full_blocks as i32),
             Arg::Int(plan.tail_slices as i32),
+            Arg::Pointer(bias.map_or(resolved[0].3, |(pointer, offset)| shifted(pointer, offset))),
+            Arg::Int(bias.is_some() as i32),
         ];
         self.launch(
             self.kernels.matmul_mma,

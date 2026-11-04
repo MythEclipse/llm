@@ -488,6 +488,65 @@ extern "C" __global__ void kv_append(__half* __restrict__ keys,
     }
 }
 
+// Rotate the query, then rotate the key straight into the cache and copy the
+// value beside it: one launch where the engine used three, and the rotated key is
+// narrowed to f16 where it is computed instead of being written out as f32 and
+// read back. The three passes touch disjoint buffers, so they share one grid.
+extern "C" __global__ void rope_append(float* __restrict__ query,
+                                       const float* __restrict__ key,
+                                       const float* __restrict__ value,
+                                       __half* __restrict__ keys,
+                                       __half* __restrict__ values,
+                                       int tokens, int q_heads, int kv_heads,
+                                       int head_dim, int half, int n_rot,
+                                       float base, int start, int kv_dim) {
+    const int stride = gridDim.x * blockDim.x;
+    const int first = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const int query_total = tokens * q_heads * half;
+    for (int index = first; index < query_total; index += stride) {
+        const int token = index / (q_heads * half);
+        const int rest = index % (q_heads * half);
+        const int head = rest / half;
+        const int pair = rest % half;
+        const float angle =
+            (float)(start + token) * powf(base, -2.0f * (float)pair / (float)n_rot);
+        float sine;
+        float cosine;
+        sincosf(angle, &sine, &cosine);
+        float* target = query + ((size_t)token * q_heads + head) * head_dim + 2 * pair;
+        const float a = *target;
+        const float b = *(target + 1);
+        *target = a * cosine - b * sine;
+        *(target + 1) = a * sine + b * cosine;
+    }
+
+    const int key_total = tokens * kv_heads * half;
+    for (int index = first; index < key_total; index += stride) {
+        const int token = index / (kv_heads * half);
+        const int rest = index % (kv_heads * half);
+        const int head = rest / half;
+        const int pair = rest % half;
+        const float angle =
+            (float)(start + token) * powf(base, -2.0f * (float)pair / (float)n_rot);
+        float sine;
+        float cosine;
+        sincosf(angle, &sine, &cosine);
+        const size_t source = ((size_t)token * kv_heads + head) * head_dim + 2 * pair;
+        const float a = key[source];
+        const float b = key[source + 1];
+        const size_t target = (size_t)(start + token) * kv_dim + head * head_dim + 2 * pair;
+        keys[target] = __float2half(a * cosine - b * sine);
+        keys[target + 1] = __float2half(a * sine + b * cosine);
+    }
+
+    const int value_total = tokens * kv_dim;
+    for (int index = first; index < value_total; index += stride) {
+        const int token = index / kv_dim;
+        values[(size_t)(start + token) * kv_dim + index % kv_dim] = __float2half(value[index]);
+    }
+}
+
 // Causal grouped-query attention for `tokens` query rows starting at `start`.
 //
 // One block per (head, query token), 4 warps: the positions of the KV cache are
@@ -822,7 +881,8 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
                                         int k, int n,
-                                        int token_tiles, int full_blocks, int tail_slices) {
+                                        int token_tiles, int full_blocks, int tail_slices,
+                                        const float* __restrict__ bias, int use_bias) {
     // ldmatrix needs sixteen-byte-aligned shared addresses, and a plain char array
     // is only guaranteed one-byte alignment.
     // One dynamic allocation instead of four static arrays: a 256-element k chunk
@@ -1093,19 +1153,19 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
             const int row = row_base + row_group + t * MMA_ROWS + group;
             if (column_low < tile_tokens && row < out) {
                 const size_t index = (size_t)(token_base + column_low) * out + row;
-                y[index] = sums[j][t][0];
+                y[index] = sums[j][t][0] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_high < tile_tokens && row < out) {
                 const size_t index = (size_t)(token_base + column_high) * out + row;
-                y[index] = sums[j][t][1];
+                y[index] = sums[j][t][1] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_low < tile_tokens && row + 8 < out) {
                 const size_t index = (size_t)(token_base + column_low) * out + row + 8;
-                y[index] = sums[j][t][2];
+                y[index] = sums[j][t][2] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_high < tile_tokens && row + 8 < out) {
                 const size_t index = (size_t)(token_base + column_high) * out + row + 8;
-                y[index] = sums[j][t][3];
+                y[index] = sums[j][t][3] + (use_bias ? bias[index] : 0.0f);
             }
         }
     }
