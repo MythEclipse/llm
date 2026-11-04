@@ -512,10 +512,10 @@ memberi 4.000 atau 5.200 tok/s hanya karena suhu awal kartu.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.360 ± 35 tok/s | 3.779 ± 228 tok/s | 89% |
-| pp512 | **5.235 ± 1 tok/s** | 4.711 ± 97 tok/s | **111%** |
-| pp1024 | 4.468 ± 1 tok/s | 4.642 ± 118 tok/s | 96% |
-| tg128 | 66,8 ± 0,02 tok/s | 69,4 ± 0,05 tok/s | 96% |
+| pp128 | 3.618 ± 33 tok/s | 3.700 ± 309 tok/s | 98% |
+| pp512 | 4.269 ± 8 tok/s | 4.700 ± 100 tok/s | 91% |
+| pp1024 | 4.108 ± 2 tok/s | 4.647 ± 121 tok/s | 88% |
+| tg128 | 68,3 ± 0,02 tok/s | 69,4 ± 0,04 tok/s | 98% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
@@ -525,43 +525,58 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 | VRAM (ctx 4096) | 2,9 GiB | 2,49 GiB |
 | Load + 1 token (wall) | 0,9 s | 1,32 s |
 
-### Apa yang menutup jarak prefill
+### Apa yang sudah menutup sebagian jarak
 
-Tiga perubahan, semuanya di bentuk grid dan bukan di aritmetika:
-
-- **Tile sisa mengisi gelombang terakhir.** Satu tile adalah satu unit kerja:
-  128 baris × 128 token. Kalau jumlah tile bukan kelipatan blok yang berjalan
-  serentak, gelombang terakhir hampir kosong tetapi tetap dibayar satu tile
-  penuh — pada 512 token itu 20% dari matmul. Tile sisa sekarang dipotong di
-  sumbu token (`wave_plan` + `tail_slices` di kernel), dan potongannya menulis
-  kolom yang berbeda-beda, jadi tidak ada penjumlahan parsial yang harus
-  digabung. Bukti bahwa gelombang memang penentu: pp640 (80 tile = 4 gelombang
-  penuh) dulu 5.353 tok/s sementara pp512 (64 tile = 3,2 gelombang) 4.972.
 - **Matmul yang berbagi aktivasi berangkat dalam satu launch** (`MMA_GROUP_MAX`).
   q, k dan v membaca baris ternormalisasi yang sama; sebagai tiga launch masing-
-  masing hanya mengisi 4 + 1 + 1 gelombang dari 34 gelombang per layer, dan
-  ruang barisnya digabung jadi 4 gelombang. gate|up juga, tetapi hanya sampai 512
-  token: pada 1.024 token gabungan itu terukur 2,40 ms melawan 2 × 0,70 ms untuk
-  terpisah (`GROUP_FFN_MAX_TOKENS`).
+  masing hanya mengisi 4 + 1 + 1 gelombang dari 34 gelombang per layer, ruang
+  barisnya digabung jadi 4. gate|up juga, tetapi hanya sampai 512 token: pada
+  1.024 token gabungan itu terukur 2,40 ms melawan 2 × 0,70 ms terpisah
+  (`GROUP_FFN_MAX_TOKENS`).
+- **Skala bobot tiap lane diangkat keluar dari loop token** — enam belas nilai per
+  potongan k, bukan dua load per mma — dan skala aktivasi disimpan block-major
+  supaya dua kolom satu lane tiba dalam satu load 64-bit. Enam load shared per mma
+  jadi tiga.
+- **Semua load satu potongan k diterbitkan sebelum store pertama.** Bobot,
+  aktivasi, dan kedua bidang skala berangkat bersama, jadi blok menunggu sekali per
+  potongan, bukan empat kali: 99,9 → 90,5 ms matmul pada pp512. Ini yang di
+  profiler terbaca sebagai `long_scoreboard` dengan 8 warp.
+- **Tile sisa dipotong di sumbu token** (`wave_plan` + `tail_slices`) supaya
+  gelombang terakhir tidak kosong: +4% pada pp512. Potongannya menulis kolom
+  berbeda, jadi tidak ada penjumlahan parsial yang harus digabung.
 - **Attention prefill: tile terberat dulu.** Masker kausal membuat tile query
-  terakhir melihat seluruh konteks, jadi beban antar blok naik linear. Blok
-  dijadwalkan menurut indeks, jadi urutan tile dibalik (`tiles - 1 - blockIdx.y`)
-  dan yang berat jalan lebih dulu: 10,5 → 8,4 ms pada pp512.
+  terakhir melihat seluruh konteks, jadi beban antar blok naik linear sementara
+  blok dijadwalkan urut indeks. Dibalik: 10,5 → 8,4 ms pada pp512.
+- **Decode**: q|k|v dan gate|up satu launch (295 → 169 peluncuran per token),
+  attention split dua kali lebih halus, rmsnorm satu barrier dengan load vektor.
 
-Untuk decode, q|k|v dan gate|up juga satu launch: 295 → 169 peluncuran per token,
-dan proyeksi 256 baris tidak lagi mengisi 8 blok dari 20 SM.
+### Sisa jarak, dan ke mana harus pergi
 
-Bacaan jujurnya:
-
-- **Prefill sudah menyusul di 512 token** (111%) dan tinggal 4% di 1.024. Sisa
-  terbesar ada di 128 token (89%), di mana satu tile token berarti bobot dibaca
-  ulang untuk setiap tile baris: di situ yang dibutuhkan pemecahan sumbu k, bukan
-  pemotongan token, karena potongan token tetap membayar salinan bobot penuh.
-- **Decode 96%.** Lantai DRAM-nya 2,39 GB per token dibagi 187,8 GB/s = 12,7 ms,
-  dan matmul-nya sudah 13,4 ms (178 GB/s). Sisanya 0,9 ms kernel kecil (attention
-  decode, rmsnorm, rope) plus ±0,3 ms celah antar peluncuran.
+- **Matmul prefill masih ±25% di belakang** dan itu seluruh selisihnya: 90,5 ms
+  lawan ±70 ms pada pp512, sementara attention (11,1 lawan 4,7) dan elementwise
+  kita sudah lebih murah dari llama.cpp. Dua hal yang mereka punya dan kita belum:
+  tile aktivasi yang sudah di-*swizzle* saat kuantisasi (`block_q8_1_mmq`, skala
+  menempel pada data sehingga fragmen B datang lewat satu `ldmatrix`, bukan dua
+  load), dan *stream-k* yang membagi sumbu k supaya tidak ada gelombang setengah
+  kosong. Keduanya perubahan besar, bukan tambalan.
+- **Decode 98%**: lantai DRAM 2,39 GB/token ÷ 187,8 GB/s = 12,7 ms, matmul-nya
+  13,4 ms (178 GB/s), sisanya ±0,9 ms kernel kecil + ±0,4 ms celah antar
+  peluncuran. Untuk menutup itu yang benar CUDA graph (satu replay per token),
+  bukan tambal per kernel.
 - **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks
   (jalur CPU belum memakai tiling attention).
+
+### Dua bug yang ditemukan saat mengejar angka ini
+
+- **`quantize_rows` tidak memeriksa batas.** Grid-nya dibulatkan ke kelipatan 128
+  thread, jadi sisa thread mengkuantisasi baris `n` dan menulisnya menimpa bidang
+  skala: prompt 65 token (atau 129, 193, …) menghasilkan logits yang melantur,
+  sementara 64 dan 66 token benar. Test `gpu_matmul` sekarang memuat 65, 129, dan
+  193 justru karena itu.
+- **Lebar potongan tail dipakai untuk semua blok.** Saat sebuah launch perlu
+  memotong tile sisa, blok yang memegang tile penuh ikut menghitung seperempat
+  token. Angka prefill sempat terlihat 25% lebih tinggi karenanya; angka di tabel
+  atas adalah yang menghitung semua token.
 
 ## Catatan implementasi
 

@@ -266,8 +266,12 @@ extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
     }
     const float* source = src + (size_t)row * n;
     float sum = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        sum += source[i] * source[i];
+    // Four elements per load: a single row is 8 KB, so the cost here is the
+    // number of round trips, not bandwidth.
+    const int vectors = n / 4;
+    for (int i = tid; i < vectors; i += blockDim.x) {
+        const float4 value = *reinterpret_cast<const float4*>(source + i * 4);
+        sum += value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w;
     }
     for (int step = 16; step > 0; step >>= 1) {
         sum += __shfl_down_sync(0xffffffffu, sum, step);
@@ -288,8 +292,14 @@ extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
     __syncthreads();
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     float* target = dst + (size_t)row * n;
-    for (int i = tid; i < n; i += blockDim.x) {
-        target[i] = source[i] * scale * weight[i];
+    for (int i = tid; i < vectors; i += blockDim.x) {
+        const float4 value = *reinterpret_cast<const float4*>(source + i * 4);
+        const float4 gain = *reinterpret_cast<const float4*>(weight + i * 4);
+        *reinterpret_cast<float4*>(target + i * 4) = make_float4(
+            value.x * scale * gain.x,
+            value.y * scale * gain.y,
+            value.z * scale * gain.z,
+            value.w * scale * gain.w);
     }
 }
 
@@ -599,7 +609,7 @@ extern "C" __global__ void attention_combine(const float* __restrict__ partial_a
 extern "C" __global__ void quantize_rows(const float* __restrict__ x,
                                         signed char* __restrict__ quants,
                                         float* __restrict__ scales,
-                                        int k) {
+                                        int k, int total) {
     // One thread per thirty-two-element block. The warp version moved four bytes
     // per lane and needed a five-step butterfly for the block peak, which left the
     // kernel at half the bandwidth it should reach; a thread that reads its own
@@ -607,6 +617,12 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
     // access and keeps the peak in registers.
     const int blocks_per_row = k >> 5;
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    // The grid is rounded up to whole warps, so the last block has threads past
+    // the end. Without this they quantise row `n` and write it over the scales
+    // plane, which is what corrupted the first rows of a 65-token prompt.
+    if (index >= total) {
+        return;
+    }
     const int row = index / blocks_per_row;
     const int block = index % blocks_per_row;
     const size_t offset = (size_t)row * k + block * 32;
@@ -639,9 +655,15 @@ extern "C" __global__ void silu_mul_quantize_rows(const float* __restrict__ gate
                                                   const float* __restrict__ up,
                                                   signed char* __restrict__ quants,
                                                   float* __restrict__ scales,
-                                                  int k) {
+                                                  int k, int total) {
     const int blocks_per_row = k >> 5;
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    // The grid is rounded up to whole warps, so the last block has threads past
+    // the end. Without this they quantise row `n` and write it over the scales
+    // plane, which is what corrupted the first rows of a 65-token prompt.
+    if (index >= total) {
+        return;
+    }
     const int row = index / blocks_per_row;
     const int block = index % blocks_per_row;
     const size_t offset = (size_t)row * k + block * 32;
@@ -770,10 +792,16 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
     // disjoint columns, so no partial sums have to be combined afterwards.
     int tile = blockIdx.x;
     int slice = 0;
+    // Only the tail blocks are cut short; a block that owns a whole tile keeps
+    // the full token count. Applying the slice width to both was a silent
+    // fifteen-sixteenths of a tile for every full block whenever a launch
+    // happened to need slicing at all.
+    int block_tokens = MMA_BLOCK_TOKENS;
     if (blockIdx.x >= (unsigned int)full_blocks) {
         const int index = blockIdx.x - full_blocks;
         tile = full_blocks + index / tail_slices;
         slice = index % tail_slices;
+        block_tokens = MMA_BLOCK_TOKENS / tail_slices;
     }
     const int tile_row = tile / token_tiles;
     const int token_tile = tile % token_tiles;
@@ -807,7 +835,7 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
         weight_quants = quants3;
         y = y3;
     }
-    const int slice_tokens = MMA_BLOCK_TOKENS / tail_slices;
+    const int slice_tokens = block_tokens;
     const int token_offset = slice * slice_tokens;
     const int token_base = token_tile * MMA_BLOCK_TOKENS + token_offset;
     const int tile_tokens = min(slice_tokens, n - token_base);
@@ -833,63 +861,105 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
     }
 
     for (int chunk = 0; chunk < k; chunk += MMA_CHUNK) {
-        for (int index = tid * 16; index < MMA_BLOCK_ROWS * MMA_CHUNK; index += threads * 16) {
+        // Every load of the chunk is issued before any store: weights,
+        // activations and both scale planes are then in flight together, and the
+        // block stalls once per chunk instead of four times. Storing each plane as
+        // it arrives is what the profiler reports as long-scoreboard stall.
+        constexpr int ROW_COPIES = MMA_BLOCK_ROWS * MMA_CHUNK / (32 * MMA_WARPS * 16);
+        constexpr int TOKEN_COPIES = MMA_BLOCK_TOKENS * MMA_CHUNK / (32 * MMA_WARPS * 16);
+        constexpr int SCALE_PAIRS = MMA_CHUNK_BLOCKS / 2;
+        constexpr int ROW_SCALES = MMA_BLOCK_ROWS * SCALE_PAIRS;
+        constexpr int TOKEN_SCALES = MMA_BLOCK_TOKENS * MMA_CHUNK_BLOCKS;
+        int4 weight_tile[ROW_COPIES];
+        int4 act_tile[TOKEN_COPIES];
+        float2 weight_scale_values[(ROW_SCALES + 32 * MMA_WARPS - 1) / (32 * MMA_WARPS)];
+        float act_scale_values[(TOKEN_SCALES + 32 * MMA_WARPS - 1) / (32 * MMA_WARPS)];
+
+        #pragma unroll
+        for (int copy = 0; copy < ROW_COPIES; ++copy) {
+            const int index = tid * 16 + copy * threads * 16;
             const int row = index / MMA_CHUNK;
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
             const int target = row_base + row;
-            int4* destination = reinterpret_cast<int4*>(a_tile + row * ROW_STRIDE + element);
-            if (position + 16 <= k && target < out) {
-                *destination =
-                    *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position);
-            } else {
-                *destination = make_int4(0, 0, 0, 0);
-            }
+            weight_tile[copy] = (position + 16 <= k && target < out)
+                ? *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position)
+                : make_int4(0, 0, 0, 0);
         }
-        for (int index = tid * 16; index < MMA_BLOCK_TOKENS * MMA_CHUNK; index += threads * 16) {
+        #pragma unroll
+        for (int copy = 0; copy < TOKEN_COPIES; ++copy) {
+            const int index = tid * 16 + copy * threads * 16;
             const int token = index / MMA_CHUNK;
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
-            int4* destination = reinterpret_cast<int4*>(b_tile + token * ROW_STRIDE + element);
-            if (position + 16 <= k && token < slice_tokens && token < tile_tokens) {
-                *destination = *reinterpret_cast<const int4*>(
-                    act_quants + (size_t)(token_base + token) * k + position);
-            } else {
-                *destination = make_int4(0, 0, 0, 0);
-            }
+            act_tile[copy] = (position + 16 <= k && token < slice_tokens && token < tile_tokens)
+                ? *reinterpret_cast<const int4*>(
+                      act_quants + (size_t)(token_base + token) * k + position)
+                : make_int4(0, 0, 0, 0);
         }
         // One half2 load per thread pair of blocks, so the scale staging keeps
         // the same 32-bit access shape the f32 plane had.
-        for (int index = tid; index < MMA_BLOCK_ROWS * (MMA_CHUNK_BLOCKS / 2); index += threads) {
-            const int row = index / (MMA_CHUNK_BLOCKS / 2);
-            const int block = (index % (MMA_CHUNK_BLOCKS / 2)) * 2;
+        #pragma unroll
+        for (int slot = 0; slot < ROW_SCALES / (32 * MMA_WARPS); ++slot) {
+            const int index = tid + slot * 32 * MMA_WARPS;
+            const int row = index / SCALE_PAIRS;
+            const int block = (index % SCALE_PAIRS) * 2;
             const int position = chunk + block * 32;
             const int target = row_base + row;
-            const bool valid = target < out && position < k;
+            float2 values = make_float2(0.0f, 0.0f);
             if (position + 32 <= k) {
-                const __half2 pair = *reinterpret_cast<const __half2*>(
-                    weight_scales + (size_t)target * k_blocks + (position >> 5));
-                const float2 values = __half22float2(pair);
-                a_scales[row * MMA_CHUNK_BLOCKS + block] = valid ? values.x : 0.0f;
-                a_scales[row * MMA_CHUNK_BLOCKS + block + 1] =
-                    (target < out && position + 32 <= k) ? values.y : 0.0f;
-            } else {
-                a_scales[row * MMA_CHUNK_BLOCKS + block] =
-                    valid ? __half2float(weight_scales[(size_t)target * k_blocks + (position >> 5)])
-                          : 0.0f;
-                a_scales[row * MMA_CHUNK_BLOCKS + block + 1] = 0.0f;
+                values = __half22float2(*reinterpret_cast<const __half2*>(
+                    weight_scales + (size_t)target * k_blocks + (position >> 5)));
+                if (target >= out) {
+                    values = make_float2(0.0f, 0.0f);
+                }
+            } else if (position < k && target < out) {
+                values.x = __half2float(
+                    weight_scales[(size_t)target * k_blocks + (position >> 5)]);
             }
+            weight_scale_values[slot] = values;
         }
-        for (int index = tid; index < MMA_BLOCK_TOKENS * MMA_CHUNK_BLOCKS; index += threads) {
+        #pragma unroll
+        for (int slot = 0; slot < TOKEN_SCALES / (32 * MMA_WARPS); ++slot) {
+            const int index = tid + slot * 32 * MMA_WARPS;
             const int token = index / MMA_CHUNK_BLOCKS;
             const int block = index % MMA_CHUNK_BLOCKS;
             const int position = chunk + block * 32;
-            // Block-major: the two columns a lane multiplies sit next to each
-            // other, so the inner loop reads them with one 64-bit load.
-            b_scales[block * MMA_BLOCK_TOKENS + token] =
-                (position < k && token < slice_tokens && token < tile_tokens)
+            act_scale_values[slot] = (position < k && token < slice_tokens && token < tile_tokens)
                 ? act_scales[(size_t)(token_base + token) * k_blocks + (position >> 5)]
                 : 0.0f;
+        }
+
+        #pragma unroll
+        for (int copy = 0; copy < ROW_COPIES; ++copy) {
+            const int index = tid * 16 + copy * threads * 16;
+            const int row = index / MMA_CHUNK;
+            const int element = index % MMA_CHUNK;
+            *reinterpret_cast<int4*>(a_tile + row * ROW_STRIDE + element) = weight_tile[copy];
+        }
+        #pragma unroll
+        for (int copy = 0; copy < TOKEN_COPIES; ++copy) {
+            const int index = tid * 16 + copy * threads * 16;
+            const int token = index / MMA_CHUNK;
+            const int element = index % MMA_CHUNK;
+            *reinterpret_cast<int4*>(b_tile + token * ROW_STRIDE + element) = act_tile[copy];
+        }
+        #pragma unroll
+        for (int slot = 0; slot < ROW_SCALES / (32 * MMA_WARPS); ++slot) {
+            const int index = tid + slot * 32 * MMA_WARPS;
+            const int row = index / SCALE_PAIRS;
+            const int block = (index % SCALE_PAIRS) * 2;
+            a_scales[row * MMA_CHUNK_BLOCKS + block] = weight_scale_values[slot].x;
+            a_scales[row * MMA_CHUNK_BLOCKS + block + 1] = weight_scale_values[slot].y;
+        }
+        #pragma unroll
+        for (int slot = 0; slot < TOKEN_SCALES / (32 * MMA_WARPS); ++slot) {
+            const int index = tid + slot * 32 * MMA_WARPS;
+            const int token = index / MMA_CHUNK_BLOCKS;
+            const int block = index % MMA_CHUNK_BLOCKS;
+            // Block-major: the two columns a lane multiplies sit next to each
+            // other, so the inner loop reads them with one 64-bit load.
+            b_scales[block * MMA_BLOCK_TOKENS + token] = act_scale_values[slot];
         }
         __syncthreads();
 

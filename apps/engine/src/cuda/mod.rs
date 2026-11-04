@@ -38,7 +38,7 @@ const DECODE_ROWS_PER_BLOCK: usize = 4;
 const ATTENTION_THREADS: u32 = 128;
 /// Positions per attention block on the decode path, and the shared window the
 /// kernel reserves per block.
-const SPLIT_POSITIONS: usize = 32;
+const SPLIT_POSITIONS: usize = 16;
 const MAX_SPLIT_POSITIONS: usize = 256;
 const MAX_SPLITS: usize = 1024;
 
@@ -786,16 +786,17 @@ impl Gpu {
         let blocks = k / 32;
         let quants_bytes = n * k;
         let buffer = self.activation_workspace(quants_bytes, n * blocks)?;
+        // One thread per thirty-two-element block, so the grid is the whole
+        // activation and each thread streams its own hundred and twenty-eight
+        // bytes contiguously.
+        let total = (blocks * n) as u32;
         let mut quantize_args = [
             Arg::Pointer(shifted(x.pointer, x_offset)),
             Arg::Pointer(buffer),
             Arg::Pointer(shifted(buffer, quants_bytes / 4)),
             Arg::Int(k as i32),
+            Arg::Int(total as i32),
         ];
-        // One thread per thirty-two-element block, so the grid is the whole
-        // activation and each thread streams its own hundred and twenty-eight
-        // bytes contiguously.
-        let total = (blocks * n) as u32;
         self.launch(
             self.kernels.quantize_rows,
             (total.div_ceil(128), 1, 1),
@@ -853,14 +854,15 @@ impl Gpu {
         let blocks = k / 32;
         let quants_bytes = n * k;
         let buffer = self.activation_workspace(quants_bytes, n * blocks)?;
+        let total = (blocks * n) as u32;
         let mut quantize_args = [
             Arg::Pointer(gate.pointer),
             Arg::Pointer(up.pointer),
             Arg::Pointer(buffer),
             Arg::Pointer(shifted(buffer, quants_bytes / 4)),
             Arg::Int(k as i32),
+            Arg::Int(total as i32),
         ];
-        let total = (blocks * n) as u32;
         self.launch(
             self.kernels.silu_mul_quantize,
             (total.div_ceil(128), 1, 1),

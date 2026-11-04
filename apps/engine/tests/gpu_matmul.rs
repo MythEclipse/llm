@@ -44,7 +44,11 @@ fn gpu_matmul_matches_the_cpu_kernel() {
     let cpu = Compute::cpu();
     for name in ["blk.0.attn_q.weight", "blk.0.ffn_down.weight"] {
         let weight = weight(&gguf, name);
-        for n in [1usize, 8, 64] {
+        // 65 and 129 are one token past a full block: they are what the
+        // quantiser's spare threads used to corrupt before it checked its bounds.
+        // 193 needs four token tiles and leaves four tail tiles, which is the only
+        // length here that cuts a tail tile into slices.
+        for n in [1usize, 8, 65, 128, 129, 172, 193] {
             let x = activations(n * weight.k, n as f32);
             let mut expected = vec![0.0f32; n * weight.out];
             let mut actual = vec![0.0f32; n * weight.out];
