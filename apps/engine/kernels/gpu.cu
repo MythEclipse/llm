@@ -39,6 +39,14 @@ __device__ __forceinline__ float q8_element(unsigned int word, int index) {
     return (float)((int)(word << (24 - index * 8)) >> 24);
 }
 
+__device__ __forceinline__ float q8_dot8(uint2 raw, float4 low, float4 high) {
+    float dot = q8_element(raw.x, 0) * low.x + q8_element(raw.x, 1) * low.y +
+                q8_element(raw.x, 2) * low.z + q8_element(raw.x, 3) * low.w;
+    dot += q8_element(raw.y, 0) * high.x + q8_element(raw.y, 1) * high.y +
+           q8_element(raw.y, 2) * high.z + q8_element(raw.y, 3) * high.w;
+    return dot;
+}
+
 // y[t * out + o] = sum_k dequant(w[o][k]) * x[t * k + k]
 //
 // The row arrives repacked at upload time: `scales` holds k/32 f32 per row and
@@ -69,6 +77,7 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
         for (int token = 0; token < n; ++token) {
             const float* activation = x + (size_t)token * k;
             float sum = 0.0f;
+            #pragma unroll 2
             for (int base = tid * 8; base < k; base += threads * 8) {
                 const uint2 raw = *reinterpret_cast<const uint2*>(row_quants + base);
                 const float4 low = *reinterpret_cast<const float4*>(activation + base);
@@ -84,6 +93,7 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
                 y[(size_t)token * out + o] = sum;
             }
         }
+
         return;
     }
 
@@ -125,6 +135,57 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
         }
     }
 }
+
+__device__ __forceinline__ float warp_block_sum4(float value, float* scratch) {
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    for (int step = 16; step > 0; step >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, step);
+    }
+    if (lane == 0) {
+        scratch[warp] = value;
+    }
+    __syncthreads();
+    float total = (warp == 0 && lane < 4) ? scratch[lane] : 0.0f;
+    if (warp == 0) {
+        for (int step = 2; step > 0; step >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, step);
+        }
+    }
+    return total;
+}
+
+extern "C" __global__ void q8_matmul_decode(const float* __restrict__ scales,
+                                            const signed char* __restrict__ quants,
+                                            const float* __restrict__ x,
+                                            float* __restrict__ y,
+                                            int k, int out) {
+    extern __shared__ float reduction[];
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int tid = warp * blockDim.x + lane;
+    const int threads = blockDim.x * blockDim.y;
+    const int o = blockIdx.x;
+    const float* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
+    const signed char* row_quants = quants + (size_t)o * k;
+    float sum = 0.0f;
+    #pragma unroll 2
+    for (int base = tid * 16; base < k; base += threads * 16) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(row_quants + base);
+        const float4 v0 = *reinterpret_cast<const float4*>(x + base);
+        const float4 v1 = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 v2 = *reinterpret_cast<const float4*>(x + base + 8);
+        const float4 v3 = *reinterpret_cast<const float4*>(x + base + 12);
+        sum += row_scales[base >> 5] *
+            (q8_dot8(make_uint2(raw.x, raw.y), v0, v1) +
+             q8_dot8(make_uint2(raw.z, raw.w), v2, v3));
+    }
+    sum = warp_block_sum4(sum, reduction);
+    if (tid == 0) {
+        y[o] = sum;
+    }
+}
+
 extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
                                        float* __restrict__ dst,
                                        const float* __restrict__ weight,

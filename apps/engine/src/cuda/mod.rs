@@ -99,6 +99,7 @@ impl Drop for DeviceBuffer {
 /// A kernel handle, looked up by name once at open time.
 struct Kernels {
     matmul: Function,
+    matmul_decode: Function,
     matmul_mma: Function,
     quantize_rows: Function,
     rmsnorm: Function,
@@ -185,6 +186,7 @@ impl Gpu {
             };
             let kernels = Kernels {
                 matmul: load("q8_matmul")?,
+                matmul_decode: load("q8_matmul_decode")?,
                 // The prompt matmul stages a 256-element k chunk, which is 57 KB of
                 // shared memory, so its ceiling is raised once here.
                 matmul_mma: reserve_shared(load("q8_matmul_mma")?, MMA_SHARED_BYTES)?,
@@ -350,8 +352,17 @@ impl Gpu {
             };
             return self.matmul_prompt_prepared(&scales, &quants, prepared, n, k, out, y, y_offset);
         }
-        // Decode path keeps the row in registers, so it needs no shared memory —
-        // and asking for 24 KB anyway costs occupancy.
+        // Single-token decode uses a smaller four-warp reduction. Batched decode
+        // keeps the eight-warp kernel because it reuses the row across tokens.
+        if n == 1 {
+            return self.launch(
+                self.kernels.matmul_decode,
+                (out as u32, 1, 1),
+                (LANES, 4, 1),
+                4 * std::mem::size_of::<f32>() as u32,
+                &mut args,
+            );
+        }
         self.launch(
             self.kernels.matmul,
             (out as u32, 1, 1),
