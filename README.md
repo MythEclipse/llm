@@ -168,27 +168,60 @@ pada bobot asli (max |Δ| ≈ 1,5e-6), dan `logits_golden`/`greedy_golden` lulus
 kedua backend dengan angka yang sama (max |Δ| 0,118 / 0,572 / 0,260; 32 token
 greedy identik). Jadi GPU bukan jalur "kira-kira benar" yang terpisah.
 
-### Kinerja CPU (untuk pembanding)
+### Perbandingan dengan llama.cpp
 
-i5-13500HX (20 thread), model 2,68 GB, diukur dengan
-`cargo test --release -p llm-engine --test perf_profile -- --ignored --nocapture`
-(median 9 langkah decode per titik, gateway dimatikan agar tidak bersaing):
+llama.cpp b11429 di-build dari source dengan CUDA (`-DGGML_CUDA=ON`,
+`CMAKE_CUDA_ARCHITECTURES=89`) supaya GPU vs GPU-nya sebanding, bukan GPU lawan
+CPU. Berkas model sama (`MiniCPM5-2B-Q8_0.gguf`), mesin sama, tidak ada proses
+lain yang memakai GPU, dan tiap angka diambil setelah satu putaran pemanasan.
+Sisi llama.cpp memakai `llama-bench` (`-r 2`/`-r 3`, `-t 20`); sisi engine ini
+memakai `perf_profile` (median 9 langkah decode per titik).
 
-| Konteks | Decode | Prefill |
-|---|---:|---:|
-| 0 token | 21,4 tok/s (46,6 ms/token) | — |
-| 128 token | 18,6 tok/s | 30,6 tok/s (4,2 s) |
-| 512 token | 16,0 tok/s | 27,5 tok/s (18,6 s) |
-| 1024 token | 6,2 tok/s | 24,4 tok/s (42 s) |
+| Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
+|---|---:|---:|---:|---:|
+| Prefill 128 token | 275 tok/s | 4.431 tok/s | 28 tok/s | 99 tok/s |
+| Prefill 512 token | 257 tok/s | 5.836 tok/s | 18 tok/s | 98 tok/s |
+| Prefill 1024 token | 241 tok/s | 5.765 tok/s | 16 tok/s | 70 tok/s |
+| Decode ctx 0 | **65,0 tok/s** | 71,2 tok/s | 17,1 tok/s | 16,9 tok/s |
+| Decode ctx 128 | 59,7 tok/s | 71,3 tok/s | 13,9 tok/s | 17,2 tok/s |
+| Decode ctx 512 | 48,1 tok/s | 71,2 tok/s | 9,8 tok/s | 15,9 tok/s |
+| Decode ctx 1024 | 38,1 tok/s | 71,2 tok/s | 7,6 tok/s | 15,1 tok/s |
+| VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB | — | — |
+| Load + 1 token (wall) | 1,07 s | 1,32 s | 0,24 s | 2,90 s |
 
-Pembanding llama.cpp b11429 pada mesin yang sama (Q8_0 yang sama, CPU):
-decode 24,4 tok/s, prefill 81 tok/s. Jadi decode ≈ 88% dari llama.cpp,
-prefill ≈ 1/3.
+Uji ujung-ke-ujung lewat CLI, prompt 87 kata (227 token), `-n 128`, `--temp 0`,
+dua putaran bergantian supaya kondisi termal sama:
 
-Kenapa prefill tertinggal: ggml memakai dot int8×int8 (`_mm256_maddubs_epi16`)
-setelah mengkuantisasi aktivasi, sedangkan engine ini memakai int8×f32
-(`_mm256_cvtepi8_epi32`) supaya tidak perlu langkah kuantisasi aktivasi. Itu
-pilihan kesederhanaan, bukan batas perangkat keras.
+| | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
+|---|---:|---:|---:|---:|
+| Prompt | 247 tok/s | 4.490 tok/s | 25 tok/s | 67 tok/s |
+| Generation | 54,2 tok/s | 68,6 tok/s | 11,2 tok/s | 18,5 tok/s |
+
+Bacaan jujurnya:
+
+- **Decode pendek hampir sepadan** (65,0 vs 71,2 tok/s, 91%). Ini masuk akal:
+  keduanya sudah menyentuh lantai bandwidth, dan selisih 9% itu ongkos repack
+  (1,125 vs 1,0625 byte per parameter) plus kernel attention yang belum di-tile.
+- **Decode merosot saat konteks panjang, punya llama.cpp tidak.** llama.cpp
+  memakai flash attention yang membaca KV per blok dan tetap di cache; kernel
+  attention di sini membaca ulang seluruh KV dari global memory tiap token, jadi
+  biayanya naik dari 15,4 ke 26,2 ms. Ini penyebab utama angka 38,1 vs 71,2 pada
+  ctx 1024, bukan matmul-nya.
+- **Prefill 18× tertinggal di GPU.** ggml memakai kernel MMQ: aktivasi
+  dikuantisasi ke int8 lalu di-dot dengan `dp4a`/MMA tensor core, sedangkan
+  engine ini menjumlahkan f32 lewat FMA biasa. Selisih 4.431 vs 275 tok/s itu
+  kelas algoritma, bukan tuning.
+- **Di CPU prefill tertinggal 3,5×, decode imbang di ctx 0 lalu tertinggal.**
+  Penyebab prefill sama sifatnya: ggml memakai `_mm256_maddubs_epi16` (int8×int8)
+  setelah aktivasi dikuantisasi, engine ini memakai `_mm256_cvtepi8_epi32`
+  (int8×f32) supaya tidak perlu langkah kuantisasi aktivasi.
+- **VRAM 3,1 vs 2,49 GiB** karena bidang `scales` f32 menyimpan 4 byte per 32
+  elemen yang di GGUF hanya 2 byte (f16).
+
+Yang belum dikerjakan untuk menutup selisih itu: dot int8 (`dp4a`) plus akumulasi
+f16 di jalur prompt, tensor core MMA untuk prefill, dan attention bertile ala
+flash attention untuk konteks panjang. Ketiganya mengubah numerik, jadi butuh
+fixture baru sebelum bisa diterima.
 
 KV cache f32: 86 KB/token → 704 MB pada ctx 8192, 1,4 GB pada ctx 16384.
 f32 dipilih setelah pengukuran: versi f16 menyimpan setengah memori tapi
