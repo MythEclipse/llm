@@ -114,6 +114,7 @@ impl Drop for DeviceBuffer {
 }
 
 /// A kernel handle, looked up by name once at open time.
+#[allow(dead_code)]
 struct Kernels {
     matmul: Function,
     matmul_decode: Function,
@@ -123,7 +124,9 @@ struct Kernels {
     rmsnorm: Function,
     rmsnorm_quantize: Function,
     silu_mul: Function,
-    residual_add: Function,
+    copy_f32: Function,
+    fill_f32: Function,
+    axpby_f32: Function,
     rope: Function,
     kv_append: Function,
     attention: Function,
@@ -238,7 +241,9 @@ impl Gpu {
                 rmsnorm: load("rmsnorm_rows")?,
                 rmsnorm_quantize: load("rmsnorm_quantize_rows")?,
                 silu_mul: load("silu_mul")?,
-                residual_add: load("residual_add")?,
+                copy_f32: load("copy_f32")?,
+                fill_f32: load("fill_f32")?,
+                axpby_f32: load("axpby_f32")?,
                 rope: load("rope")?,
                 kv_append: load("kv_append")?,
                 attention: load("attention")?,
@@ -525,13 +530,76 @@ impl Gpu {
         x_offset: usize,
         n: usize,
     ) -> Result<(), EngineError> {
+        self.axpby_f32(y, y_offset, x, x_offset, 1.0, 1.0, n)
+    }
+
+    /// Copies a contiguous f32 range on the device using four-wide loads.
+    #[allow(dead_code)]
+    pub fn copy_f32(
+        &self,
+        destination: &DeviceBuffer,
+        destination_offset: usize,
+        source: &DeviceBuffer,
+        source_offset: usize,
+        n: usize,
+    ) -> Result<(), EngineError> {
         let mut args = [
-            Arg::Pointer(shifted(y.pointer, y_offset)),
-            Arg::Pointer(shifted(x.pointer, x_offset)),
+            Arg::Pointer(shifted(destination.pointer, destination_offset)),
+            Arg::Pointer(shifted(source.pointer, source_offset)),
             Arg::Int(n as i32),
         ];
         self.launch(
-            self.kernels.residual_add,
+            self.kernels.copy_f32,
+            (blocks(n), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Fills a contiguous f32 range on the device.
+    #[allow(dead_code)]
+    pub fn fill_f32(
+        &self,
+        destination: &DeviceBuffer,
+        destination_offset: usize,
+        value: f32,
+        n: usize,
+    ) -> Result<(), EngineError> {
+        let mut args = [
+            Arg::Pointer(shifted(destination.pointer, destination_offset)),
+            Arg::Float(value),
+            Arg::Int(n as i32),
+        ];
+        self.launch(
+            self.kernels.fill_f32,
+            (blocks(n), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Computes `y = alpha*y + beta*x` for a contiguous f32 range.
+    pub fn axpby_f32(
+        &self,
+        y: &DeviceBuffer,
+        y_offset: usize,
+        x: &DeviceBuffer,
+        x_offset: usize,
+        alpha: f32,
+        beta: f32,
+        n: usize,
+    ) -> Result<(), EngineError> {
+        let mut args = [
+            Arg::Pointer(shifted(y.pointer, y_offset)),
+            Arg::Pointer(shifted(x.pointer, x_offset)),
+            Arg::Float(alpha),
+            Arg::Float(beta),
+            Arg::Int(n as i32),
+        ];
+        self.launch(
+            self.kernels.axpby_f32,
             (blocks(n), 1, 1),
             (256, 1, 1),
             0,

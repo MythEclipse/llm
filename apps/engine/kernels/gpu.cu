@@ -387,12 +387,58 @@ extern "C" __global__ void silu_mul(float* __restrict__ act,
     }
 }
 
-// y[i] += x[i]
-extern "C" __global__ void residual_add(float* __restrict__ y,
-                                        const float* __restrict__ x,
-                                        int n) {
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        y[i] += x[i];
+// Reusable contiguous f32 primitives. The vector path covers the aligned
+// transformer buffers while the scalar tail keeps the helpers valid for any n.
+extern "C" __global__ void copy_f32(float* __restrict__ dst,
+                                    const float* __restrict__ src,
+                                    int n) {
+    const int vector_count = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vector_count;
+         i += gridDim.x * blockDim.x) {
+        *reinterpret_cast<float4*>(dst + i * 4) =
+            *reinterpret_cast<const float4*>(src + i * 4);
+    }
+    for (int i = vector_count * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+extern "C" __global__ void fill_f32(float* __restrict__ dst, float value, int n) {
+    const float4 packed = make_float4(value, value, value, value);
+    const int vector_count = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vector_count;
+         i += gridDim.x * blockDim.x) {
+        *reinterpret_cast<float4*>(dst + i * 4) = packed;
+    }
+    for (int i = vector_count * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        dst[i] = value;
+    }
+}
+
+// y[i] = alpha*y[i] + beta*x[i]. residual_add is this operation with both
+// coefficients equal to one, and keeping it generic avoids another kernel for
+// future residual, scaling, and blending paths.
+extern "C" __global__ void axpby_f32(float* __restrict__ y,
+                                     const float* __restrict__ x,
+                                     float alpha,
+                                     float beta,
+                                     int n) {
+    const int vector_count = n / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vector_count;
+         i += gridDim.x * blockDim.x) {
+        const float4 lhs = *reinterpret_cast<const float4*>(y + i * 4);
+        const float4 rhs = *reinterpret_cast<const float4*>(x + i * 4);
+        *reinterpret_cast<float4*>(y + i * 4) = make_float4(
+            alpha * lhs.x + beta * rhs.x,
+            alpha * lhs.y + beta * rhs.y,
+            alpha * lhs.z + beta * rhs.z,
+            alpha * lhs.w + beta * rhs.w);
+    }
+    for (int i = vector_count * 4 + blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        y[i] = alpha * y[i] + beta * x[i];
     }
 }
 
