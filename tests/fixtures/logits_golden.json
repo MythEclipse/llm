@@ -1,0 +1,11 @@
+{
+ "prompt": "The capital of France is",
+ "tokens": [
+  608,
+  4894,
+  304,
+  6918,
+  357
+ ],
+ "logits_file": "logits_golden.bin"
+}

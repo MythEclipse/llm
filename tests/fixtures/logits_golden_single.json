@@ -1,0 +1,7 @@
+{
+ "prompt": "The",
+ "tokens": [
+  608
+ ],
+ "logits_file": "logits_golden_single.bin"
+}

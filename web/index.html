@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LLM lokal · MiniCPM5</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" aria-hidden="true"></span>
+        <strong id="model-name">memuat model…</strong>
+        <span class="muted" id="model-meta"></span>
+      </div>
+      <div class="live" aria-live="polite">
+        <span><b id="live-tps">–</b> tok/s</span>
+        <span><b id="live-ttft">–</b> ms TTFT</span>
+        <span><b id="live-tokens">–</b> token</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel conversations">
+        <div class="panel-head">
+          <h2>Percakapan</h2>
+          <button id="new-chat" type="button">Baru</button>
+        </div>
+        <ul id="conversation-list" class="conversation-list"></ul>
+      </aside>
+
+      <section class="panel chat">
+        <div id="transcript" class="transcript" aria-live="polite"></div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="prompt">Pesan</label>
+          <textarea id="prompt" rows="3" placeholder="Tulis pesan… (Enter kirim, Shift+Enter baris baru)"></textarea>
+          <div class="composer-actions">
+            <label class="field">
+              <span>suhu</span>
+              <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7" />
+            </label>
+            <label class="field">
+              <span>maks token</span>
+              <input id="max-tokens" type="number" min="1" max="4096" step="1" value="512" />
+            </label>
+            <button id="send" type="submit">Kirim</button>
+            <button id="stop" type="button" class="ghost" hidden>Stop</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="panel stats">
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-tab="live">Live</button>
+          <button role="tab" aria-selected="false" data-tab="history">Statistik</button>
+        </div>
+
+        <div id="tab-live" class="tab-body">
+          <dl class="metrics">
+            <div><dt>tok/s</dt><dd id="run-tps">–</dd></div>
+            <div><dt>TTFT</dt><dd id="run-ttft">–</dd></div>
+            <div><dt>prefill</dt><dd id="run-prefill">–</dd></div>
+            <div><dt>token</dt><dd id="run-tokens">–</dd></div>
+            <div><dt>ctx</dt><dd id="run-ctx">–</dd></div>
+            <div><dt>berhenti</dt><dd id="run-stop">–</dd></div>
+          </dl>
+          <h3>Latensi per token</h3>
+          <div id="latency-chart" class="chart"></div>
+          <h3>Info model</h3>
+          <dl id="model-info" class="kv"></dl>
+        </div>
+
+        <div id="tab-history" class="tab-body" hidden>
+          <dl class="metrics">
+            <div><dt>total run</dt><dd id="stat-runs">–</dd></div>
+            <div><dt>total token</dt><dd id="stat-tokens">–</dd></div>
+            <div><dt>rata tok/s</dt><dd id="stat-avg">–</dd></div>
+            <div><dt>p50 tok/s</dt><dd id="stat-p50">–</dd></div>
+            <div><dt>p95 tok/s</dt><dd id="stat-p95">–</dd></div>
+            <div><dt>rata TTFT</dt><dd id="stat-ttft">–</dd></div>
+          </dl>
+          <h3>Token per hari</h3>
+          <div id="daily-chart" class="chart"></div>
+          <h3>Run terakhir</h3>
+          <table class="runs">
+            <thead>
+              <tr><th>waktu</th><th>tok</th><th>tok/s</th><th>TTFT</th><th>stop</th></tr>
+            </thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

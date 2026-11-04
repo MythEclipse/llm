@@ -1,0 +1,9 @@
+[package]
+name = "migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sea-orm-migration = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+async-trait = "0.1"

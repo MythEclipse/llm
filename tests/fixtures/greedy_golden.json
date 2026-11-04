@@ -1,0 +1,5 @@
+{
+ "prompt": "The capital of France is",
+ "max_tokens": 32,
+ "text": " Paris.\"\nprint(check_python_version(3.8))  # Output: True\nprint(check_python_version(3.9))  #"
+}

@@ -1,0 +1,12 @@
+[package]
+name = "llm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-cli"
+path = "src/main.rs"
+
+[dependencies]
+llm-engine = { path = "../engine" }

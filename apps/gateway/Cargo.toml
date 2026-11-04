@@ -1,0 +1,22 @@
+[package]
+name = "llm-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-gateway"
+path = "src/main.rs"
+
+[dependencies]
+llm-api = { path = "../api" }
+llm-engine = { path = "../engine" }
+migration = { path = "../../.migrations" }
+axum = "0.8"
+tokio = { workspace = true }
+sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
