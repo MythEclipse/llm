@@ -423,7 +423,7 @@ impl<'a> Model<'a> {
             scores_stride: start + n,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
         };
-        let needed = config.n_head * n * spec.scores_stride;
+        let needed = self.compute.attention_scores(&spec, n);
         scratch.ensure_scores(&self.compute, needed)?;
         self.compute.attend(
             &scratch.q,

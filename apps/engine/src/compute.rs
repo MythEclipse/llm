@@ -72,6 +72,22 @@ const PREFILL_HEADS: usize = 2;
 /// whole block serves exactly one KV head then.
 const PREFILL_HEADS_PER_KV: usize = 8;
 
+/// Which attention kernel the backend will run, and therefore whether a score
+/// grid has to exist at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttentionPath {
+    /// Decode: positions spread over blocks, probabilities never leave registers.
+    DecodeSplit,
+    /// Prefill with keys and values staged, softmax kept online.
+    PrefillTiled,
+    /// Prefill on the f16 tensor cores.
+    PrefillMma,
+    /// One block per (head, query token), writing a full score grid.
+    Serial,
+    /// The host backend, which also writes a full grid.
+    Host,
+}
+
 pub struct AttentionSpec {
     pub n_head: usize,
     pub n_head_kv: usize,
@@ -140,6 +156,12 @@ impl Compute {
     /// `Some("NVIDIA GeForce RTX 4050 Laptop GPU")` when the GPU path is live.
     pub fn device_name(&self) -> Option<&str> {
         self.gpu.as_ref().map(Gpu::name)
+    }
+
+    /// Bytes the engine holds on the device now and at peak, so a benchmark can
+    /// report the footprint next to the speed.
+    pub fn device_footprint(&self) -> Option<(usize, usize)> {
+        self.gpu.as_ref().map(Gpu::device_bytes)
     }
 
     /// Whether the live backend is the device, so a host timer around a launch
@@ -650,6 +672,47 @@ impl Compute {
         }
     }
 
+    /// Score elements the attention kernel of this backend reads. The tiled
+    /// kernels keep their probabilities in registers and shared memory, so they
+    /// ask for none; only the serial kernel and the host path write a full grid
+    /// of `n_head × tokens × scores_stride`. Sizing the scratch from this instead
+    /// of from the grid leaves the largest buffer in the engine unallocated.
+    pub fn attention_scores(&self, spec: &AttentionSpec, tokens: usize) -> usize {
+        match self.attention_path(spec, tokens) {
+            AttentionPath::Serial | AttentionPath::Host => {
+                spec.n_head * tokens * spec.scores_stride
+            }
+            AttentionPath::DecodeSplit
+            | AttentionPath::PrefillTiled
+            | AttentionPath::PrefillMma => 0,
+        }
+    }
+
+    /// Which attention kernel the live backend runs, decided once so the launch
+    /// and the scratch sizing cannot disagree.
+    fn attention_path(&self, spec: &AttentionSpec, tokens: usize) -> AttentionPath {
+        if self.gpu.is_none() {
+            return AttentionPath::Host;
+        }
+        if tokens == 1 {
+            return AttentionPath::DecodeSplit;
+        }
+        let tiled_shape = spec.head_dim == PREFILL_HEAD_DIM
+            && spec.n_head.is_multiple_of(PREFILL_HEADS)
+            && (spec.n_head / spec.n_head_kv).is_multiple_of(PREFILL_HEADS);
+        if std::env::var("LLM_ATTN_OLD").is_ok() && tiled_shape {
+            return AttentionPath::PrefillTiled;
+        }
+        if spec.head_dim == PREFILL_HEAD_DIM && spec.n_head / spec.n_head_kv == PREFILL_HEADS_PER_KV
+        {
+            return AttentionPath::PrefillMma;
+        }
+        if tiled_shape {
+            return AttentionPath::PrefillTiled;
+        }
+        AttentionPath::Serial
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn attend(
         &self,
@@ -678,34 +741,29 @@ impl Compute {
                     scores_stride: spec.scores_stride,
                     scale: spec.scale,
                 };
-                if tokens == 1 {
+                match self.attention_path(spec, tokens) {
                     // Decode: one token has no batch to hide latency behind, so
                     // the positions are spread over blocks instead.
-                    gpu.attention_split(q, k, v, target, geometry, start + tokens)
-                } else if std::env::var("LLM_ATTN_OLD").is_ok()
-                    && spec.head_dim == PREFILL_HEAD_DIM
-                    && spec.n_head.is_multiple_of(PREFILL_HEADS)
-                    && (spec.n_head / spec.n_head_kv).is_multiple_of(PREFILL_HEADS)
-                {
+                    AttentionPath::DecodeSplit => {
+                        gpu.attention_split(q, k, v, target, geometry, start + tokens)
+                    }
                     // A/B switch: the fp32 tiled kernel for comparing numerics.
-                    gpu.attention_prefill(q, k, v, target, geometry, start, tokens)
-                } else if spec.head_dim == PREFILL_HEAD_DIM
-                    && spec.n_head / spec.n_head_kv == PREFILL_HEADS_PER_KV
-                {
-                    // Prefill: eight heads that share one KV head, sixteen
-                    // queries, scores on the f16 tensor cores.
-                    gpu.attention_prefill_mma(q, k, v, target, geometry, start, tokens)
-                } else if spec.head_dim == PREFILL_HEAD_DIM
-                    && spec.n_head.is_multiple_of(PREFILL_HEADS)
-                    && (spec.n_head / spec.n_head_kv).is_multiple_of(PREFILL_HEADS)
-                {
                     // Prefill: sixteen queries per block, keys and values staged
                     // in shared memory, softmax kept online.
-                    gpu.attention_prefill(q, k, v, target, geometry, start, tokens)
-                } else {
+                    AttentionPath::PrefillTiled => {
+                        gpu.attention_prefill(q, k, v, target, geometry, start, tokens)
+                    }
+                    // Prefill: eight heads that share one KV head, sixteen
+                    // queries, scores on the f16 tensor cores.
+                    AttentionPath::PrefillMma => {
+                        gpu.attention_prefill_mma(q, k, v, target, geometry, start, tokens)
+                    }
                     // The tiled kernel fixes four dimensions per lane, which is
                     // what head_dim 128 gives; anything else keeps the serial one.
-                    gpu.attention(q, k, v, target, scratch, geometry, start, tokens)
+                    AttentionPath::Serial => {
+                        gpu.attention(q, k, v, target, scratch, geometry, start, tokens)
+                    }
+                    AttentionPath::Host => unreachable!("device buffers on the host path"),
                 }
             }
             (

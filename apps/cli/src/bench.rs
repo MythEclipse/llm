@@ -129,7 +129,12 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
         });
     }
 
-    report(&measurements, &device, &options.model_path);
+    report(
+        &measurements,
+        &device,
+        &options.model_path,
+        model.compute().device_footprint(),
+    );
     Ok(measurements)
 }
 
@@ -161,7 +166,12 @@ fn deviation(samples: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-fn report(measurements: &[Measurement], device: &str, model_path: &std::path::Path) {
+fn report(
+    measurements: &[Measurement],
+    device: &str,
+    model_path: &std::path::Path,
+    device_bytes: Option<(usize, usize)>,
+) {
     let name = model_path.file_stem().map_or_else(
         || "model".to_string(),
         |stem| stem.to_string_lossy().to_string(),
@@ -174,6 +184,14 @@ fn report(measurements: &[Measurement], device: &str, model_path: &std::path::Pa
             measurement.test, measurement.tokens_per_second, measurement.spread
         );
     }
+    if let Some((live, peak)) = device_bytes {
+        println!("| | | vram | {} live, {} peak |", gib(live), gib(peak));
+    }
+}
+
+/// Bytes as GiB with two decimals, the unit llama.cpp prints its buffers in.
+fn gib(bytes: usize) -> String {
+    format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// JSON form, matching llama-bench's `-o json` shape closely enough to be read by

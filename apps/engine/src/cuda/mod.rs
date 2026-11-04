@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use half::f16;
 
 use sys::{
@@ -25,6 +27,29 @@ use sys::{
 };
 
 use crate::error::EngineError;
+
+/// Bytes the engine holds on the device, and the high-water mark of that.
+/// Process-wide, because every buffer is born in `Gpu::alloc` and frees itself on
+/// drop: the two counters then describe the engine's own footprint, the number
+/// llama.cpp prints as its model and KV buffer sizes, rather than the driver's
+/// view of the whole context.
+static DEVICE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static DEVICE_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes one allocation of `len` f32 values reserves, matching what `Gpu::alloc`
+/// asks the driver for and what `DeviceBuffer::drop` gives back.
+fn allocation_bytes(len: usize) -> usize {
+    (len * 4).max(4)
+}
+
+fn note_allocation(bytes: usize) {
+    let live = DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    DEVICE_PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+}
+
+fn note_release(bytes: usize) {
+    DEVICE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
 
 include!(concat!(env!("OUT_DIR"), "/gpu_ptx.rs"));
 
@@ -110,6 +135,7 @@ impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         // SAFETY: the pointer came from `cuMemAlloc_v2` and is freed once.
         unsafe { cuMemFree_v2(self.pointer) };
+        note_release(allocation_bytes(self.len));
     }
 }
 
@@ -315,7 +341,7 @@ impl Gpu {
         self.bind()?;
         let mut pointer = DevicePtr(0);
         // SAFETY: the driver writes the allocation handle into `pointer`.
-        let status = unsafe { cuMemAlloc_v2(&raw mut pointer, (len * 4).max(4)) };
+        let status = unsafe { cuMemAlloc_v2(&raw mut pointer, allocation_bytes(len)) };
         if status != SUCCESS {
             return Err(EngineError::Unsupported(format!(
                 "cuda: allocation of {} bytes failed: {}",
@@ -323,7 +349,16 @@ impl Gpu {
                 error_message(status)
             )));
         }
+        note_allocation(allocation_bytes(len));
         Ok(DeviceBuffer { pointer, len })
+    }
+
+    /// Bytes held on the device right now, and the most ever held at once.
+    pub fn device_bytes(&self) -> (usize, usize) {
+        (
+            DEVICE_BYTES.load(Ordering::Relaxed),
+            DEVICE_PEAK_BYTES.load(Ordering::Relaxed),
+        )
     }
 
     pub fn upload(&self, destination: &DeviceBuffer, source: &[f32]) -> Result<(), EngineError> {
