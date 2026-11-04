@@ -298,6 +298,26 @@ ctx 1024 itu sekitar 2,7 GB per chunk untuk 42 layer. Menaikkan tile query dari 
 ke 32 memangkasnya setengah, tetapi shared memory-nya menjadi 52 KB dan butuh
 dynamic shared memory (`cuFuncSetAttribute`) karena batas statis 48 KB.
 
+### Ke mana waktu prefill pergi (pp512, 149 ms)
+
+Diukur dengan mematikan satu bagian sekali jalan, bukan diperkirakan:
+
+| Bagian | Waktu | Porsi | Catatan |
+|---|---:|---:|---|
+| Matmul (semua, termasuk proyeksi output) | 106 ms | 71% | kernelnya sendiri 14,2 TMAC/s; yang terukur di sini 9,6 TMAC/s |
+| Attention | 32 ms | 22% | turun dari 43 ms setelah empat query per pembacaan kunci |
+| Elementwise (rmsnorm, rope, kv_append, silu, residual) | 17 ms | 12% | sudah di batas bandwidth DRAM |
+
+Selisih antara 14,2 TMAC/s (kernel sendirian, diukur dengan bobot 267 MB yang
+dialirkan dari DRAM supaya bukan kasus L2) dan 9,6 TMAC/s (di dalam model) adalah
+**kuantisasi gelombang**: `out = 2048` dengan tile 128 baris memberi 16 blok per
+tile token, dan 20 SM berarti satu gelombang pun belum penuh — 64 blok berjalan
+sebagai 3,2 gelombang, jadi 80% efisien. Untuk `out = 6144` angkanya 96%.
+
+Untuk mengejar llama.cpp (87 ms di pp512) tiga hal harus turun bersamaan:
+matmul ke ≈75 ms (kernel penuh, tanpa sisa gelombang), attention ke ≈5 ms (butuh
+tensor core f16 seperti `fattn` milik ggml), dan elementwise ke ≈8 ms (fusion).
+
 ### Attention prefill: empat head per blok
 
 Enam belas head berbagi dua KV head, jadi satu blok per head membaca baris K/V
