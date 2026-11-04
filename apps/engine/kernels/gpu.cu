@@ -393,8 +393,8 @@ extern "C" __global__ void attention_combine(const float* __restrict__ partial_a
 }
 
 // Quantize activations to Q8_0, one warp per 32-element block. Doing this once
-// per matmul is what lets the prompt kernel multiply int8 by int8 with dp4a
-// instead of widening every weight to f32 first.
+// per matmul is what lets the prompt kernel multiply int8 by int8 on the tensor
+// cores instead of widening every weight to f32 first.
 extern "C" __global__ void quantize_rows(const float* __restrict__ x,
                                         signed char* __restrict__ quants,
                                         float* __restrict__ scales,
@@ -417,198 +417,121 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
     quants[offset] = (signed char)roundf(value * inverse);
 }
 
-#define ROWS_PER_BLOCK 4
-#define K_CHUNK 1024
-#define TOKENS_PER_WARP 4
-#define TOKEN_GROUPS 2
-#define STAGES 2
+#define MMA_ROWS 16
+#define MMA_WARPS 4
+#define MMA_K_CHUNK 512
+#define MMA_TOKEN_TILES 8
 
-__device__ __forceinline__ void copy_async(void* destination, const void* source) {
-    const unsigned address = (unsigned)__cvta_generic_to_shared(destination);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(address), "l"(source));
+__device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3,
+                                      int a0, int a1, int a2, int a3,
+                                      int b0, int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void copy_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template <int Pending>
-__device__ __forceinline__ void copy_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(Pending));
-}
-
-// Prompt matmul on int8 pairs. Four output rows are staged into shared memory as
-// int8 — a quarter of the bytes the f32 version had to copy — and each warp runs
-// eight tokens (two groups of four) against that staged tile with dp4a.
+// Prompt matmul on the int8 tensor cores: mma.sync.m16n8k32, the instruction ggml
+// uses for Q8_0 on sm_80+. One warp owns sixteen output rows and walks the tokens
+// eight at a time, so a weight fragment staged once feeds every token tile.
 //
-// Two things decide the speed here, and neither is the arithmetic:
-//
-//  * the copy is asynchronous and double buffered, so the next tile is already in
-//    flight while the current one is being multiplied. Staging synchronously and
-//    then computing left the card waiting on one 4 KB burst per tile and the
-//    weight read ran at a fifth of its bandwidth;
-//  * each lane owns a whole 32-element block, so its eight dp4a land in one int32
-//    accumulator and the block scale is applied once.
-extern "C" __global__ void q8_matmul_dp4a(const float* __restrict__ weight_scales,
-                                         const signed char* __restrict__ weight_quants,
-                                         const float* __restrict__ act_scales,
-                                         const signed char* __restrict__ act_quants,
-                                         float* __restrict__ y,
-                                         int k, int out, int n) {
-    __shared__ signed char tile[STAGES][ROWS_PER_BLOCK][K_CHUNK];
-    __shared__ float tile_scales[STAGES][ROWS_PER_BLOCK][K_CHUNK / 32];
+// Fragment layout, from the PTX ISA: for A, thread t holds the words at byte
+// (t%4)*4 and (t%4)*4+16 of rows t/4 and t/4+8; for B, column t/4 holds the words
+// at (t%4)*4 and 16+(t%4)*4; for D, thread t owns rows {t/4, t/4+8} crossed with
+// columns {2*(t%4), 2*(t%4)+1}. The scale and the store therefore use a different
+// token index than the load — different threads own the input and the output of
+// the same column.
+extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales,
+                                        const signed char* __restrict__ weight_quants,
+                                        const float* __restrict__ act_scales,
+                                        const signed char* __restrict__ act_quants,
+                                        float* __restrict__ y,
+                                        int k, int out, int n) {
+    __shared__ signed char tile[MMA_WARPS * MMA_ROWS][MMA_K_CHUNK];
+    __shared__ float tile_scales[MMA_WARPS * MMA_ROWS][MMA_K_CHUNK / 32];
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int warps = blockDim.y;
     const int threads = blockDim.x * blockDim.y;
     const int tid = warp * blockDim.x + lane;
-    const int first_row = blockIdx.x * ROWS_PER_BLOCK;
     const int blocks = k >> 5;
-    const int chunks = (k + K_CHUNK - 1) / K_CHUNK;
+    const int rows = warps * MMA_ROWS;
+    const int first_row = blockIdx.x * rows + warp * MMA_ROWS;
+    const int group = lane >> 2;
+    const int lane4 = lane & 3;
 
-    // Every warp runs the same number of group iterations, so the __syncthreads
-    // in the tile loop stays reachable for all of them.
-    const int stride = warps * TOKENS_PER_WARP * TOKEN_GROUPS;
-    for (int base = 0; base < n; base += stride) {
-        const int group = base + warp * TOKENS_PER_WARP * TOKEN_GROUPS;
-        float sums[ROWS_PER_BLOCK][TOKENS_PER_WARP * TOKEN_GROUPS];
+    const int token_tiles = (n + 7) / 8;
+    for (int tile_base = 0; tile_base < token_tiles; tile_base += MMA_TOKEN_TILES) {
+        float acc[MMA_TOKEN_TILES][4];
         #pragma unroll
-        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
             #pragma unroll
-            for (int token = 0; token < TOKENS_PER_WARP * TOKEN_GROUPS; ++token) {
-                sums[row][token] = 0.0f;
+            for (int e = 0; e < 4; ++e) {
+                acc[t][e] = 0.0f;
             }
         }
 
-        // Prefetch the first two tiles before any arithmetic happens.
-        for (int stage = 0; stage < STAGES && stage < chunks; ++stage) {
-            const int chunk = stage * K_CHUNK;
-            for (int index = tid * 16; index < ROWS_PER_BLOCK * K_CHUNK; index += threads * 16) {
-                const int row = index / K_CHUNK;
-                const int element = index % K_CHUNK;
+        for (int chunk = 0; chunk < k; chunk += MMA_K_CHUNK) {
+            for (int index = tid * 16; index < rows * MMA_K_CHUNK; index += threads * 16) {
+                const int row = index / MMA_K_CHUNK;
+                const int element = index % MMA_K_CHUNK;
                 const int position = chunk + element;
-                const int target = first_row + row;
+                const int target = blockIdx.x * rows + row;
                 if (position + 16 <= k && target < out) {
-                    copy_async(&tile[stage][row][element],
-                               weight_quants + (size_t)target * k + position);
+                    *reinterpret_cast<int4*>(&tile[row][element]) =
+                        *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position);
                 } else {
-                    *reinterpret_cast<int4*>(&tile[stage][row][element]) = make_int4(0, 0, 0, 0);
+                    *reinterpret_cast<int4*>(&tile[row][element]) = make_int4(0, 0, 0, 0);
                 }
             }
-            copy_async_commit();
-        }
-
-        for (int chunk = 0; chunk < k; chunk += K_CHUNK) {
-            const int stage = (chunk / K_CHUNK) % STAGES;
-            const int ahead = chunk + K_CHUNK;
-            if (ahead < k) {
-                const int target_stage = (stage + 1) % STAGES;
-                for (int index = tid * 16; index < ROWS_PER_BLOCK * K_CHUNK; index += threads * 16) {
-                    const int row = index / K_CHUNK;
-                    const int element = index % K_CHUNK;
-                    const int position = ahead + element;
-                    const int target = first_row + row;
-                    if (position + 16 <= k && target < out) {
-                        copy_async(&tile[target_stage][row][element],
-                                   weight_quants + (size_t)target * k + position);
-                    }
-                }
-            }
-            copy_async_commit();
-
-            // The tile being computed is one group behind the one just queued, so
-            // waiting for all but one group leaves the prefetch in flight.
-            copy_async_wait<1>();
-            __syncthreads();
-
-            for (int index = tid; index < ROWS_PER_BLOCK * (K_CHUNK / 32); index += threads) {
-                const int row = index / (K_CHUNK / 32);
-                const int block = index % (K_CHUNK / 32);
+            for (int index = tid; index < rows * (MMA_K_CHUNK / 32); index += threads) {
+                const int row = index / (MMA_K_CHUNK / 32);
+                const int block = index % (MMA_K_CHUNK / 32);
                 const int position = chunk + block * 32;
-                const int target = first_row + row;
-                tile_scales[stage][row][block] = (position < k && target < out)
+                const int target = blockIdx.x * rows + row;
+                tile_scales[row][block] = (position < k && target < out)
                     ? weight_scales[(size_t)target * blocks + (position >> 5)]
                     : 0.0f;
             }
             __syncthreads();
 
-            #pragma unroll
-            for (int half = 0; half < TOKEN_GROUPS; ++half) {
-                const int first_token = group + half * TOKENS_PER_WARP;
-                for (int block = lane; block < K_CHUNK / 32; block += blockDim.x) {
-                    const int position = chunk + block * 32;
-                    if (position < k) {
-                        int act_value[TOKENS_PER_WARP][8];
-                        float act_scale[TOKENS_PER_WARP];
-                        #pragma unroll
-                        for (int token = 0; token < TOKENS_PER_WARP; ++token) {
-                            int4 low = make_int4(0, 0, 0, 0);
-                            int4 high = make_int4(0, 0, 0, 0);
-                            float scale = 0.0f;
-                            if (first_token + token < n) {
-                                const size_t offset = (size_t)(first_token + token) * k + position;
-                                low = *reinterpret_cast<const int4*>(act_quants + offset);
-                                high = *reinterpret_cast<const int4*>(act_quants + offset + 16);
-                                scale = act_scales[(size_t)(first_token + token) * blocks + (position >> 5)];
-                            }
-                            act_value[token][0] = low.x;
-                            act_value[token][1] = low.y;
-                            act_value[token][2] = low.z;
-                            act_value[token][3] = low.w;
-                            act_value[token][4] = high.x;
-                            act_value[token][5] = high.y;
-                            act_value[token][6] = high.z;
-                            act_value[token][7] = high.w;
-                            act_scale[token] = scale;
-                        }
+            const int warp_row = warp * MMA_ROWS;
+            for (int block = 0; block < MMA_K_CHUNK / 32; ++block) {
+                const int kblk = (chunk >> 5) + block;
+                if (kblk >= blocks) {
+                    break;
+                }
+                const int byte = block * 32 + lane4 * 4;
+                const int* low = reinterpret_cast<const int*>(&tile[warp_row + group][byte]);
+                const int* high = reinterpret_cast<const int*>(&tile[warp_row + group + 8][byte]);
+                const int a0 = low[0];
+                const int a1 = high[0];
+                const int a2 = low[4];
+                const int a3 = high[4];
+                const float weight_low = tile_scales[warp_row + group][block];
+                const float weight_high = tile_scales[warp_row + group + 8][block];
 
-                        int weight_value[ROWS_PER_BLOCK][8];
-                        #pragma unroll
-                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-                            const signed char* staged = &tile[stage][row][block * 32];
-                            const int4 low = *reinterpret_cast<const int4*>(staged);
-                            const int4 high = *reinterpret_cast<const int4*>(staged + 16);
-                            weight_value[row][0] = low.x;
-                            weight_value[row][1] = low.y;
-                            weight_value[row][2] = low.z;
-                            weight_value[row][3] = low.w;
-                            weight_value[row][4] = high.x;
-                            weight_value[row][5] = high.y;
-                            weight_value[row][6] = high.z;
-                            weight_value[row][7] = high.w;
-                        }
-
-                        int acc[ROWS_PER_BLOCK][TOKENS_PER_WARP];
-                        #pragma unroll
-                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-                            #pragma unroll
-                            for (int token = 0; token < TOKENS_PER_WARP; ++token) {
-                                acc[row][token] = 0;
-                            }
-                        }
-                        #pragma unroll
-                        for (int step = 0; step < 8; ++step) {
-                            #pragma unroll
-                            for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-                                #pragma unroll
-                                for (int token = 0; token < TOKENS_PER_WARP; ++token) {
-                                    acc[row][token] = __dp4a(weight_value[row][step],
-                                                             act_value[token][step],
-                                                             acc[row][token]);
-                                }
-                            }
-                        }
-
-                        #pragma unroll
-                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-                            const float weight_scale = tile_scales[stage][row][block];
-                            #pragma unroll
-                            for (int token = 0; token < TOKENS_PER_WARP; ++token) {
-                                sums[row][half * TOKENS_PER_WARP + token] +=
-                                    weight_scale * act_scale[token] * (float)acc[row][token];
-                            }
-                        }
+                #pragma unroll
+                for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
+                    const int fragment_token = (tile_base + t) * 8 + group;
+                    if (fragment_token < n) {
+                        const int* activations = reinterpret_cast<const int*>(
+                            act_quants + (size_t)fragment_token * k + (kblk << 5) + lane4 * 4);
+                        const int b0 = activations[0];
+                        const int b1 = activations[4];
+                        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                        mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+                        const int column = (tile_base + t) * 8 + lane4 * 2;
+                        const float act_low = act_scales[(size_t)column * blocks + kblk];
+                        const float act_high = column + 1 < n
+                            ? act_scales[(size_t)(column + 1) * blocks + kblk]
+                            : 0.0f;
+                        acc[t][0] += weight_low * act_low * (float)d0;
+                        acc[t][1] += weight_low * act_high * (float)d1;
+                        acc[t][2] += weight_high * act_low * (float)d2;
+                        acc[t][3] += weight_high * act_high * (float)d3;
                     }
                 }
             }
@@ -616,17 +539,23 @@ extern "C" __global__ void q8_matmul_dp4a(const float* __restrict__ weight_scale
         }
 
         #pragma unroll
-        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-            const int target = first_row + row;
-            if (target < out) {
-                #pragma unroll
-                for (int token = 0; token < TOKENS_PER_WARP * TOKEN_GROUPS; ++token) {
-                    if (group + token < n) {
-                        const float total = warp_sum(sums[row][token]);
-                        if (lane == 0) {
-                            y[(size_t)(group + token) * out + target] = total;
-                        }
-                    }
+        for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
+            const int column_low = (tile_base + t) * 8 + lane4 * 2;
+            const int column_high = column_low + 1;
+            if (column_low < n) {
+                if (first_row + group < out) {
+                    y[(size_t)column_low * out + first_row + group] = acc[t][0];
+                }
+                if (first_row + group + 8 < out) {
+                    y[(size_t)column_low * out + first_row + group + 8] = acc[t][2];
+                }
+            }
+            if (column_high < n) {
+                if (first_row + group < out) {
+                    y[(size_t)column_high * out + first_row + group] = acc[t][1];
+                }
+                if (first_row + group + 8 < out) {
+                    y[(size_t)column_high * out + first_row + group + 8] = acc[t][3];
                 }
             }
         }

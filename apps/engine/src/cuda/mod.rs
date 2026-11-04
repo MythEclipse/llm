@@ -41,8 +41,9 @@ fn split_count(visible: usize) -> usize {
     wanted.max(required).min(MAX_SPLITS)
 }
 
-/// Output rows per block on the prompt path, matching `ROWS_PER_BLOCK`.
-const ROWS_PER_BLOCK: usize = 4;
+/// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
+const MMA_ROWS: usize = 16;
+const MMA_WARPS: usize = 4;
 
 /// A device allocation of `len` f32 values, freed on drop.
 pub struct DeviceBuffer {
@@ -70,7 +71,7 @@ impl Drop for DeviceBuffer {
 /// A kernel handle, looked up by name once at open time.
 struct Kernels {
     matmul: Function,
-    matmul_dp4a: Function,
+    matmul_mma: Function,
     quantize_rows: Function,
     rmsnorm: Function,
     silu_mul: Function,
@@ -146,7 +147,7 @@ impl Gpu {
 
             let kernels = Kernels {
                 matmul: function(module, "q8_matmul")?,
-                matmul_dp4a: function(module, "q8_matmul_dp4a")?,
+                matmul_mma: function(module, "q8_matmul_mma")?,
                 quantize_rows: function(module, "quantize_rows")?,
                 rmsnorm: function(module, "rmsnorm_rows")?,
                 silu_mul: function(module, "silu_mul")?,
@@ -285,7 +286,7 @@ impl Gpu {
             Arg::Int(n as i32),
         ];
         if n >= WARPS as usize {
-            return self.matmul_dp4a(
+            return self.matmul_prompt(
                 &scales,
                 &quants,
                 &shifted(x.pointer, x_offset),
@@ -545,9 +546,10 @@ impl Gpu {
     }
 
     /// int8 against int8: activations are quantized once per matmul, then the
-    /// prompt kernel multiplies with dp4a and applies the per-block scales.
+    /// prompt kernel multiplies them with the weights and applies the per-block
+    /// scales.
     #[allow(clippy::too_many_arguments)]
-    fn matmul_dp4a(
+    fn matmul_prompt(
         &self,
         weight_scales: &DevicePtr,
         weight_quants: &DevicePtr,
@@ -588,9 +590,9 @@ impl Gpu {
             Arg::Int(n as i32),
         ];
         self.launch(
-            self.kernels.matmul_dp4a,
-            (out.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
-            (LANES, WARPS, 1),
+            self.kernels.matmul_mma,
+            (out.div_ceil(MMA_ROWS * MMA_WARPS) as u32, 1, 1),
+            (LANES, MMA_WARPS as u32, 1),
             0,
             &mut args,
         )

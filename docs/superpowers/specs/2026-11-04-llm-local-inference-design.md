@@ -164,6 +164,8 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + attention decode dipecah antar blok (flash-decoding) | 16,6 ms @ ctx 1024 | dari 26,2 ms; kurva decode rata 15,5 → 20,3 ms sampai ctx 4090 |
 | + aktivasi dikuantisasi ke q8_0, dot int8×int8 (maddubs / dp4a) | prefill 534 tok/s @ ctx 128 | dari 275; CPU 28 → 35 tok/s; sisa selisih ke llama.cpp ada di tensor core |
 | + tile bobot disalin per 16 byte dan lewat cp.async dua tahap | 1,4× pada matmul | salinan per 1 byte hanya 25 GB/s; cp.async sendiri tidak menambah apa pun di titik ini |
+| + jalur prompt pindah ke tensor core `mma.sync.m16n8k32.s8` | prefill 818 tok/s @ ctx 128 | dari 534; matmul sendirian 2,1 TMAC/s vs ≈7,5 TMAC/s setara llama.cpp; sisa selisih karena hanya 128 warp untuk 20 SM |
+| - pemecahan token antar blok pada kernel mma | tidak dipakai | menambah warp tetapi menggandakan baca bobot; 0,128 → 0,155 ms per matmul |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
 warp menjalankan jumlah iterasi yang sama. Versi pertama memakai

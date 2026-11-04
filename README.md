@@ -30,7 +30,7 @@ Variabel lingkungan:
 | `LLM_CONTEXT` | `8192` | ukuran konteks (KV f16 ≈ 43 KB/token) |
 | `LLM_THREADS` | jumlah core | thread rayon untuk matmul (jalur CPU) |
 | `LLM_GPU` | otomatis | `0` memaksa CPU walau ada GPU |
-| `LLM_CUDA_ARCH` | `sm_89` | arsitektur PTX saat build (butuh `nvcc`) |
+| `LLM_CUDA_ARCH` | `sm_89` | arsitektur PTX saat build (butuh `nvcc`); jalur prompt memakai `mma.sync` jadi butuh sm_80 ke atas |
 | `LLM_DATABASE` | `sqlite://llm.db?mode=rwc` | database statistik |
 | `LLM_ADDRESS` | `127.0.0.1:8099` | alamat bind |
 | `LLM_LOG` | `info` | filter tracing |
@@ -128,9 +128,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 534 tok/s (0,24 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 491 tok/s (1,04 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 444 tok/s (2,31 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 818 tok/s (0,16 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 735 tok/s (0,70 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 634 tok/s (1,62 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -183,11 +183,31 @@ dengan int8. Yang diport dari llama.cpp:
 Hasilnya prefill GPU 275 → 534 tok/s pada konteks 128 (dan 235 → 824 tok/s lewat
 CLI pada prompt 215 token), CPU 28 → 35 tok/s. Decode tidak tersentuh.
 
-Yang belum, dan ini yang menjelaskan sisa selisihnya: ggml memakai tensor core
-(`mma.sync.m16n8k32.s8`) untuk Q8_0 di sm_80+, bukan `dp4a`. Angkanya bisa
-dihitung: prefill 5.836 tok/s × 2,58 GFLOP/token ≈ 15 TFLOP/s, sedangkan matmul
-di sini mencapai 1,3–1,9 TMAC/s. Jadi sisa 4–6× itu ada di tensor core, bukan di
-jalur memori atau di pengaturan tile.
+Lalu jalur prompt dipindah ke tensor core — `mma.sync.aligned.m16n8k32` dengan
+akumulasi `s32`, instruksi yang sama yang dipakai ggml untuk Q8_0 di sm_80+:
+
+- satu warp memegang 16 baris keluaran dan menyusuri token delapan sekaligus,
+  jadi fragmen bobot yang sudah di-stage dipakai ulang oleh semua tile token;
+- skala per blok 32 diterapkan setelah `mma` (skala bobot × skala aktivasi),
+  karena akumulasi int32 tidak bisa mencampur blok yang skalanya beda;
+- tata letak fragmen A/B/D diambil dari PTX ISA, dan itu yang paling mudah salah:
+  fragmen B dimiliki kolom `lane/4`, sedangkan D dikembalikan ke kolom
+  `2*(lane%4)` dan `+1` — thread yang berbeda memegang masukan dan keluaran
+  kolom yang sama, jadi skala dan penyimpanan memakai indeks token yang berbeda
+  dari pemuatan.
+
+Prefill 534 → 818 tok/s (ctx 128), 491 → 735 (ctx 512), 444 → 634 (ctx 1024).
+Decode tidak berubah.
+
+Sisa selisihnya sekarang 5,4× pada prefill. Yang saya ukur dan belum tertutup:
+matmul sendirian berjalan 2,1 TMAC/s, sedangkan prefill llama.cpp setara
+≈ 7,5 TMAC/s. Penyebab yang paling mungkin bukan lagi jenis instruksi
+(keduanya `mma.sync`) melainkan jumlah warp: dengan 16 baris per warp dan 2048
+baris keluaran hanya ada 128 warp untuk 20 SM, sekitar 6 warp per SM, dan
+pengukuran menunjukkan pembacaan bobot berhenti di 33–90 GB/s. Memecah token
+antar blok sudah dicoba (tidak menolong, biaya baca bobot dua kali lipat);
+memecah k antar blok belum dicoba dan itu cara menambah warp tanpa menambah
+trafik.
 
 Empat percobaan yang **tidak** menolong, dicatat supaya tidak diulang: memecah
 rantai 8 `dp4a` menjadi 16 akumulator independen (0%), mengubah granularitas lane
