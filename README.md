@@ -135,9 +135,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 3.518 tok/s (0,04 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 4.063 tok/s (0,13 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 3.734 tok/s (0,29 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 3.438 tok/s (0,04 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 4.099 tok/s (0,12 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 3.758 tok/s (0,27 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -307,14 +307,14 @@ antre. Untuk satu prefill 512 token:
 | Kernel | Total ms | Panggilan | ms/panggilan |
 |---|---:|---:|---:|
 | `q8_matmul_mma` | 81,9 | 294 | 0,279 |
-| `attention_prefill` | 27,8 | 42 | 0,663 |
+| `attention_prefill` | 25,1 | 42 | 0,596 |
 | `quantize_rows` | 4,8 | 168 | 0,029 |
 | `silu_mul` | 7,8 | 42 | 0,186 |
 | `residual_add` | 3,5 | 84 | 0,042 |
 | `rmsnorm_rows` | 2,6 | 85 | 0,031 |
 | `rope` | 2,1 | 84 | 0,025 |
 | sisanya | ~1,9 | — | — |
-| **jumlah** | **125,5** | | |
+| **jumlah** | **124,2** | | |
 
 Wall prefill ~126 ms, jadi hampir seluruhnya kernel — tidak ada kebocoran di
 antara peluncuran. Matmul berjalan 13,0 TMAC/s di dalam model versus 13,5 TMAC/s
@@ -360,6 +360,12 @@ Decode tidak tersentuh. Diverifikasi terhadap referensi host: selisih maksimum
 Delapan head per blok (K/V tinggal dibaca dua kali per chunk) butuh 112 KB dan
 melewati batas 99 KB per blok di sm_89, jadi langkah itu menunggu tile query yang
 lebih kecil atau query dalam f16.
+
+Sesudah itu blok diubah ke **dua head tanpa buffer probabilitas**: probabilitas
+tinggal di register dan sampai ke pass value lewat `__shfl_sync`, jadi shared turun
+ke 48 KB dan dua blok muat per SM (16 warp, bukan 8). Attention 27,8 → 25,1 ms.
+Tapi trafik K/V jadi dua kali lebih sering, sehingga pp128 turun 3.518 → 3.438
+sementara pp512 dan pp1024 naik (4.063 → 4.099 dan 3.734 → 3.758).
 
 ### Attention prefill: dua query per pembacaan kunci
 
@@ -431,9 +437,9 @@ ada proses lain yang memakai GPU.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.518 ± 54 tok/s | 4.546 ± 482 tok/s | 77% |
-| pp512 | 4.063 ± 4,4 tok/s | 5.890 ± 161 tok/s | 69% |
-| pp1024 | 3.734 ± 0,8 tok/s | 5.796 ± 187 tok/s | 64% |
+| pp128 | 3.438 ± 26 tok/s | 4.546 ± 482 tok/s | 76% |
+| pp512 | 4.099 ± 0,8 tok/s | 5.890 ± 161 tok/s | 70% |
+| pp1024 | 3.758 ± 4,7 tok/s | 5.796 ± 187 tok/s | 65% |
 | tg128 | **63,2 ± 0,02 tok/s** | 71,2 ± 0,03 tok/s | 89% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
@@ -449,7 +455,7 @@ Bacaan jujurnya:
 - **Decode sepadan**: 89% dan kurvanya rata terhadap konteks seperti llama.cpp.
   Selisihnya ongkos repack (1,125 vs 1,0625 byte per parameter) ditambah attention
   yang belum di-tile dengan cara yang sama.
-- **Prefill 1,3–1,6× tertinggal**: 77% pada 128 token, 69% pada 512, 64% pada
+- **Prefill 1,3–1,5× tertinggal**: 76% pada 128 token, 70% pada 512, 65% pada
   1024. Dua penyebab yang sudah terukur:
   matmul sendirian berjalan 5,5 TMAC/s sedangkan prefill llama.cpp setara
   ≈7,5 TMAC/s, dan attention prefill membaca ulang K/V untuk setiap blok query.

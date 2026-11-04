@@ -47,15 +47,15 @@ fn split_count(visible: usize) -> usize {
 const PREFILL_QUERY_TILE: usize = 16;
 /// Heads per prefill attention block, matching `FA_HEADS`: four heads that share
 /// one KV head, so the staged keys and values are read once instead of four times.
-const PREFILL_HEADS: usize = 4;
+const PREFILL_HEADS: usize = 2;
 /// Warps per prefill attention block, matching `FA_WARPS`.
 const PREFILL_WARPS: usize = 8;
 /// Shared memory the tiled attention kernel asks for: four heads of queries, one
 /// key tile, one value tile, and the probabilities.
-/// Shared memory the tiled attention kernel asks for: four heads of queries, one
-/// key tile, one value tile, and the probabilities. Keys and values are key-major
-/// so a lane can pull four dims of its own key in one read.
-const PREFILL_SHARED_BYTES: u32 = 73_728;
+/// Shared memory the tiled attention kernel asks for: two heads of queries, one key
+/// tile and one value tile. The probabilities stay in registers, which is what keeps
+/// the block small enough for two of them to share an SM.
+const PREFILL_SHARED_BYTES: u32 = 49_152;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;

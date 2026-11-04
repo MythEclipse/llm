@@ -641,20 +641,16 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
 }
 
 // Prefill attention, tiled the way ggml's fattn-tile does it: one block per head
-// group and per sixteen query positions, keys and values staged in shared memory
+// pair and per sixteen query positions, keys and values staged in shared memory
 // thirty-two positions at a time, and the softmax kept online so nothing of size
 // `visible` is ever materialised.
 //
-// The head group is what makes it cheap. Sixteen heads share two KV heads, so
-// serving one head per block read the same K/V rows eight times over; four heads
-// to a block cuts that to two, and the staged tile is then the only copy.
-//
-// The inner loops are written around what shared memory can deliver. A scalar dot
-// needs two shared reads for every multiply-add, which caps the warp at sixteen
-// multiply-adds per cycle however fast the arithmetic units are. Carrying two
-// queries through the same key load moves that to forty-two: the four key reads
-// serve both queries, and each query's four dims arrive in one broadcast.
-#define FA_HEADS 4
+// Two heads to a block rather than four, and no probability buffer: the
+// probabilities stay in registers and reach the value pass through `__shfl_sync`.
+// That is what brings the block under 48 KB, so two of them fit on an SM instead
+// of one — sixteen warps to hide shared-memory latency with, where four heads and
+// a probability buffer left eight.
+#define FA_HEADS 2
 #define FA_QUERY_TILE 16
 #define FA_KEY_TILE 32
 #define FA_WARPS 8
@@ -675,7 +671,6 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
     float* q_tile = reinterpret_cast<float*>(smem);
     float* k_tile = q_tile + FA_HEADS * FA_QUERY_TILE * FA_MAX_HEAD_DIM;
     float* v_tile = k_tile + FA_KEY_TILE * FA_KEY_STRIDE;
-    float* weight = v_tile + FA_KEY_TILE * FA_MAX_HEAD_DIM;
 
     const int group = blockIdx.x;
     const int tile = blockIdx.y;
@@ -726,22 +721,22 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
             const int dim = index % head_dim;
             const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
             // Keys stay dim-major: a lane owns one key and reads k_tile[dim][lane],
-            // so the warp touches thirty-two different banks. Key-major would put
-            // every lane on the same bank and serialise the read.
+            // so the warp touches thirty-two different banks.
             k_tile[dim * FA_KEY_TILE + row] = keys[source];
             v_tile[row * FA_MAX_HEAD_DIM + dim] = values[source];
         }
         __syncthreads();
 
+        // Each query group runs its scores and its value accumulation back to
+        // back, so the probabilities never leave registers: the value pass reads
+        // lane `row`'s probability with a shuffle instead of a shared load.
         #pragma unroll
         for (int base_query = 0; base_query < FA_QUERIES_PER_WARP; base_query += FA_QUERY_GROUP) {
-            // Four queries ride through one set of key reads. The second query of
-            // the group sees one more key than the first, the third two more, and
-            // so on, so the guard is per query even though the load is shared.
-            float dots[FA_QUERY_GROUP];
+            float dots[FA_QUERY_GROUP][2];
             #pragma unroll
             for (int q = 0; q < FA_QUERY_GROUP; ++q) {
-                dots[q] = 0.0f;
+                dots[q][0] = 0.0f;
+                dots[q][1] = 0.0f;
             }
             if (base + lane < start + first_query + first_of_warp + base_query + FA_QUERY_GROUP) {
                 for (int dim = 0; dim < head_dim; dim += FA_DIMS_PER_LANE) {
@@ -754,23 +749,24 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                         const float* row = q_tile + head_slot * FA_QUERY_TILE * FA_MAX_HEAD_DIM
                             + (first_of_warp + base_query + q) * FA_MAX_HEAD_DIM;
                         const float4 values = *reinterpret_cast<const float4*>(row + dim);
-                        dots[q] += values.x * key0 + values.y * key1
-                            + values.z * key2 + values.w * key3;
+                        dots[q][0] += values.x * key0 + values.y * key1;
+                        dots[q][1] += values.z * key2 + values.w * key3;
                     }
                 }
             }
+
+            float probabilities[FA_QUERY_GROUP];
             #pragma unroll
             for (int q = 0; q < FA_QUERY_GROUP; ++q) {
-                // `slot` is the warp-local index the accumulators are sized for;
-                // `query_index` is the position inside the block's query tile.
                 const int slot = base_query + q;
                 const int query_index = first_of_warp + slot;
                 const int visible = start + first_query + query_index + 1;
-                const float score = (base + lane < visible) ? dots[q] * scale : -INFINITY;
+                const float score =
+                    (base + lane < visible) ? (dots[q][0] + dots[q][1]) * scale : -INFINITY;
                 const float tile_max = warp_max(score);
                 const float new_max = fmaxf(running_max[slot], tile_max);
-                const float probability = score == -INFINITY ? 0.0f : expf(score - new_max);
-                const float tile_sum = warp_sum(probability);
+                probabilities[q] = score == -INFINITY ? 0.0f : expf(score - new_max);
+                const float tile_sum = warp_sum(probabilities[q]);
                 const float correction = running_max[slot] == -INFINITY
                     ? 0.0f
                     : expf(running_max[slot] - new_max);
@@ -780,27 +776,23 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                 for (int d = 0; d < FA_DIMS_PER_LANE; ++d) {
                     acc[slot][d] *= correction;
                 }
-                weight[(head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE + lane] =
-                    probability;
             }
-        }
-        __syncthreads();
 
-        #pragma unroll
-        for (int base_query = 0; base_query < FA_QUERIES_PER_WARP; base_query += FA_QUERY_GROUP) {
             for (int row = 0; row < keys_here; ++row) {
+                float probability[FA_QUERY_GROUP];
+                #pragma unroll
+                for (int q = 0; q < FA_QUERY_GROUP; ++q) {
+                    probability[q] = __shfl_sync(0xffffffffu, probabilities[q], row);
+                }
                 const float4 value = *reinterpret_cast<const float4*>(
                     v_tile + row * FA_MAX_HEAD_DIM + lane * FA_DIMS_PER_LANE);
                 #pragma unroll
                 for (int q = 0; q < FA_QUERY_GROUP; ++q) {
                     const int slot = base_query + q;
-                    const int query_index = first_of_warp + slot;
-                    const float probability =
-                        weight[(head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE + row];
-                    acc[slot][0] += probability * value.x;
-                    acc[slot][1] += probability * value.y;
-                    acc[slot][2] += probability * value.z;
-                    acc[slot][3] += probability * value.w;
+                    acc[slot][0] += probability[q] * value.x;
+                    acc[slot][1] += probability[q] * value.y;
+                    acc[slot][2] += probability[q] * value.z;
+                    acc[slot][3] += probability[q] * value.w;
                 }
             }
         }
