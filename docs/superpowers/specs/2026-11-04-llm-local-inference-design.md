@@ -176,7 +176,8 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + kernel prompt 16 warp, 256 baris/blok, 16 baris/warp (`__launch_bounds__(512)`) | 2.740 / 3.165 / 2.686 tok/s | pp512 +5,5%, pp1024 +5%; 128 register/thread, tanpa spill |
 | - jalur tensor core f16 (dekuantisasi Q8_0 → f16 saat staging) | tidak dipakai | 1,6× lebih lambat (1.893 vs 3.000): dekuantisasi diulang per tile token dan f16 menggandakan trafik shared; presisi juga 3× lebih longgar (3,5e-3 vs 1e-3) |
 | + tile token kernel prompt 64 → 128 (satu tile bobot di shared untuk 128 token), 8 warp/128 baris, k chunk 256 | pp128/512/1024 = 2.929 / 3.190 / 2.747 tok/s | 178 register tanpa spill, 77.824 byte shared |
-| + attention prefill: dua query per pembacaan kunci, query via `float4` broadcast | pp128/512/1024 = 3.147 / 3.488 / 3.173 tok/s | dari 2.929 / 3.190 / 2.747; biaya attention 27% → 20% dari pp512 |
+| + attention prefill: empat query per pembacaan kunci, query via `float4` broadcast | pp128/512/1024 = 3.190 / 3.605 / 3.355 tok/s | dari 2.929 / 3.190 / 2.747; biaya attention 27% → 20% dari pp512 |
+| + test `attention_prefill` membandingkan kernel dengan referensi host per elemen | selisih maksimum 1,6e-6 | menangkap bug indeks akumulator (indeks global 0..15 dipakai pada array 8 slot) yang tidak terlihat di golden logits |
 | - attention dengan K key-major (float4 per lane) | tidak dipakai | stride 128 float membuat semua lane mendarat di bank yang sama: 3.036 vs 3.143 |
 | - `cp.async` dua tahap | tidak dipakai | pada 16 warp 130 register × 512 thread melebihi berkas register; pada bentuk yang muat (8 warp, k chunk 128) hasilnya 2.793 dan test toleransi gagal — lebih lambat dan tidak benar |
 | - tile 128 token dengan k chunk 128 | tidak dipakai | 2.947 / 2.946 / 2.599; k chunk 128 kalah di semua jumlah warp |
