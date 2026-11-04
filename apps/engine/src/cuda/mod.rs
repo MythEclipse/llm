@@ -70,6 +70,9 @@ const MMA_BLOCK_TOKENS: usize = 128;
 const MMA_TOKENS: usize = 1024;
 
 /// A device allocation of `len` f32 values, freed on drop.
+/// Activations already quantised on the device, ready for one or more matmuls.
+pub struct Prepared(DevicePtr);
+
 pub struct DeviceBuffer {
     pointer: DevicePtr,
     len: usize,
@@ -287,6 +290,7 @@ impl Gpu {
 
     /// `y[t·out + o] = Σᵢ x[t·k + i] · W[o·k + i]`, weights uploaded once.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         &self,
         identity: (usize, usize),
@@ -298,6 +302,7 @@ impl Gpu {
         out: usize,
         y: &DeviceBuffer,
         y_offset: usize,
+        prepared: Option<&Prepared>,
     ) -> Result<(), EngineError> {
         assert!(
             k.is_multiple_of(32),
@@ -317,15 +322,20 @@ impl Gpu {
             Arg::Int(n as i32),
         ];
         if n >= WARPS as usize {
-            return self.matmul_prompt(
-                &scales,
-                &quants,
-                &shifted(x.pointer, x_offset),
-                n,
-                k,
-                out,
-                &shifted(y.pointer, y_offset),
-            );
+            if n > MMA_TOKENS {
+                return Err(EngineError::Unsupported(format!(
+                    "prompt matmul holds {MMA_TOKENS} tokens, got {n}"
+                )));
+            }
+            let owned;
+            let prepared = match prepared {
+                Some(prepared) => prepared,
+                None => {
+                    owned = self.prepare(x, x_offset, n, k)?;
+                    &owned
+                }
+            };
+            return self.matmul_prompt_prepared(&scales, &quants, prepared, n, k, out, y, y_offset);
         }
         // Decode path keeps the row in registers, so it needs no shared memory —
         // and asking for 24 KB anyway costs occupancy.
@@ -618,31 +628,23 @@ impl Gpu {
     /// prompt kernel multiplies them with the weights and applies the per-block
     /// scales.
     #[allow(clippy::too_many_arguments)]
-    fn matmul_prompt(
+    /// Quantises activations once, so several matmuls reading the same rows — the
+    /// q, k and v projections, or the two feed-forward ones — pay for it once
+    /// instead of once each.
+    pub fn prepare(
         &self,
-        weight_scales: &DevicePtr,
-        weight_quants: &DevicePtr,
-        x: &DevicePtr,
+        x: &DeviceBuffer,
+        x_offset: usize,
         n: usize,
         k: usize,
-        out: usize,
-        y: &DevicePtr,
-    ) -> Result<(), EngineError> {
-        if n > MMA_TOKENS {
-            return Err(EngineError::Unsupported(format!(
-                "prompt matmul holds {MMA_TOKENS} tokens, got {n}"
-            )));
-        }
+    ) -> Result<Prepared, EngineError> {
         let blocks = k / 32;
         let quants_bytes = n * k;
         let buffer = self.activation_workspace(quants_bytes, n * blocks)?;
-        let act_quants = buffer;
-        let act_scales = shifted(buffer, quants_bytes / 4);
-
         let mut quantize_args = [
-            Arg::Pointer(*x),
-            Arg::Pointer(act_quants),
-            Arg::Pointer(act_scales),
+            Arg::Pointer(shifted(x.pointer, x_offset)),
+            Arg::Pointer(buffer),
+            Arg::Pointer(shifted(buffer, quants_bytes / 4)),
             Arg::Int(k as i32),
         ];
         self.launch(
@@ -652,13 +654,35 @@ impl Gpu {
             0,
             &mut quantize_args,
         )?;
+        Ok(Prepared(buffer))
+    }
 
+    /// The prompt matmul on activations `prepare` has already quantised.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_prompt_prepared(
+        &self,
+        weight_scales: &DevicePtr,
+        weight_quants: &DevicePtr,
+        prepared: &Prepared,
+        n: usize,
+        k: usize,
+        out: usize,
+        y: &DeviceBuffer,
+        y_offset: usize,
+    ) -> Result<(), EngineError> {
+        if n > MMA_TOKENS {
+            return Err(EngineError::Unsupported(format!(
+                "prompt matmul holds {MMA_TOKENS} tokens, got {n}"
+            )));
+        }
+        let act_quants = prepared.0;
+        let act_scales = shifted(prepared.0, n * k / 4);
         let mut args = [
             Arg::Pointer(*weight_scales),
             Arg::Pointer(*weight_quants),
             Arg::Pointer(act_scales),
             Arg::Pointer(act_quants),
-            Arg::Pointer(*y),
+            Arg::Pointer(shifted(y.pointer, y_offset)),
             Arg::Int(k as i32),
             Arg::Int(out as i32),
             Arg::Int(n as i32),

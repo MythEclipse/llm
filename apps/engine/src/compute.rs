@@ -30,6 +30,17 @@ impl Activation {
     }
 }
 
+/// Tokens at which the prompt kernels take over from the row-at-a-time ones,
+/// matching the device's warp count.
+const PREPARE_MIN_TOKENS: usize = 8;
+
+/// Activations already quantised for the matmuls that read them. `buffer` is
+/// `None` on the CPU, where the dot product quantises per row and there is nothing
+/// to prepare.
+pub struct Prepared {
+    buffer: Option<crate::cuda::Prepared>,
+}
+
 /// Attention geometry for one launch.
 /// Head dimension the tiled prefill attention kernel is written for.
 const PREFILL_HEAD_DIM: usize = 128;
@@ -186,6 +197,53 @@ impl Compute {
         }
     }
 
+    /// Activations quantised once for a group of matmuls that share them. On the
+    /// CPU there is nothing to do: the dot product quantises per row as it goes,
+    /// so `buffer` stays `None` and the caller falls back to `matmul`.
+    pub fn prepare(
+        &self,
+        x: &Activation,
+        x_offset: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Prepared, EngineError> {
+        // Below the prompt threshold the matmul takes the row-at-a-time kernel,
+        // which quantises as it goes and never reads the buffer, so preparing one
+        // would be a launch per matmul for nothing.
+        if n < PREPARE_MIN_TOKENS {
+            return Ok(Prepared { buffer: None });
+        }
+        match (&self.gpu, x) {
+            (Some(gpu), Activation::Device(buffer)) => Ok(Prepared {
+                buffer: Some(gpu.prepare(buffer, x_offset, n, k)?),
+            }),
+            _ => Ok(Prepared { buffer: None }),
+        }
+    }
+
+    /// `matmul` on activations `prepare` already quantised.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_prepared(
+        &self,
+        weight: &Weight<'_>,
+        x: &Activation,
+        x_offset: usize,
+        prepared: &Prepared,
+        n: usize,
+        y: &mut Activation,
+        y_offset: usize,
+    ) -> Result<(), EngineError> {
+        self.matmul_with(
+            weight,
+            x,
+            x_offset,
+            n,
+            y,
+            y_offset,
+            prepared.buffer.as_ref(),
+        )
+    }
+
     pub fn matmul(
         &self,
         weight: &Weight<'_>,
@@ -194,6 +252,20 @@ impl Compute {
         n: usize,
         y: &mut Activation,
         y_offset: usize,
+    ) -> Result<(), EngineError> {
+        self.matmul_with(weight, x, x_offset, n, y, y_offset, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_with(
+        &self,
+        weight: &Weight<'_>,
+        x: &Activation,
+        x_offset: usize,
+        n: usize,
+        y: &mut Activation,
+        y_offset: usize,
+        prepared: Option<&crate::cuda::Prepared>,
     ) -> Result<(), EngineError> {
         match (&self.gpu, x, y) {
             (Some(gpu), Activation::Device(source), Activation::Device(target))
@@ -209,6 +281,7 @@ impl Compute {
                     weight.out,
                     target,
                     y_offset,
+                    prepared,
                 )
             }
             (None, Activation::Host(source), Activation::Host(target)) => {

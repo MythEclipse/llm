@@ -351,12 +351,36 @@ impl<'a> Model<'a> {
 
         self.compute
             .rmsnorm(x, 0, layer.attn_norm, config.eps, n, &mut scratch.normed, 0)?;
-        self.compute
-            .matmul(&layer.wq, &scratch.normed, 0, n, &mut scratch.q, 0)?;
-        self.compute
-            .matmul(&layer.wk, &scratch.normed, 0, n, &mut scratch.k, 0)?;
-        self.compute
-            .matmul(&layer.wv, &scratch.normed, 0, n, &mut scratch.v, 0)?;
+        // q, k and v read the same normalised rows, so they share one
+        // quantisation of them instead of paying for three.
+        let normed = self.compute.prepare(&scratch.normed, 0, n, embd)?;
+        self.compute.matmul_prepared(
+            &layer.wq,
+            &scratch.normed,
+            0,
+            &normed,
+            n,
+            &mut scratch.q,
+            0,
+        )?;
+        self.compute.matmul_prepared(
+            &layer.wk,
+            &scratch.normed,
+            0,
+            &normed,
+            n,
+            &mut scratch.k,
+            0,
+        )?;
+        self.compute.matmul_prepared(
+            &layer.wv,
+            &scratch.normed,
+            0,
+            &normed,
+            n,
+            &mut scratch.v,
+            0,
+        )?;
 
         self.compute.rope(
             &mut scratch.q,
@@ -414,10 +438,25 @@ impl<'a> Model<'a> {
 
         self.compute
             .rmsnorm(x, 0, layer.ffn_norm, config.eps, n, &mut scratch.normed, 0)?;
-        self.compute
-            .matmul(&layer.w_gate, &scratch.normed, 0, n, &mut scratch.gate, 0)?;
-        self.compute
-            .matmul(&layer.w_up, &scratch.normed, 0, n, &mut scratch.up, 0)?;
+        let normed = self.compute.prepare(&scratch.normed, 0, n, embd)?;
+        self.compute.matmul_prepared(
+            &layer.w_gate,
+            &scratch.normed,
+            0,
+            &normed,
+            n,
+            &mut scratch.gate,
+            0,
+        )?;
+        self.compute.matmul_prepared(
+            &layer.w_up,
+            &scratch.normed,
+            0,
+            &normed,
+            n,
+            &mut scratch.up,
+            0,
+        )?;
         self.compute
             .silu_mul(&mut scratch.activated, &scratch.gate, &scratch.up, n * ffn)?;
         self.compute.matmul(

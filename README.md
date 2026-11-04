@@ -135,9 +135,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 3.190 tok/s (0,04 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 3.605 tok/s (0,14 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 3.355 tok/s (0,31 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 3.344 tok/s (0,04 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 3.800 tok/s (0,13 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 3.521 tok/s (0,30 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -305,6 +305,7 @@ Diukur dengan mematikan satu bagian sekali jalan, bukan diperkirakan:
 | Bagian | Waktu | Porsi | Catatan |
 |---|---:|---:|---|
 | Matmul (semua, termasuk proyeksi output) | 106 ms | 71% | kernelnya sendiri 14,2 TMAC/s; yang terukur di sini 9,6 TMAC/s |
+| — di dalamnya: kuantisasi aktivasi | 20 ms | 13% | dulu 7 kali per layer, sekarang 4 (q/k/v berbagi satu) |
 | Attention | 32 ms | 22% | turun dari 43 ms setelah empat query per pembacaan kunci |
 | Elementwise (rmsnorm, rope, kv_append, silu, residual) | 17 ms | 12% | sudah di batas bandwidth DRAM |
 
@@ -408,9 +409,9 @@ ada proses lain yang memakai GPU.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.190 ± 26 tok/s | 4.546 ± 482 tok/s | 70% |
-| pp512 | 3.605 ± 2,5 tok/s | 5.890 ± 161 tok/s | 61% |
-| pp1024 | 3.355 ± 2,5 tok/s | 5.796 ± 187 tok/s | 58% |
+| pp128 | 3.344 ± 23 tok/s | 4.546 ± 482 tok/s | 74% |
+| pp512 | 3.800 ± 0,7 tok/s | 5.890 ± 161 tok/s | 65% |
+| pp1024 | 3.521 ± 1,1 tok/s | 5.796 ± 187 tok/s | 61% |
 | tg128 | **63,2 ± 0,02 tok/s** | 71,2 ± 0,03 tok/s | 89% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
@@ -426,7 +427,7 @@ Bacaan jujurnya:
 - **Decode sepadan**: 89% dan kurvanya rata terhadap konteks seperti llama.cpp.
   Selisihnya ongkos repack (1,125 vs 1,0625 byte per parameter) ditambah attention
   yang belum di-tile dengan cara yang sama.
-- **Prefill 1,4–1,7× tertinggal**: 70% pada 128 token, 61% pada 512, 58% pada
+- **Prefill 1,4–1,6× tertinggal**: 74% pada 128 token, 65% pada 512, 61% pada
   1024. Dua penyebab yang sudah terukur:
   matmul sendirian berjalan 5,5 TMAC/s sedangkan prefill llama.cpp setara
   ≈7,5 TMAC/s, dan attention prefill membaca ulang K/V untuk setiap blok query.

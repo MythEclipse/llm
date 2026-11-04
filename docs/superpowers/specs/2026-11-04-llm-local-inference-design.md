@@ -178,6 +178,7 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + tile token kernel prompt 64 → 128 (satu tile bobot di shared untuk 128 token), 8 warp/128 baris, k chunk 256 | pp128/512/1024 = 2.929 / 3.190 / 2.747 tok/s | 178 register tanpa spill, 77.824 byte shared |
 | + attention prefill: empat query per pembacaan kunci, query via `float4` broadcast | pp128/512/1024 = 3.190 / 3.605 / 3.355 tok/s | dari 2.929 / 3.190 / 2.747; biaya attention 27% → 20% dari pp512 |
 | · pengukuran anggaran waktu prefill pp512 (ablation) | matmul 106 ms (71%), attention 32 ms (22%), elementwise 17 ms (12%) | kernel matmul sendirian 14,2 TMAC/s vs 9,6 TMAC/s di dalam model; selisihnya kuantisasi gelombang (64 blok = 3,2 gelombang pada 20 SM) |
+| + kuantisasi aktivasi dibagi antar matmul (`Compute::prepare` + `matmul_prepared`) | pp128/512/1024 = 3.344 / 3.800 / 3.521 tok/s | dari 3.199 / 3.605 / 3.359; kuantisasi 20 ms (14%) turun karena q/k/v berbagi satu pass dan gate/up berbagi satu, 7 → 4 per layer |
 | - kuantisasi aktivasi menyatu di staging matmul | tidak dipakai | aktivasi f32 empat kali lebih besar dari int8 dan dibaca ulang per tile baris: 3.185 vs 3.605 |
 | + test `attention_prefill` membandingkan kernel dengan referensi host per elemen | selisih maksimum 1,6e-6 | menangkap bug indeks akumulator (indeks global 0..15 dipakai pada array 8 slot) yang tidak terlihat di golden logits |
 | - attention dengan K key-major (float4 per lane) | tidak dipakai | stride 128 float membuat semua lane mendarat di bank yang sama: 3.036 vs 3.143 |
