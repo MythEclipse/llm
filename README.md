@@ -220,13 +220,16 @@ memakai `perf_profile` (median 9 langkah decode per titik).
 | VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB | — | — |
 | Load + 1 token (wall) | 1,07 s | 1,32 s | 0,24 s | 2,90 s |
 
-Uji ujung-ke-ujung lewat CLI, prompt 87 kata (227 token), `-n 128`, `--temp 0`,
-dua putaran bergantian supaya kondisi termal sama:
+Uji ujung-ke-ujung lewat CLI, `-n 128`, `--temp 0`, dua putaran bergantian supaya
+kondisi termal sama. Prompt pendek 215 token, prompt panjang 1071 token (teks
+sama diulang lima kali):
 
-| | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
-|---|---:|---:|---:|---:|
-| Prompt | 247 tok/s | 4.490 tok/s | 25 tok/s | 67 tok/s |
-| Generation | 54,2 tok/s | 68,6 tok/s | 11,2 tok/s | 18,5 tok/s |
+| Prompt | Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
+|---|---|---:|---:|---:|---:|
+| 215 token | Prompt | 235 tok/s | 3.703–4.073 tok/s | 24,5 tok/s | 64,3 tok/s |
+| 215 token | Generation | 62,1 tok/s | 68,4–68,6 tok/s | 14,5 tok/s | 19,2 tok/s |
+| 1071 token | Prompt | 239 tok/s | 5.013–5.183 tok/s | 18,7 tok/s | 70,8 tok/s |
+| 1071 token | Generation | 59,2 tok/s | 67,4–67,5 tok/s | 7,4 tok/s | 19,3 tok/s |
 
 Bacaan jujurnya:
 
@@ -239,10 +242,13 @@ Bacaan jujurnya:
   dikuantisasi ke int8 lalu di-dot dengan `dp4a`/MMA tensor core, sedangkan
   engine ini menjumlahkan f32 lewat FMA biasa. Selisih 4.431 vs 275 tok/s itu
   kelas algoritma, bukan tuning.
-- **Di CPU prefill tertinggal 3,5×, decode imbang di ctx 0 lalu tertinggal.**
-  Penyebab prefill sama sifatnya: ggml memakai `_mm256_maddubs_epi16` (int8×int8)
-  setelah aktivasi dikuantisasi, engine ini memakai `_mm256_cvtepi8_epi32`
-  (int8×f32) supaya tidak perlu langkah kuantisasi aktivasi.
+- **Di CPU prefill tertinggal 3,5×, dan decode masih menurun dengan konteks**
+  (14,5 → 7,4 tok/s dari prompt 215 ke 1071 token) sementara llama.cpp tetap
+  19,2–19,3. Pemecahan attention antar blok baru dikerjakan di jalur CUDA; jalur
+  CPU masih menyusuri KV secara serial per (head, token). Prefill tertinggal
+  karena sebab yang sama seperti di GPU: ggml memakai `_mm256_maddubs_epi16`
+  (int8×int8) setelah aktivasi dikuantisasi, engine ini memakai
+  `_mm256_cvtepi8_epi32` (int8×f32) supaya tidak perlu langkah kuantisasi.
 - **VRAM 3,1 vs 2,49 GiB** karena bidang `scales` f32 menyimpan 4 byte per 32
   elemen yang di GGUF hanya 2 byte (f16).
 
