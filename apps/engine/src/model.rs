@@ -80,16 +80,23 @@ pub struct KvCache {
     keys: Vec<Activation>,
     values: Vec<Activation>,
     len: usize,
+    entries_f16: bool,
 }
 
 impl KvCache {
     pub fn new(compute: &Compute, config: &Config, capacity: usize) -> Result<Self, EngineError> {
         let per_layer = capacity * config.kv_dim();
+        // On the device the cache is f16 (llama.cpp's precision), so an entry is
+        // two bytes and the buffer holds half as many f32 slots as positions ×
+        // dims. The host path keeps f32 entries because its attention reads the
+        // cache as plain slices.
+        let device = compute.device_name().is_some();
+        let slots = if device { per_layer.div_ceil(2) } else { per_layer };
         let mut keys = Vec::with_capacity(config.n_layers);
         let mut values = Vec::with_capacity(config.n_layers);
         for _ in 0..config.n_layers {
-            keys.push(compute.alloc(per_layer)?);
-            values.push(compute.alloc(per_layer)?);
+            keys.push(compute.alloc(slots)?);
+            values.push(compute.alloc(slots)?);
         }
         Ok(Self {
             capacity,
@@ -97,6 +104,7 @@ impl KvCache {
             keys,
             values,
             len: 0,
+            entries_f16: device,
         })
     }
 
@@ -113,7 +121,9 @@ impl KvCache {
     }
 
     pub fn bytes(&self) -> usize {
-        self.keys.len() * self.capacity * self.kv_dim * 2 * std::mem::size_of::<f32>()
+        // k + v per layer; f16 entries are two bytes, f32 four.
+        let per_entry = if self.entries_f16 { 2 } else { 4 };
+        self.keys.len() * self.capacity * self.kv_dim * 2 * per_entry
     }
 
     pub fn reset(&mut self) {
@@ -298,15 +308,14 @@ impl<'a> Model<'a> {
         let start = kv.len();
 
         let mut x = self.compute.alloc(n * embd)?;
-        for (index, token) in tokens.iter().enumerate() {
+        for token in tokens {
             if *token as usize >= config.n_vocab {
                 return Err(EngineError::Format(format!(
                     "token {token} outside vocabulary"
                 )));
             }
-            self.compute
-                .embedding(&self.token_embd, *token, &mut x, index * embd)?;
         }
+        self.compute.embeddings(&self.token_embd, tokens, &mut x, 0)?;
 
         let mut scratch = Scratch::new(&self.compute, config, n)?;
         for (index, layer) in self.layers.iter().enumerate() {
@@ -345,15 +354,21 @@ impl<'a> Model<'a> {
         scratch: &mut Scratch,
     ) -> Result<(), EngineError> {
         let config = &self.config;
-        let embd = config.n_embd;
         let kv_dim = config.kv_dim();
         let ffn = config.n_ff;
 
-        self.compute
-            .rmsnorm(x, 0, layer.attn_norm, config.eps, n, &mut scratch.normed, 0)?;
-        // q, k and v read the same normalised rows, so they share one
-        // quantisation of them instead of paying for three.
-        let normed = self.compute.prepare(&scratch.normed, 0, n, embd)?;
+        // q, k and v read the same normalised rows, so the norm is quantised
+        // straight from the hidden state — one kernel instead of a write-out,
+        // a read-back, and a quantise pass.
+        let normed = self.compute.norm_prepare(
+            x,
+            0,
+            layer.attn_norm,
+            config.eps,
+            n,
+            &mut scratch.normed,
+            0,
+        )?;
         self.compute.matmul_prepared(
             &layer.wq,
             &scratch.normed,
@@ -432,13 +447,17 @@ impl<'a> Model<'a> {
         )?;
 
         self.compute
-            .matmul(&layer.wo, &scratch.attn, 0, n, &mut scratch.projected, 0)?;
-        self.compute
-            .residual_add(x, 0, &scratch.projected, 0, n * embd)?;
+            .matmul_add(&layer.wo, &scratch.attn, 0, None, n, x, 0, &mut scratch.projected)?;
 
-        self.compute
-            .rmsnorm(x, 0, layer.ffn_norm, config.eps, n, &mut scratch.normed, 0)?;
-        let normed = self.compute.prepare(&scratch.normed, 0, n, embd)?;
+        let normed = self.compute.norm_prepare(
+            x,
+            0,
+            layer.ffn_norm,
+            config.eps,
+            n,
+            &mut scratch.normed,
+            0,
+        )?;
         self.compute.matmul_prepared(
             &layer.w_gate,
             &scratch.normed,
@@ -457,18 +476,23 @@ impl<'a> Model<'a> {
             &mut scratch.up,
             0,
         )?;
-        self.compute
-            .silu_mul(&mut scratch.activated, &scratch.gate, &scratch.up, n * ffn)?;
-        self.compute.matmul(
+        let activated = self.compute.silu_mul_prepare(
+            &mut scratch.activated,
+            &scratch.gate,
+            &scratch.up,
+            n,
+            ffn,
+        )?;
+        self.compute.matmul_add(
             &layer.w_down,
             &scratch.activated,
             0,
+            Some(&activated),
             n,
-            &mut scratch.projected,
+            x,
             0,
+            &mut scratch.projected,
         )?;
-        self.compute
-            .residual_add(x, 0, &scratch.projected, 0, n * embd)?;
         Ok(())
     }
 }

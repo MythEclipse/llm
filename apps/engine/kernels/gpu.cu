@@ -58,10 +58,12 @@ __device__ __forceinline__ float q8_dot8(uint2 raw, float4 low, float4 high) {
 //               two 128-bit activation loads, block-wide reduction.
 //   n >= warps  one warp per token over the shared row, so the weight row is
 //               read once and reused by every token in the chunk.
-extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
+extern "C" __global__ void q8_matmul(const __half* __restrict__ scales,
                                     const signed char* __restrict__ quants,
                                     const float* __restrict__ x,
                                     float* __restrict__ y,
+                                    const float* bias,
+                                    int use_bias,
                                     int k, int out, int n) {
     extern __shared__ float row[];
     __shared__ float reduction[WARPS_PER_BLOCK];
@@ -70,7 +72,7 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
     const int threads = blockDim.x * blockDim.y;
     const int tid = warp * blockDim.x + lane;
     const int o = blockIdx.x;
-    const float* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
+    const __half* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
     const signed char* row_quants = quants + (size_t)o * k;
 
     if (n < WARPS_PER_BLOCK) {
@@ -86,11 +88,12 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
                                   q8_element(raw.x, 2) * low.z + q8_element(raw.x, 3) * low.w +
                                   q8_element(raw.y, 0) * high.x + q8_element(raw.y, 1) * high.y +
                                   q8_element(raw.y, 2) * high.z + q8_element(raw.y, 3) * high.w;
-                sum += row_scales[base >> 5] * dot;
+                sum += __half2float(row_scales[base >> 5]) * dot;
             }
             sum = warp_block_sum(sum, reduction);
             if (tid == 0) {
-                y[(size_t)token * out + o] = sum;
+                const size_t index = (size_t)token * out + o;
+                y[index] = sum + (use_bias ? bias[index] : 0.0f);
             }
         }
 
@@ -98,7 +101,7 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
     }
 
     for (int i = tid; i < k; i += threads) {
-        row[i] = row_scales[i >> 5] * (float)row_quants[i];
+        row[i] = __half2float(row_scales[i >> 5]) * (float)row_quants[i];
     }
     __syncthreads();
 
@@ -129,7 +132,8 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
                     total += __shfl_down_sync(0xffffffffu, total, offset);
                 }
                 if (lane == 0) {
-                    y[(size_t)(group + slot) * out + o] = total;
+                    const size_t index = (size_t)(group + slot) * out + o;
+                    y[index] = total + (use_bias ? bias[index] : 0.0f);
                 }
             }
         }
@@ -155,18 +159,20 @@ __device__ __forceinline__ float warp_block_sum4(float value, float* scratch) {
     return total;
 }
 
-extern "C" __global__ void q8_matmul_decode(const float* __restrict__ scales,
+extern "C" __global__ void q8_matmul_decode(const __half* __restrict__ scales,
                                             const signed char* __restrict__ quants,
                                             const float* __restrict__ x,
                                             float* __restrict__ y,
+                                            const float* bias,
+                                            int use_bias,
                                             int k, int out) {
-    extern __shared__ float reduction[];
+    __shared__ float reduction[4];
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int tid = warp * blockDim.x + lane;
     const int threads = blockDim.x * blockDim.y;
     const int o = blockIdx.x;
-    const float* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
+    const __half* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
     const signed char* row_quants = quants + (size_t)o * k;
     float sum = 0.0f;
     #pragma unroll 2
@@ -176,13 +182,13 @@ extern "C" __global__ void q8_matmul_decode(const float* __restrict__ scales,
         const float4 v1 = *reinterpret_cast<const float4*>(x + base + 4);
         const float4 v2 = *reinterpret_cast<const float4*>(x + base + 8);
         const float4 v3 = *reinterpret_cast<const float4*>(x + base + 12);
-        sum += row_scales[base >> 5] *
+        sum += __half2float(row_scales[base >> 5]) *
             (q8_dot8(make_uint2(raw.x, raw.y), v0, v1) +
              q8_dot8(make_uint2(raw.z, raw.w), v2, v3));
     }
     sum = warp_block_sum4(sum, reduction);
     if (tid == 0) {
-        y[o] = sum;
+        y[o] = sum + (use_bias ? bias[o] : 0.0f);
     }
 }
 
@@ -213,6 +219,67 @@ extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
     float* target = dst + (size_t)row * n;
     for (int i = tid; i < n; i += blockDim.x) {
         target[i] = source[i] * scale * weight[i];
+    }
+}
+
+// quants = quantize(rmsnorm(src)): the normalised rows go straight to int8 for
+// the projections that consume them, so the f32 normalisation is never written
+// out and read back.
+extern "C" __global__ void rmsnorm_quantize_rows(const float* __restrict__ src,
+                                                 const float* __restrict__ weight,
+                                                 signed char* __restrict__ quants,
+                                                 float* __restrict__ scales,
+                                                 int n, int rows, float eps) {
+    __shared__ float partial[256];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float* source = src + (size_t)row * n;
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        sum += source[i] * source[i];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (int width = blockDim.x / 2; width > 0; width >>= 1) {
+        if (tid < width) {
+            partial[tid] += partial[tid + width];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const int blocks_per_row = n >> 5;
+    if (tid >= blocks_per_row) {
+        return;
+    }
+    const size_t offset = (size_t)tid * 32;
+    float4 values[8];
+    float peak = 0.0f;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        const size_t i = offset + step * 4;
+        const float4 s = *reinterpret_cast<const float4*>(source + i);
+        const float4 w = *reinterpret_cast<const float4*>(weight + i);
+        values[step].x = s.x * scale * w.x;
+        values[step].y = s.y * scale * w.y;
+        values[step].z = s.z * scale * w.z;
+        values[step].w = s.w * scale * w.w;
+        peak = fmaxf(peak, fmaxf(fmaxf(fabsf(values[step].x), fabsf(values[step].y)),
+                                 fmaxf(fabsf(values[step].z), fabsf(values[step].w))));
+    }
+    const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
+    scales[(size_t)row * blocks_per_row + tid] = peak / 127.0f;
+    signed char* quant = quants + (size_t)row * n;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        char4 quantized;
+        quantized.x = (signed char)__float2int_rn(values[step].x * inverse);
+        quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
+        quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
+        quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
+        *reinterpret_cast<char4*>(quant + offset + step * 4) = quantized;
     }
 }
 
@@ -262,10 +329,12 @@ extern "C" __global__ void rope(float* __restrict__ x,
     }
 }
 
-// Copy this layer's keys and values for `tokens` new positions into the cache.
+// Copy this layer's keys and values for `tokens` new positions into the cache,
+// narrowing f32 to f16 — the precision llama.cpp stores its KV cache in, so the
+// cache costs half the bandwidth on every attention pass.
 // Layout per position: [kv_head][head_dim].
-extern "C" __global__ void kv_append(float* __restrict__ keys,
-                                     float* __restrict__ values,
+extern "C" __global__ void kv_append(__half* __restrict__ keys,
+                                     __half* __restrict__ values,
                                      const float* __restrict__ source_keys,
                                      const float* __restrict__ source_values,
                                      int tokens, int kv_dim, int start) {
@@ -274,8 +343,8 @@ extern "C" __global__ void kv_append(float* __restrict__ keys,
         const int token = i / kv_dim;
         const int offset = i % kv_dim;
         const size_t target = (size_t)(start + token) * kv_dim + offset;
-        keys[target] = source_keys[i];
-        values[target] = source_values[i];
+        keys[target] = __float2half(source_keys[i]);
+        values[target] = __float2half(source_values[i]);
     }
 }
 
@@ -343,8 +412,8 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 #define MAX_SPLIT_POSITIONS 256
 
 extern "C" __global__ void attention_split(const float* __restrict__ query,
-                                           const float* __restrict__ keys,
-                                           const float* __restrict__ values,
+                                           const __half* __restrict__ keys,
+                                           const __half* __restrict__ values,
                                            float* __restrict__ partial_acc,
                                            float* __restrict__ partial_max,
                                            float* __restrict__ partial_sum,
@@ -369,10 +438,10 @@ extern "C" __global__ void attention_split(const float* __restrict__ query,
 
     float local_max = -INFINITY;
     for (int offset = begin + warp; offset < end; offset += ATTENTION_WARPS) {
-        const float* key = keys + (size_t)offset * kv_dim + kv_head * head_dim;
+        const __half* key = keys + (size_t)offset * kv_dim + kv_head * head_dim;
         float dot = 0.0f;
         for (int i = lane; i < head_dim; i += 32) {
-            dot += query_head[i] * key[i];
+            dot += query_head[i] * __half2float(key[i]);
         }
         dot = warp_sum(dot);
         if (lane == 0) {
@@ -401,9 +470,9 @@ extern "C" __global__ void attention_split(const float* __restrict__ query,
             total += weight;
         }
         weight = __shfl_sync(0xffffffffu, weight, 0);
-        const float* value = values + (size_t)offset * kv_dim + kv_head * head_dim;
+        const __half* value = values + (size_t)offset * kv_dim + kv_head * head_dim;
         for (int element = 0; element < elements; ++element) {
-            accumulator[element] += weight * value[lane + element * 32];
+            accumulator[element] += weight * __half2float(value[lane + element * 32]);
         }
     }
     for (int element = 0; element < elements; ++element) {
@@ -492,6 +561,46 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
     }
 }
 
+// quants = quantize(silu(gate) * up). The SwiGLU activation used to be written
+// out and read back by quantize_rows for the down projection; quantising it
+// where it is computed spares one full pass over n * ffn floats.
+extern "C" __global__ void silu_mul_quantize_rows(const float* __restrict__ gate,
+                                                  const float* __restrict__ up,
+                                                  signed char* __restrict__ quants,
+                                                  float* __restrict__ scales,
+                                                  int k) {
+    const int blocks_per_row = k >> 5;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = index / blocks_per_row;
+    const int block = index % blocks_per_row;
+    const size_t offset = (size_t)row * k + block * 32;
+
+    float4 values[8];
+    float peak = 0.0f;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        const float4 g = *reinterpret_cast<const float4*>(gate + offset + step * 4);
+        const float4 u = *reinterpret_cast<const float4*>(up + offset + step * 4);
+        values[step].x = (g.x / (1.0f + expf(-g.x))) * u.x;
+        values[step].y = (g.y / (1.0f + expf(-g.y))) * u.y;
+        values[step].z = (g.z / (1.0f + expf(-g.z))) * u.z;
+        values[step].w = (g.w / (1.0f + expf(-g.w))) * u.w;
+        peak = fmaxf(peak, fmaxf(fmaxf(fabsf(values[step].x), fabsf(values[step].y)),
+                                 fmaxf(fabsf(values[step].z), fabsf(values[step].w))));
+    }
+    const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
+    scales[(size_t)row * blocks_per_row + block] = peak / 127.0f;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        char4 quantized;
+        quantized.x = (signed char)__float2int_rn(values[step].x * inverse);
+        quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
+        quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
+        quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
+        *reinterpret_cast<char4*>(quants + offset + step * 4) = quantized;
+    }
+}
+
 #define MMA_ROWS 16
 #define MMA_WARPS 8
 #define MMA_BLOCK_ROWS 128
@@ -539,11 +648,13 @@ __device__ __forceinline__ void load_a_fragment(int* fragment, const signed char
 //     two-word-per-lane layout — and the per-block scales collapse into one fma
 //     per accumulator element: sum += C * dA * dB.
 // Eight warps of sixteen rows, so registers stay inside the file without spilling.
-extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(const float* __restrict__ weight_scales,
+extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(const __half* __restrict__ weight_scales,
                                         const signed char* __restrict__ weight_quants,
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
                                         float* __restrict__ y,
+                                        const float* bias,
+                                        int use_bias,
                                         int k, int out, int n) {
     // ldmatrix needs sixteen-byte-aligned shared addresses, and a plain char array
     // is only guaranteed one-byte alignment.
@@ -612,14 +723,27 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
                 *destination = make_int4(0, 0, 0, 0);
             }
         }
-        for (int index = tid; index < MMA_BLOCK_ROWS * MMA_CHUNK_BLOCKS; index += threads) {
-            const int row = index / MMA_CHUNK_BLOCKS;
-            const int block = index % MMA_CHUNK_BLOCKS;
+        // One half2 load per thread pair of blocks, so the scale staging keeps
+        // the same 32-bit access shape the f32 plane had.
+        for (int index = tid; index < MMA_BLOCK_ROWS * (MMA_CHUNK_BLOCKS / 2); index += threads) {
+            const int row = index / (MMA_CHUNK_BLOCKS / 2);
+            const int block = (index % (MMA_CHUNK_BLOCKS / 2)) * 2;
             const int position = chunk + block * 32;
             const int target = row_base + row;
-            a_scales[row * MMA_CHUNK_BLOCKS + block] = (position < k && target < out)
-                ? weight_scales[(size_t)target * k_blocks + (position >> 5)]
-                : 0.0f;
+            const bool valid = target < out && position < k;
+            if (position + 32 <= k) {
+                const __half2 pair = *reinterpret_cast<const __half2*>(
+                    weight_scales + (size_t)target * k_blocks + (position >> 5));
+                const float2 values = __half22float2(pair);
+                a_scales[row * MMA_CHUNK_BLOCKS + block] = valid ? values.x : 0.0f;
+                a_scales[row * MMA_CHUNK_BLOCKS + block + 1] =
+                    (target < out && position + 32 <= k) ? values.y : 0.0f;
+            } else {
+                a_scales[row * MMA_CHUNK_BLOCKS + block] =
+                    valid ? __half2float(weight_scales[(size_t)target * k_blocks + (position >> 5)])
+                          : 0.0f;
+                a_scales[row * MMA_CHUNK_BLOCKS + block + 1] = 0.0f;
+            }
         }
         for (int index = tid; index < MMA_BLOCK_TOKENS * MMA_CHUNK_BLOCKS; index += threads) {
             const int token = index / MMA_CHUNK_BLOCKS;
@@ -684,18 +808,20 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
         for (int t = 0; t < MMA_MINI_TILES; ++t) {
             const int row = row_base + row_group + t * MMA_ROWS + group;
             if (column_low < tile_tokens && row < out) {
-                y[(size_t)(token_base + column_low) * out + row] =
-                    sums[j][t][0];
+                const size_t index = (size_t)(token_base + column_low) * out + row;
+                y[index] = sums[j][t][0] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_high < tile_tokens && row < out) {
-                y[(size_t)(token_base + column_high) * out + row] =
-                    sums[j][t][1];
+                const size_t index = (size_t)(token_base + column_high) * out + row;
+                y[index] = sums[j][t][1] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_low < tile_tokens && row + 8 < out) {
-                y[(size_t)(token_base + column_low) * out + row + 8] = sums[j][t][2];
+                const size_t index = (size_t)(token_base + column_low) * out + row + 8;
+                y[index] = sums[j][t][2] + (use_bias ? bias[index] : 0.0f);
             }
             if (column_high < tile_tokens && row + 8 < out) {
-                y[(size_t)(token_base + column_high) * out + row + 8] = sums[j][t][3];
+                const size_t index = (size_t)(token_base + column_high) * out + row + 8;
+                y[index] = sums[j][t][3] + (use_bias ? bias[index] : 0.0f);
             }
         }
     }
@@ -723,8 +849,8 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
 #define FA_KEY_STRIDE (FA_MAX_HEAD_DIM)
 
 extern "C" __global__ void attention_prefill(const float* __restrict__ query,
-                                            const float* __restrict__ keys,
-                                            const float* __restrict__ values,
+                                            const __half* __restrict__ keys,
+                                            const __half* __restrict__ values,
                                             float* __restrict__ out,
                                             int n_head, int n_head_kv, int head_dim,
                                             int start, int tokens, float scale) {
@@ -782,9 +908,10 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
             const int dim = index % head_dim;
             const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
             // Keys stay dim-major: a lane owns one key and reads k_tile[dim][lane],
-            // so the warp touches thirty-two different banks.
-            k_tile[dim * FA_KEY_TILE + row] = keys[source];
-            v_tile[row * FA_MAX_HEAD_DIM + dim] = values[source];
+            // so the warp touches thirty-two different banks. The cache is f16,
+            // the tile f32.
+            k_tile[dim * FA_KEY_TILE + row] = __half2float(keys[source]);
+            v_tile[row * FA_MAX_HEAD_DIM + dim] = __half2float(values[source]);
         }
         __syncthreads();
 
@@ -877,9 +1004,251 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
     }
 }
 
+// Prefill attention on the f16 tensor cores. One block holds eight heads that
+// share one KV head (this model's group size) and sixteen query positions, so
+// the staged keys and values are read once per eight query heads. QK^T and PV
+// both run as mma.m16n8k16.f16: a warp owns one head, its sixteen queries are
+// one m-tile, and the scores never leave registers — the exp'ed score
+// accumulators ARE the A fragments of the PV mma, which is the same trick
+// ggml's fattn uses.
+//
+// Keys stay dim-major in shared memory so the K^T B fragments load straight
+// with ldmatrix, and the online softmax keeps one running max/sum per query
+// row across key tiles instead of materialising anything of size `visible`.
+#define FA8_HEADS 8
+#define FA8_QUERY_TILE 16
+#define FA8_KEY_TILE 32
+#define FA8_HEAD_DIM 128
+
+__device__ __forceinline__ void mma_f16(float& d0, float& d1, float& d2, float& d3,
+                                        int a0, int a1, int a2, int a3,
+                                        int b0, int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// A fragment: sixteen query rows of one head, sixteen dims, four 8x8 tiles.
+__device__ __forceinline__ void load_q8_fragment(int* fragment, const __half* base, int lane) {
+    const __half* address = base + (lane % 16) * FA8_HEAD_DIM + (lane / 16) * 8;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
+                 : "l"(address));
+}
+
+// B fragment: sixteen rows of stride `stride` elements, eight columns, two
+// 8x8 tiles — rows for K^T (dims), and for V (keys). The transpose matches
+// what the mma B operand expects: b0 = B[2t][g], b1 = B[2t+1][g].
+__device__ __forceinline__ void load_b8_fragment(int* fragment, const __half* base, int lane, int stride) {
+    const __half* address = base + (lane % 16) * stride;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];\n"
+                 : "=r"(fragment[0]), "=r"(fragment[1])
+                 : "l"(address));
+}
+
+__device__ __forceinline__ int pack_half2(float low, float high) {
+    __half2 packed = __floats2half2_rn(low, high);
+    return *reinterpret_cast<int*>(&packed);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void attention_prefill_mma(
+    const float* __restrict__ query,
+    const __half* __restrict__ keys,
+    const __half* __restrict__ values,
+    float* __restrict__ out,
+    int n_head, int n_head_kv, int head_dim,
+    int start, int tokens, float scale) {
+    extern __shared__ __align__(16) signed char smem[];
+    __half* q_tile = reinterpret_cast<__half*>(smem);
+    __half* k_tile = q_tile + FA8_HEADS * FA8_QUERY_TILE * FA8_HEAD_DIM;
+    __half* v_tile = k_tile + FA8_HEAD_DIM * FA8_KEY_TILE;
+
+    const int group = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int heads_per_kv = n_head / n_head_kv;
+    const int kv_head = (group * FA8_HEADS) / heads_per_kv;
+    const int kv_dim = n_head_kv * head_dim;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int threads = blockDim.x * blockDim.y;
+    const int tid = warp * 32 + lane;
+    const int head = group * FA8_HEADS + warp;
+    const int first_query = tile * FA8_QUERY_TILE;
+    const int queries = min(FA8_QUERY_TILE, tokens - first_query);
+    if (queries <= 0) {
+        return;
+    }
+
+    for (int index = tid; index < FA8_HEADS * queries * head_dim; index += threads) {
+        const int slot = index / (queries * head_dim);
+        const int rest = index % (queries * head_dim);
+        const int row = rest / head_dim;
+        const int dim = rest % head_dim;
+        q_tile[(slot * FA8_QUERY_TILE + row) * FA8_HEAD_DIM + dim] =
+            __float2half(query[((size_t)(first_query + row) * n_head + group * FA8_HEADS + slot) * head_dim + dim]);
+    }
+
+    // Each lane owns query rows row_low and row_low + 8, and the two score
+    // columns col_base and col_base + 1 of every 8-key tile.
+    const int row_low = lane >> 2;
+    const int col_base = (lane & 3) * 2;
+
+    float accum[FA8_HEAD_DIM / 8][4];
+    #pragma unroll
+    for (int n8 = 0; n8 < FA8_HEAD_DIM / 8; ++n8) {
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            accum[n8][e] = 0.0f;
+        }
+    }
+    float running_max_low = -INFINITY;
+    float running_max_high = -INFINITY;
+    float running_sum_low = 0.0f;
+    float running_sum_high = 0.0f;
+    __syncthreads();
+
+    const int max_visible = start + min(first_query + queries, tokens);
+    for (int base = 0; base < max_visible; base += FA8_KEY_TILE) {
+        const int keys_here = min(FA8_KEY_TILE, max_visible - base);
+        for (int index = tid; index < FA8_KEY_TILE * head_dim; index += threads) {
+            const int row = index / head_dim;
+            const int dim = index % head_dim;
+            if (row < keys_here) {
+                const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
+                // K is staged dim-major so the K^T fragments load untransposed;
+                // V stays row-major for the PV fragments.
+                k_tile[dim * FA8_KEY_TILE + row] = keys[source];
+                v_tile[row * FA8_HEAD_DIM + dim] = values[source];
+            } else {
+                k_tile[dim * FA8_KEY_TILE + row] = __float2half(0.0f);
+                v_tile[row * FA8_HEAD_DIM + dim] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        float scores[4][4];
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                scores[nt][e] = 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int dim = 0; dim < FA8_HEAD_DIM / 16; ++dim) {
+            int a[4];
+            load_q8_fragment(a, q_tile + warp * FA8_QUERY_TILE * FA8_HEAD_DIM + dim * 16, lane);
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                int b[2];
+                load_b8_fragment(b, k_tile + dim * 16 * FA8_KEY_TILE + nt * 8, lane, FA8_KEY_TILE);
+                mma_f16(scores[nt][0], scores[nt][1], scores[nt][2], scores[nt][3],
+                        a[0], a[1], a[2], a[3], b[0], b[1]);
+            }
+        }
+
+        // Mask, scale, and run the online softmax statistics for this tile.
+        const int visible_low = start + first_query + row_low + 1;
+        const int visible_high = visible_low + 8;
+        float tile_max_low = -INFINITY;
+        float tile_max_high = -INFINITY;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            const int column = base + col_base + nt * 8;
+            scores[nt][0] = (column < visible_low) ? scores[nt][0] * scale : -INFINITY;
+            scores[nt][1] = (column + 1 < visible_low) ? scores[nt][1] * scale : -INFINITY;
+            scores[nt][2] = (column < visible_high) ? scores[nt][2] * scale : -INFINITY;
+            scores[nt][3] = (column + 1 < visible_high) ? scores[nt][3] * scale : -INFINITY;
+            tile_max_low = fmaxf(tile_max_low, fmaxf(scores[nt][0], scores[nt][1]));
+            tile_max_high = fmaxf(tile_max_high, fmaxf(scores[nt][2], scores[nt][3]));
+        }
+        tile_max_low = fmaxf(tile_max_low, __shfl_xor_sync(0xffffffffu, tile_max_low, 1));
+        tile_max_low = fmaxf(tile_max_low, __shfl_xor_sync(0xffffffffu, tile_max_low, 2));
+        tile_max_high = fmaxf(tile_max_high, __shfl_xor_sync(0xffffffffu, tile_max_high, 1));
+        tile_max_high = fmaxf(tile_max_high, __shfl_xor_sync(0xffffffffu, tile_max_high, 2));
+
+        const float new_max_low = fmaxf(running_max_low, tile_max_low);
+        const float new_max_high = fmaxf(running_max_high, tile_max_high);
+        const float correction_low =
+            running_max_low == -INFINITY ? 0.0f : expf(running_max_low - new_max_low);
+        const float correction_high =
+            running_max_high == -INFINITY ? 0.0f : expf(running_max_high - new_max_high);
+        #pragma unroll
+        for (int n8 = 0; n8 < FA8_HEAD_DIM / 8; ++n8) {
+            accum[n8][0] *= correction_low;
+            accum[n8][1] *= correction_low;
+            accum[n8][2] *= correction_high;
+            accum[n8][3] *= correction_high;
+        }
+
+        float tile_sum_low = 0.0f;
+        float tile_sum_high = 0.0f;
+        float probs[4][4];
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            probs[nt][0] = scores[nt][0] == -INFINITY ? 0.0f : expf(scores[nt][0] - new_max_low);
+            probs[nt][1] = scores[nt][1] == -INFINITY ? 0.0f : expf(scores[nt][1] - new_max_low);
+            probs[nt][2] = scores[nt][2] == -INFINITY ? 0.0f : expf(scores[nt][2] - new_max_high);
+            probs[nt][3] = scores[nt][3] == -INFINITY ? 0.0f : expf(scores[nt][3] - new_max_high);
+            tile_sum_low += probs[nt][0] + probs[nt][1];
+            tile_sum_high += probs[nt][2] + probs[nt][3];
+        }
+        tile_sum_low += __shfl_xor_sync(0xffffffffu, tile_sum_low, 1);
+        tile_sum_low += __shfl_xor_sync(0xffffffffu, tile_sum_low, 2);
+        tile_sum_high += __shfl_xor_sync(0xffffffffu, tile_sum_high, 1);
+        tile_sum_high += __shfl_xor_sync(0xffffffffu, tile_sum_high, 2);
+        running_sum_low = running_sum_low * correction_low + tile_sum_low;
+        running_sum_high = running_sum_high * correction_high + tile_sum_high;
+        running_max_low = new_max_low;
+        running_max_high = new_max_high;
+
+        // PV: the exp'ed scores ARE the A fragments — pack two neighbours per
+        // register and multiply the value rows right away.
+        #pragma unroll
+        for (int kh = 0; kh < 2; ++kh) {
+            int pa[4];
+            pa[0] = pack_half2(probs[kh * 2][0], probs[kh * 2][1]);
+            pa[1] = pack_half2(probs[kh * 2][2], probs[kh * 2][3]);
+            pa[2] = pack_half2(probs[kh * 2 + 1][0], probs[kh * 2 + 1][1]);
+            pa[3] = pack_half2(probs[kh * 2 + 1][2], probs[kh * 2 + 1][3]);
+            #pragma unroll
+            for (int n8 = 0; n8 < FA8_HEAD_DIM / 8; ++n8) {
+                int b[2];
+                load_b8_fragment(b, v_tile + kh * 16 * FA8_HEAD_DIM + n8 * 8, lane, FA8_HEAD_DIM);
+                mma_f16(accum[n8][0], accum[n8][1], accum[n8][2], accum[n8][3],
+                        pa[0], pa[1], pa[2], pa[3], b[0], b[1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inverse_low = running_sum_low > 0.0f ? 1.0f / running_sum_low : 0.0f;
+    const float inverse_high = running_sum_high > 0.0f ? 1.0f / running_sum_high : 0.0f;
+    if (first_query + row_low < tokens) {
+        float* low = out + ((size_t)(first_query + row_low) * n_head + head) * head_dim;
+        #pragma unroll
+        for (int n8 = 0; n8 < FA8_HEAD_DIM / 8; ++n8) {
+            const int dim = col_base + n8 * 8;
+            low[dim] = accum[n8][0] * inverse_low;
+            low[dim + 1] = accum[n8][1] * inverse_low;
+        }
+    }
+    if (first_query + row_low + 8 < tokens) {
+        float* high = out + ((size_t)(first_query + row_low + 8) * n_head + head) * head_dim;
+        #pragma unroll
+        for (int n8 = 0; n8 < FA8_HEAD_DIM / 8; ++n8) {
+            const int dim = col_base + n8 * 8;
+            high[dim] = accum[n8][2] * inverse_high;
+            high[dim + 1] = accum[n8][3] * inverse_high;
+        }
+    }
+}
+
 extern "C" __global__ void attention(const float* __restrict__ query,
-                                     const float* __restrict__ keys,
-                                     const float* __restrict__ values,
+                                     const __half* __restrict__ keys,
+                                     const __half* __restrict__ values,
                                      float* __restrict__ out,
                                      float* __restrict__ scores,
                                      int n_head, int n_head_kv, int head_dim,
@@ -900,10 +1269,10 @@ extern "C" __global__ void attention(const float* __restrict__ query,
     const float* query_head = query + ((size_t)token * n_head + head) * head_dim;
 
     for (int offset = warp; offset < visible; offset += ATTENTION_WARPS) {
-        const float* key = keys + (size_t)offset * kv_dim + kv_head * head_dim;
+        const __half* key = keys + (size_t)offset * kv_dim + kv_head * head_dim;
         float dot = 0.0f;
         for (int i = lane; i < head_dim; i += 32) {
-            dot += query_head[i] * key[i];
+            dot += query_head[i] * __half2float(key[i]);
         }
         dot = warp_sum(dot);
         if (lane == 0) {
@@ -939,10 +1308,10 @@ extern "C" __global__ void attention(const float* __restrict__ query,
         accumulator[element] = 0.0f;
     }
     for (int offset = warp; offset < visible; offset += ATTENTION_WARPS) {
-        const float* value = values + (size_t)offset * kv_dim + kv_head * head_dim;
+        const __half* value = values + (size_t)offset * kv_dim + kv_head * head_dim;
         const float weight = row[offset];
         for (int element = 0; element < elements; ++element) {
-            accumulator[element] += weight * value[lane + element * 32];
+            accumulator[element] += weight * __half2float(value[lane + element * 32]);
         }
     }
     for (int element = 0; element < elements; ++element) {
@@ -960,13 +1329,30 @@ extern "C" __global__ void attention(const float* __restrict__ query,
 }
 
 // Embedding row dequantized straight into the activation buffer.
-extern "C" __global__ void embedding_row(const float* __restrict__ scales,
+extern "C" __global__ void embedding_row(const __half* __restrict__ scales,
                                          const signed char* __restrict__ quants,
                                          float* __restrict__ out,
                                          int row, int k) {
-    const float* row_scales = scales + (size_t)row * (k / Q8_BLOCK_ELEMS);
+    const __half* row_scales = scales + (size_t)row * (k / Q8_BLOCK_ELEMS);
     const signed char* row_quants = quants + (size_t)row * k;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < k; i += gridDim.x * blockDim.x) {
-        out[i] = row_scales[i >> 5] * (float)row_quants[i];
+        out[i] = __half2float(row_scales[i >> 5]) * (float)row_quants[i];
+    }
+}
+
+// Whole prompt embedding in one launch: one thread per (token, column).
+extern "C" __global__ void embedding_rows(const __half* __restrict__ scales,
+                                          const signed char* __restrict__ quants,
+                                          const int* __restrict__ tokens,
+                                          float* __restrict__ out,
+                                          int n, int k) {
+    const int blocks_per_row = k / Q8_BLOCK_ELEMS;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n * k; i += gridDim.x * blockDim.x) {
+        const int token = i / k;
+        const int column = i % k;
+        const int row = tokens[token];
+        const __half* row_scales = scales + (size_t)row * blocks_per_row;
+        const signed char* row_quants = quants + (size_t)row * k;
+        out[i] = __half2float(row_scales[column >> 5]) * (float)row_quants[column];
     }
 }

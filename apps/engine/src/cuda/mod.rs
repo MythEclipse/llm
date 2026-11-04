@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
+use half::f16;
+
 use sys::{
     Context, Device, DevicePtr, Event, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module,
     SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName,
@@ -87,6 +89,12 @@ impl DeviceBuffer {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Raw device pointer, for kernels that read one buffer and add it into
+    /// another.
+    pub fn pointer(&self) -> DevicePtr {
+        self.pointer
+    }
 }
 
 impl Drop for DeviceBuffer {
@@ -102,16 +110,20 @@ struct Kernels {
     matmul_decode: Function,
     matmul_mma: Function,
     quantize_rows: Function,
+    silu_mul_quantize: Function,
     rmsnorm: Function,
+    rmsnorm_quantize: Function,
     silu_mul: Function,
     residual_add: Function,
     rope: Function,
     kv_append: Function,
     attention: Function,
     attention_prefill: Function,
+    attention_prefill_mma: Function,
     attention_split: Function,
     attention_combine: Function,
     embedding: Function,
+    embedding_rows: Function,
 }
 
 /// A weight slice as the kernels want it.
@@ -134,6 +146,7 @@ pub struct Gpu {
     weights: Mutex<HashMap<(usize, usize), Resident>>,
     workspace: Mutex<Option<DeviceBuffer>>,
     activation: Mutex<Option<DeviceBuffer>>,
+    tokens: Mutex<Option<DeviceBuffer>>,
     names: Vec<(Function, &'static str)>,
     profile_enabled: bool,
     profile: Mutex<Option<HashMap<&'static str, (f64, u64)>>>,
@@ -191,7 +204,9 @@ impl Gpu {
                 // shared memory, so its ceiling is raised once here.
                 matmul_mma: reserve_shared(load("q8_matmul_mma")?, MMA_SHARED_BYTES)?,
                 quantize_rows: load("quantize_rows")?,
+                silu_mul_quantize: load("silu_mul_quantize_rows")?,
                 rmsnorm: load("rmsnorm_rows")?,
+                rmsnorm_quantize: load("rmsnorm_quantize_rows")?,
                 silu_mul: load("silu_mul")?,
                 residual_add: load("residual_add")?,
                 rope: load("rope")?,
@@ -201,9 +216,14 @@ impl Gpu {
                     load("attention_prefill")?,
                     PREFILL_SHARED_BYTES,
                 )?,
+                attention_prefill_mma: reserve_shared(
+                    load("attention_prefill_mma")?,
+                    PREFILL_SHARED_BYTES,
+                )?,
                 attention_split: load("attention_split")?,
                 attention_combine: load("attention_combine")?,
                 embedding: load("embedding_row")?,
+                embedding_rows: load("embedding_rows")?,
             };
 
             Ok(Self {
@@ -217,6 +237,7 @@ impl Gpu {
                 weights: Mutex::new(HashMap::new()),
                 workspace: Mutex::new(None),
                 activation: Mutex::new(None),
+                tokens: Mutex::new(None),
             })
         }
     }
@@ -304,6 +325,8 @@ impl Gpu {
     }
 
     /// `y[t·out + o] = Σᵢ x[t·k + i] · W[o·k + i]`, weights uploaded once.
+    /// When `bias` is set, the result is added into `y` instead of overwriting
+    /// it — the residual add happens in the epilogue, not in a separate pass.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn matmul(
@@ -318,6 +341,7 @@ impl Gpu {
         y: &DeviceBuffer,
         y_offset: usize,
         prepared: Option<&Prepared>,
+        bias: Option<(DevicePtr, usize)>,
     ) -> Result<(), EngineError> {
         assert!(
             k.is_multiple_of(32),
@@ -327,15 +351,6 @@ impl Gpu {
         assert!(y.len() >= n * out, "output shape mismatch");
 
         let (scales, quants) = self.quantized(identity, weights)?;
-        let mut args = [
-            Arg::Pointer(scales),
-            Arg::Pointer(quants),
-            Arg::Pointer(shifted(x.pointer, x_offset)),
-            Arg::Pointer(shifted(y.pointer, y_offset)),
-            Arg::Int(k as i32),
-            Arg::Int(out as i32),
-            Arg::Int(n as i32),
-        ];
         if n >= WARPS as usize {
             if n > MMA_TOKENS {
                 return Err(EngineError::Unsupported(format!(
@@ -350,8 +365,29 @@ impl Gpu {
                     &owned
                 }
             };
-            return self.matmul_prompt_prepared(&scales, &quants, prepared, n, k, out, y, y_offset);
+            return self.matmul_prompt_prepared(
+                &scales,
+                &quants,
+                prepared,
+                n,
+                k,
+                out,
+                y,
+                y_offset,
+                bias,
+            );
         }
+        let mut args = [
+            Arg::Pointer(scales),
+            Arg::Pointer(quants),
+            Arg::Pointer(shifted(x.pointer, x_offset)),
+            Arg::Pointer(shifted(y.pointer, y_offset)),
+            Arg::Pointer(bias.map_or(shifted(y.pointer, y_offset), |(p, o)| shifted(p, o))),
+            Arg::Int(bias.is_some() as i32),
+            Arg::Int(k as i32),
+            Arg::Int(out as i32),
+            Arg::Int(n as i32),
+        ];
         // Single-token decode uses a smaller four-warp reduction. Batched decode
         // keeps the eight-warp kernel because it reuses the row across tokens.
         if n == 1 {
@@ -359,10 +395,12 @@ impl Gpu {
                 self.kernels.matmul_decode,
                 (out as u32, 1, 1),
                 (LANES, 4, 1),
-                4 * std::mem::size_of::<f32>() as u32,
+                0,
                 &mut args,
             );
         }
+        // Two to seven tokens keep the eight-warp kernel; the bias is applied
+        // in its epilogue like the other two kernels.
         self.launch(
             self.kernels.matmul,
             (out as u32, 1, 1),
@@ -548,6 +586,47 @@ impl Gpu {
         )
     }
 
+    /// Prefill attention on the tensor cores: eight heads that share one KV
+    /// head, sixteen queries, and the same shared-memory budget as the fp32
+    /// kernel because queries are staged as f16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_mma(
+        &self,
+        query: &DeviceBuffer,
+        keys: &DeviceBuffer,
+        values: &DeviceBuffer,
+        out: &DeviceBuffer,
+        geometry: AttentionGeometry,
+        start: usize,
+        tokens: usize,
+    ) -> Result<(), EngineError> {
+        const MMA_HEADS: usize = 8;
+        const MMA_QUERY_TILE: usize = 16;
+        let mut args = [
+            Arg::Pointer(query.pointer),
+            Arg::Pointer(keys.pointer),
+            Arg::Pointer(values.pointer),
+            Arg::Pointer(out.pointer),
+            Arg::Int(geometry.n_head as i32),
+            Arg::Int(geometry.n_head_kv as i32),
+            Arg::Int(geometry.head_dim as i32),
+            Arg::Int(start as i32),
+            Arg::Int(tokens as i32),
+            Arg::Float(geometry.scale),
+        ];
+        self.launch(
+            self.kernels.attention_prefill_mma,
+            (
+                geometry.n_head.div_ceil(MMA_HEADS) as u32,
+                tokens.div_ceil(MMA_QUERY_TILE) as u32,
+                1,
+            ),
+            (LANES, 8, 1),
+            PREFILL_SHARED_BYTES,
+            &mut args,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn attention(
         &self,
@@ -685,6 +764,71 @@ impl Gpu {
         Ok(Prepared(buffer))
     }
 
+    /// `quants = quantize(rmsnorm(src))` for the projections that read the
+    /// normalised rows, so the f32 norm is never written out and read back.
+    pub fn rmsnorm_prepare(
+        &self,
+        source: &DeviceBuffer,
+        source_offset: usize,
+        weight: &[f32],
+        n: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<Prepared, EngineError> {
+        let identity = (weight.as_ptr() as usize, weight.len());
+        let device_weight = self.plain(identity, as_bytes(weight))?;
+        let blocks = n / 32;
+        let quants_bytes = rows * n;
+        let buffer = self.activation_workspace(quants_bytes, rows * blocks)?;
+        let mut args = [
+            Arg::Pointer(shifted(source.pointer, source_offset)),
+            Arg::Pointer(device_weight),
+            Arg::Pointer(buffer),
+            Arg::Pointer(shifted(buffer, quants_bytes / 4)),
+            Arg::Int(n as i32),
+            Arg::Int(rows as i32),
+            Arg::Float(eps),
+        ];
+        self.launch(
+            self.kernels.rmsnorm_quantize,
+            (rows as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )?;
+        Ok(Prepared(buffer))
+    }
+
+    /// `quants = quantize(silu(gate) * up)` for the down projection, so the
+    /// activation is never written out and read back in f32.
+    pub fn silu_mul_quantize(
+        &self,
+        gate: &DeviceBuffer,
+        up: &DeviceBuffer,
+        n: usize,
+        k: usize,
+    ) -> Result<Prepared, EngineError> {
+        let blocks = k / 32;
+        let quants_bytes = n * k;
+        let buffer = self.activation_workspace(quants_bytes, n * blocks)?;
+        let mut quantize_args = [
+            Arg::Pointer(gate.pointer),
+            Arg::Pointer(up.pointer),
+            Arg::Pointer(buffer),
+            Arg::Pointer(shifted(buffer, quants_bytes / 4)),
+            Arg::Int(k as i32),
+        ];
+        let total = (blocks * n) as u32;
+        self.launch(
+            self.kernels.silu_mul_quantize,
+            (total.div_ceil(128), 1, 1),
+            (128, 1, 1),
+            0,
+            &mut quantize_args,
+        )?;
+        Ok(Prepared(buffer))
+    }
+
     /// The prompt matmul on activations `prepare` has already quantised.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_prompt_prepared(
@@ -697,6 +841,7 @@ impl Gpu {
         out: usize,
         y: &DeviceBuffer,
         y_offset: usize,
+        bias: Option<(DevicePtr, usize)>,
     ) -> Result<(), EngineError> {
         if n > MMA_TOKENS {
             return Err(EngineError::Unsupported(format!(
@@ -711,6 +856,8 @@ impl Gpu {
             Arg::Pointer(act_scales),
             Arg::Pointer(act_quants),
             Arg::Pointer(shifted(y.pointer, y_offset)),
+            Arg::Pointer(bias.map_or(shifted(y.pointer, y_offset), |(p, o)| shifted(p, o))),
+            Arg::Int(bias.is_some() as i32),
             Arg::Int(k as i32),
             Arg::Int(out as i32),
             Arg::Int(n as i32),
@@ -791,6 +938,79 @@ impl Gpu {
         )
     }
 
+    /// Whole prompt embedding in one launch: `tokens` is copied into a cached
+    /// device buffer, then one grid dequantises every row it names.
+    pub fn embeddings(
+        &self,
+        identity: (usize, usize),
+        weights: &[u8],
+        tokens: &[u32],
+        out: &DeviceBuffer,
+        out_offset: usize,
+        k: usize,
+    ) -> Result<(), EngineError> {
+        let (scales, quants) = self.quantized(identity, weights)?;
+        let token_buffer = self.token_buffer(tokens)?;
+        let mut args = [
+            Arg::Pointer(scales),
+            Arg::Pointer(quants),
+            Arg::Pointer(token_buffer),
+            Arg::Pointer(shifted(out.pointer, out_offset)),
+            Arg::Int(tokens.len() as i32),
+            Arg::Int(k as i32),
+        ];
+        self.launch(
+            self.kernels.embedding_rows,
+            (blocks(tokens.len() * k), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Cached device copy of the token ids, grown on demand.
+    fn token_buffer(&self, tokens: &[u32]) -> Result<DevicePtr, EngineError> {
+        self.bind()?;
+        let mut slot = self.tokens.lock().expect("tokens lock");
+        if let Some(buffer) = slot.as_ref()
+            && buffer.len() >= tokens.len()
+        {
+            // SAFETY: both pointers are valid for the copied length.
+            let status = unsafe {
+                cuMemcpyHtoD_v2(
+                    buffer.pointer,
+                    tokens.as_ptr().cast::<c_void>(),
+                    std::mem::size_of_val(tokens),
+                )
+            };
+            if status == SUCCESS {
+                return Ok(buffer.pointer);
+            }
+            return Err(EngineError::Unsupported(format!(
+                "cuda: token upload failed: {}",
+                error_message(status)
+            )));
+        }
+        let buffer = self.alloc(tokens.len().max(1))?;
+        // SAFETY: both pointers are valid for the copied length.
+        let status = unsafe {
+            cuMemcpyHtoD_v2(
+                buffer.pointer,
+                tokens.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(tokens),
+            )
+        };
+        if status != SUCCESS {
+            return Err(EngineError::Unsupported(format!(
+                "cuda: token upload failed: {}",
+                error_message(status)
+            )));
+        }
+        let pointer = buffer.pointer;
+        *slot = Some(buffer);
+        Ok(pointer)
+    }
+
     /// Uploads a weight slice now, failing early if the device is full.
     pub fn reserve(&self, identity: (usize, usize), bytes: &[u8]) -> Result<(), EngineError> {
         self.quantized(identity, bytes).map(|_| ())
@@ -813,7 +1033,7 @@ impl Gpu {
             return Ok((scales.pointer, quants.pointer));
         }
         let (scales, quants) = repack_q8(bytes);
-        let device_scales = self.upload_new(&scales)?;
+        let device_scales = self.upload_new_bytes(as_bytes(&scales))?;
         let device_quants = self.upload_new_bytes(as_bytes(&quants))?;
         let pointers = (device_scales.pointer, device_quants.pointer);
         cache.insert(
@@ -836,10 +1056,6 @@ impl Gpu {
         let pointer = buffer.pointer;
         cache.insert(identity, Resident::Plain(buffer));
         Ok(pointer)
-    }
-
-    fn upload_new(&self, values: &[f32]) -> Result<DeviceBuffer, EngineError> {
-        self.upload_new_bytes(as_bytes(values))
     }
 
     fn upload_new_bytes(&self, bytes: &[u8]) -> Result<DeviceBuffer, EngineError> {
@@ -1042,14 +1258,16 @@ fn function(module: Module, name: &str) -> Result<Function, EngineError> {
 ///
 /// GGUF stores `[f16 scale][32 i8]` per 32 elements, so a row is a stride-34
 /// walk. Splitting it lets the kernel load eight quants in one instruction.
-fn repack_q8(bytes: &[u8]) -> (Vec<f32>, Vec<i8>) {
+/// The scales stay f16 — that is their precision in the file, and it halves the
+/// scale traffic on every weight pass.
+fn repack_q8(bytes: &[u8]) -> (Vec<f16>, Vec<i8>) {
     const BLOCK: usize = 34;
     let blocks = bytes.len() / BLOCK;
     let mut scales = Vec::with_capacity(blocks);
     let mut quants = Vec::with_capacity(blocks * 32);
     for block in bytes.as_chunks::<BLOCK>().0 {
         let bits = u16::from_le_bytes([block[0], block[1]]);
-        scales.push(half::f16::from_bits(bits).to_f32());
+        scales.push(f16::from_bits(bits));
         quants.extend(block[2..].iter().map(|byte| *byte as i8));
     }
     (scales, quants)

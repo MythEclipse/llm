@@ -23,10 +23,11 @@ fn ms(duration: std::time::Duration) -> f64 {
 fn decode_step_cost_grows_with_position() {
     let gguf = GgufFile::open(&model_path()).expect("model opens");
     let model = Model::load(&gguf).expect("model loads");
-    let filler: Vec<u32> = (0..1024).map(|index| 100 + index % 900).collect();
+    let filler: Vec<u32> = (0..4096).map(|index| 100 + index % 900).collect();
 
-    for position in [0usize, 128, 512, 1024] {
-        let mut session = Session::new(&model, 2048).expect("session builds");
+    for position in [0usize, 128, 512, 1024, 2048, 4090] {
+        let mut session = Session::new(&model, (position + 16).next_power_of_two().max(512))
+            .expect("session builds");
         let prefill_started = Instant::now();
         let mut logits = session
             .prefill(&filler[..position.max(1)])

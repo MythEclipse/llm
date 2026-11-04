@@ -130,32 +130,36 @@ sebaran `±` (deviasi standar sampel, rumus yang sama dengan llama-bench).
 ### Kinerja terukur
 
 RTX 4050 Laptop 6 GB (sm_89, driver 615.78.08), model 2,68 GB, konteks 4096,
-VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
+VRAM terpakai ±3,0 GiB, median 9 langkah decode per titik, gateway dimatikan:
 
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
-| 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 3.438 tok/s (0,04 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 4.099 tok/s (0,12 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 3.758 tok/s (0,27 s) | 27 tok/s (36,8 s) |
-| 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
-| 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
+| 0 token | **68,9 tok/s** (14,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
+| 128 token | **67,4 tok/s** (14,8 ms) | 19,5 tok/s (51,4 ms) | 3.843 tok/s (0,03 s) | 35 tok/s (3,63 s) |
+| 512 token | **66,6 tok/s** (15,0 ms) | 15,6 tok/s (64,1 ms) | 4.856 tok/s (0,11 s) | 30 tok/s (16,7 s) |
+| 1024 token | **63,5 tok/s** (15,7 ms) | 11,1 tok/s (90,3 ms) | 5.202 tok/s (0,20 s) | 27 tok/s (36,8 s) |
+| 2048 token | 60,7 tok/s (16,5 ms) | — | — | — |
+| 4090 token | 54,0 tok/s (18,5 ms) | — | — | — |
 
 Decode 3,0–5,4× lebih cepat, prefill 9,3–10,6× lebih cepat. Satu generasi 120
-token di CLI: 60,6 tok/s, TTFT 175 ms.
+token di CLI: 67,0 tok/s, TTFT ≈ 140 ms.
 
 Lantai decode di 4050 (≈192 GB/s) adalah 2,68 GB bobot / 192 GB/s ≈ 14 ms per
-token; yang terukur 15,5 ms pada konteks 0, jadi decode sudah 90% dari lantai
-itu. Kenaikan 15,5 → 20,3 ms sampai konteks 4090 juga bukan kernel lagi: KV f32
-pada 4090 token berukuran 704 MB dan dibaca ulang tiap token, yaitu 704 MB /
-192 GB/s ≈ 3,7 ms — persis selisih yang terukur. Menekannya berarti KV f16 atau
-KV terkuantisasi, yang mengubah numerik.
+token; yang terukur 14,5 ms pada konteks 0, jadi decode berada di 96% dari
+lantai itu. Dua hal yang memangkas sisa jarak:
 
-Prefill masih di ±670 GFLOPS (5–10% dari puncak fp32 kartu ini). Jalur prompt
-memakai 4 baris bobot × 8 token per blok dengan k dipecah 1024 elemen, jadi satu
-baca shared menghasilkan 32 MAC; menaikkan lagi berarti tile 8×8 (64 akumulator
-per lane, register tidak cukup) atau tensor core lewat bobot f16/bf16 — yang
-mengubah numerik dan karenanya belum dilakukan.
+- **skala bobot disimpan f16, bukan f32** — skala memang f16 di file GGUF, jadi
+  menyimpannya sebagai f16 tidak mengubah satu bit pun dari hasil, tetapi
+  memangkas bidang skala dari 0,32 GB menjadi 0,16 GB. Bobot total kembali ke
+  2,68 GB persis seperti di file, dan decode turun 15,5 → 14,5 ms;
+- **KV cache f16, seperti llama.cpp** — pada 4090 token KV dulu 704 MB dan
+  dibaca ulang tiap token (3,7 ms); sekarang 352 MB (1,85 ms). Kurva decode
+  jadi 14,5 / 14,8 / 15,0 / 15,7 / 16,5 / 18,5 ms pada konteks
+  0 / 128 / 512 / 1024 / 2048 / 4090.
+
+Prefill dulu ±670 GFLOPS (5–10% dari puncak fp32); sekarang matmul-nya sendiri
+berjalan 12,5 TMAC/s lewat tensor core int8 dan attention lewat tensor core f16
+(lihat bagian-bagian berikut).
 
 ### Kenapa decode butuh repack bobot
 
@@ -414,8 +418,74 @@ yang benar menaruh `sum_i` hanya di penyebut.
 Kedua backend menjalankan **forward pass yang sama** dan diuji terhadap fixture
 llama.cpp yang sama. Test `gpu_matmul` membandingkan kernel GPU dengan kernel CPU
 pada bobot asli (max |Δ| ≈ 1,5e-6), dan `logits_golden`/`greedy_golden` lulus di
-kedua backend dengan angka yang sama (max |Δ| 0,118 / 0,572 / 0,260; 32 token
+kedua backend dengan angka yang sama (max |Δ| 0,118 / 0,572 / 0,274; 32 token
 greedy identik). Jadi GPU bukan jalur "kira-kira benar" yang terpisah.
+
+### KV f16, skala bobot f16, dan fusi elementwise
+
+Empat perubahan kecil yang menutup celah decode dan memangkas prefill:
+
+- **KV cache f16**. llama.cpp menyimpan KV dalam f16, engine ini dulu f32.
+  Sekarang `kv_append` mengonversi saat menulis, dan ketiga kernel attention
+  mengonversi balik saat membaca. Pada konteks 4090 KV yang dibaca ulang tiap
+  token turun 704 → 352 MB, jadi decode 20,3 → 18,5 ms — dan numeriknya justru
+  makin dekat ke fixture llama.cpp (semua fixture direkam dari cache f16 mereka).
+- **Skala bobot f16**. Repack Q8_0 dulu menyimpan skala f16 sebagai f32. Karena
+  skala memang f16 di file, menyimpannya sebagai f16 identik bit-per-bit, dan
+  bidang skala turun 0,32 → 0,16 GB: decode 15,5 → 14,5 ms. Ada satu jebakan:
+  versi pertama memuat skala dengan `LDG.U16` per elemen di kernel prompt dan
+  prefill justru turun 7%; memuat dua skala sekaligus sebagai `half2` (akses
+  32-bit, bentuk yang sama seperti f32 lama) mengembalikan semuanya.
+- **`silu(gate)·up` langsung dikuantisasi** (`silu_mul_quantize_rows`), tanpa
+  menulis aktivasi f32 lalu membacanya kembali — hemat satu pass penuh n×6144
+  per layer. Perhatian: jalur decode (n < 8) membaca aktivasi f32 langsung dan
+  tidak pernah melihat buffer prepared, jadi di bawah ambang itu produk tetap
+  ditulis seperti sebelumnya.
+- **`rmsnorm` langsung dikuantisasi** (`rmsnorm_quantize_rows`) dengan alasan
+  yang sama. Vektor load float4 eksplisit diperlukan di sini — versi skalar
+  berjalan dua kali lebih lambat daripada pasangan kernel yang digantikannya.
+  Residual matmul juga dicoba dilebur ke epilog kernel mma, tetapi load bias
+  yang tersebar di epilog ternyata lebih mahal (81 → 87 ms) daripada pass
+  residual terpisah yang digantikannya (3 ms), jadi fusi itu hanya dipakai
+  untuk decode (n = 1), di mana satu load per baris tidak menyebar.
+
+Embedding prompt juga dijadikan satu launch (`embedding_rows`) alih-alih satu
+launch per token.
+
+### Attention prefill: tensor core f16
+
+Kernel fp32 sebelumnya terikat bandwidth **shared memory**, bukan DRAM: dot
+skalar butuh dua pembacaan shared per MAC, jadi tidak peduli seberapa cepat
+unit aritmetikanya. Perbaikan yang sebenarnya adalah mengalikan di tensor
+core, seperti `fattn` milik ggml:
+
+- satu blok memegang **delapan head** (seluruh grup GQA model ini) dan 16 posisi
+  query; satu warp = satu head, 16 query = satu ubin m16;
+- Q dan K/V di-stage ke shared sebagai f16 (48 KB, dua blok per SM); K tetap
+  dim-major sehingga fragmen B (=Kᵀ) dimuat langsung dengan `ldmatrix`;
+- QKᵀ dihitung dengan `mma.sync.m16n8k16.f16` dan skor tinggal di register —
+  **skor yang sudah di-exp adalah fragmen A dari PV**, jadi langkah value juga
+  `mma` tanpa pembacaan shared tambahan, trik yang sama dengan ggml;
+- softmax tetap online: `running_max`/`running_sum` per baris query plus
+  koreksi `exp(m_lama − m_baru)` pada akumulator O, persis seperti kernel fp32.
+
+Hasilnya attention prefill 25,5 → 10,5 ms pada pp512 (dan proporsional pada
+ukuran lain), yang mengangkat pp128 3.438 → 3.843, pp512 4.099 → 4.856, dan
+pp1024 3.758 → 5.202 tok/s. Delta logits terhadap llama.cpp justru mengecil
+(logits_golden_long 0,321 → 0,274) karena f16 adalah presisi attention mereka.
+
+Dua jebakan yang memakan waktu paling lama, dicatat karena keduanya tidak
+terlihat dari kode:
+
+- **fragmen C `m16n8` adalah d0/d1 = (baris r, kolom 2t dan 2t+1), d2/d3 =
+  baris r+8** — bukan d0/d2 = baris r seperti yang tertulis di teks PTX ISA
+  yang saya baca. Gejalanya: semua nilai salah kecuali baris pertama;
+- **fragmen B butuh `ldmatrix…x2.trans`**. Tanpa transpos, distribusi lane
+  memberikan B[lane/4][2t] sedangkan mma meminta B[2t][lane/4]; baris 0
+  kebetulan benar sehingga kesalahan terlihat seperti masalah masking.
+
+Keduanya dipastikan lewat micro-probe standalone yang membandingkan kernel
+melawan referensi CPU pada matriks acak, bukan lewat forward pass penuh.
 
 ### Perbandingan dengan llama.cpp
 
@@ -437,28 +507,28 @@ ada proses lain yang memakai GPU.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.438 ± 26 tok/s | 4.546 ± 482 tok/s | 76% |
-| pp512 | 4.099 ± 0,8 tok/s | 5.890 ± 161 tok/s | 70% |
-| pp1024 | 3.758 ± 4,7 tok/s | 5.796 ± 187 tok/s | 65% |
-| tg128 | **63,2 ± 0,02 tok/s** | 71,2 ± 0,03 tok/s | 89% |
+| pp128 | 3.843 ± 27 tok/s | 4.546 ± 482 tok/s | 85% |
+| pp512 | 4.856 ± 5 tok/s | 5.890 ± 161 tok/s | 82% |
+| pp1024 | 5.202 ± 7 tok/s | 5.796 ± 187 tok/s | 90% |
+| tg128 | **67,1 ± 0,1 tok/s** | 71,2 ± 0,03 tok/s | 94% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
 
 | Metrik | llm GPU | llama.cpp GPU |
 |---|---:|---:|
-| VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB |
-| Load + 1 token (wall) | 1,07 s | 1,32 s |
+| VRAM (ctx 4096) | 2,9 GiB | 2,49 GiB |
+| Load + 1 token (wall) | 0,9 s | 1,32 s |
 
 Bacaan jujurnya:
 
-- **Decode sepadan**: 89% dan kurvanya rata terhadap konteks seperti llama.cpp.
-  Selisihnya ongkos repack (1,125 vs 1,0625 byte per parameter) ditambah attention
-  yang belum di-tile dengan cara yang sama.
-- **Prefill 1,3–1,5× tertinggal**: 76% pada 128 token, 70% pada 512, 65% pada
-  1024. Dua penyebab yang sudah terukur:
-  matmul sendirian berjalan 5,5 TMAC/s sedangkan prefill llama.cpp setara
-  ≈7,5 TMAC/s, dan attention prefill membaca ulang K/V untuk setiap blok query.
+- **Decode nyaris sepadan**: 94%, dan kurvanya rata terhadap konteks — sisanya
+  ongkos repack (1,125 vs 1,0625 byte per parameter) plus attention decode yang
+  masih fp32.
+- **Prefill 10–18% tertinggal**, dan selisihnya sekarang menyusut seiring konteks
+  bertambah. Dua sisa yang terukur: matmul masih membayar kuantisasi gelombang
+  pada proyeksi 2048 baris (80% efisien), dan attention prefill masih bisa
+  memakai query tile yang lebih besar.
 - **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks
   (jalur CPU belum memakai tiling attention).
 
