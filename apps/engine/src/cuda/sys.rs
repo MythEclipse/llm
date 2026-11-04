@@ -35,12 +35,17 @@ pub struct DevicePtr(pub u64);
 
 pub const SUCCESS: i32 = 0;
 
+/// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`: how many blocks can run at once.
+pub const ATTRIBUTE_MULTIPROCESSORS: i32 = 16;
+
 #[link(name = "cuda")]
 unsafe extern "C" {
     pub fn cuInit(flags: u32) -> i32;
     pub fn cuDeviceGet(device: *mut Device, ordinal: i32) -> i32;
     pub fn cuDeviceGetName(name: *mut c_char, len: i32, device: Device) -> i32;
     pub fn cuDeviceTotalMem_v2(bytes: *mut usize, device: Device) -> i32;
+    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` is 16 in the driver API.
+    pub fn cuDeviceGetAttribute(value: *mut i32, attribute: i32, device: Device) -> i32;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     pub fn cuCtxCreate_v2(context: *mut Context, flags: u32, device: Device) -> i32;
     pub fn cuCtxDestroy_v2(context: Context) -> i32;

@@ -15,9 +15,10 @@ use std::sync::Mutex;
 use half::f16;
 
 use sys::{
-    Context, Device, DevicePtr, Event, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module,
-    SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName,
-    cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy, cuEventElapsedTime, cuEventRecord,
+    ATTRIBUTE_MULTIPROCESSORS, Context, Device, DevicePtr, Event, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED,
+    Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet,
+    cuDeviceGetAttribute, cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy,
+    cuEventElapsedTime, cuEventRecord,
     cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
     cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
     error_message,
@@ -28,12 +29,16 @@ use crate::error::EngineError;
 include!(concat!(env!("OUT_DIR"), "/gpu_ptx.rs"));
 
 const LANES: u32 = 32;
+/// Matrices one prompt matmul launch carries, matching `MMA_GROUP_MAX`.
+pub const MMA_GROUP_MAX: usize = 4;
 const WARPS: u32 = 8;
+/// Output rows one decode matmul block owns, matching `DECODE_ROWS_PER_BLOCK`.
+const DECODE_ROWS_PER_BLOCK: usize = 4;
 /// Four warps per attention block, matching `ATTENTION_WARPS` in the kernel.
 const ATTENTION_THREADS: u32 = 128;
 /// Positions per attention block on the decode path, and the shared window the
 /// kernel reserves per block.
-const SPLIT_POSITIONS: usize = 64;
+const SPLIT_POSITIONS: usize = 32;
 const MAX_SPLIT_POSITIONS: usize = 256;
 const MAX_SPLITS: usize = 1024;
 
@@ -62,9 +67,10 @@ const PREFILL_SHARED_BYTES: u32 = 49_152;
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
 const MMA_WARPS: usize = 8;
-/// Dynamic shared memory the prompt matmul asks for: weights and activations for
-/// one k chunk, both padded by `MMA_PAD`, plus their per-block scales.
-const MMA_SHARED_BYTES: u32 = 97_280;
+/// Dynamic shared memory the prompt matmul asks for: two k-chunk stages of
+/// weights and activations, both padded by `MMA_PAD`, plus their per-block scales.
+/// 2 × 128 × 144 twice over, plus 2 × 2 × 128 × 4 scales.
+const MMA_SHARED_BYTES: u32 = 77_824;
 /// Tokens one prompt block can hold, matching `MMA_BLOCK_TOKENS` in the kernel
 /// and the engine's prefill chunk.
 /// Tokens one prompt-matmul block covers, matching `MMA_BLOCK_TOKENS`.
@@ -126,6 +132,15 @@ struct Kernels {
     embedding_rows: Function,
 }
 
+/// One matmul of a group that shares its activations.
+pub struct GroupEntry<'a> {
+    pub identity: (usize, usize),
+    pub bytes: &'a [u8],
+    pub out: usize,
+    pub y: &'a DeviceBuffer,
+    pub y_offset: usize,
+}
+
 /// A weight slice as the kernels want it.
 enum Resident {
     /// Q8_0 repacked to `scales` (k/32 f32) + `quants` (k i8) per row.
@@ -143,6 +158,8 @@ pub struct Gpu {
     kernels: Kernels,
     name: String,
     total_bytes: usize,
+    /// Streaming multiprocessors, which is how many blocks one wave holds.
+    multiprocessors: usize,
     weights: Mutex<HashMap<(usize, usize), Resident>>,
     workspace: Mutex<Option<DeviceBuffer>>,
     activation: Mutex<Option<DeviceBuffer>>,
@@ -179,6 +196,16 @@ impl Gpu {
             check(
                 cuDeviceTotalMem_v2(&raw mut total_bytes, device),
                 "cuDeviceTotalMem",
+            )?;
+
+            let mut multiprocessors = 0i32;
+            check(
+                cuDeviceGetAttribute(
+                    &raw mut multiprocessors,
+                    ATTRIBUTE_MULTIPROCESSORS,
+                    device,
+                ),
+                "cuDeviceGetAttribute",
             )?;
 
             let mut context = Context(std::ptr::null_mut());
@@ -234,6 +261,7 @@ impl Gpu {
                 kernels,
                 name,
                 total_bytes,
+                multiprocessors: multiprocessors.max(1) as usize,
                 weights: Mutex::new(HashMap::new()),
                 workspace: Mutex::new(None),
                 activation: Mutex::new(None),
@@ -248,6 +276,11 @@ impl Gpu {
 
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    /// Blocks that run concurrently: one wave.
+    pub fn multiprocessors(&self) -> usize {
+        self.multiprocessors
     }
 
     /// Free device memory right now, used to decide whether a model fits.
@@ -350,7 +383,6 @@ impl Gpu {
         assert!(x.len() >= n * k, "activation shape mismatch");
         assert!(y.len() >= n * out, "output shape mismatch");
 
-        let (scales, quants) = self.quantized(identity, weights)?;
         if n >= WARPS as usize {
             if n > MMA_TOKENS {
                 return Err(EngineError::Unsupported(format!(
@@ -365,18 +397,22 @@ impl Gpu {
                     &owned
                 }
             };
-            return self.matmul_prompt_prepared(
-                &scales,
-                &quants,
+            // A single matrix is a group of one; the bias never reaches the
+            // prompt path, which keeps its residual add as a separate pass.
+            return self.matmul_prompt_group(
+                &[GroupEntry {
+                    identity,
+                    bytes: weights,
+                    out,
+                    y,
+                    y_offset,
+                }],
                 prepared,
                 n,
                 k,
-                out,
-                y,
-                y_offset,
-                bias,
             );
         }
+        let (scales, quants) = self.quantized(identity, weights)?;
         let mut args = [
             Arg::Pointer(scales),
             Arg::Pointer(quants),
@@ -388,15 +424,21 @@ impl Gpu {
             Arg::Int(out as i32),
             Arg::Int(n as i32),
         ];
-        // Single-token decode uses a smaller four-warp reduction. Batched decode
-        // keeps the eight-warp kernel because it reuses the row across tokens.
+        // Single-token decode gives every output row its own warp, four rows per
+        // block: the row is small, so the win is in flight, not in width.
         if n == 1 {
-            return self.launch(
-                self.kernels.matmul_decode,
-                (out as u32, 1, 1),
-                (LANES, 4, 1),
-                0,
-                &mut args,
+            return self.matmul_decode_group(
+                &[GroupEntry {
+                    identity,
+                    bytes: weights,
+                    out,
+                    y,
+                    y_offset,
+                }],
+                x,
+                x_offset,
+                k,
+                bias,
             );
         }
         // Two to seven tokens keep the eight-warp kernel; the bias is applied
@@ -829,55 +871,139 @@ impl Gpu {
         Ok(Prepared(buffer))
     }
 
-    /// The prompt matmul on activations `prepare` has already quantised.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_prompt_prepared(
+    /// One launch for up to four single-token matmuls that share the activation
+    /// vector, their row spaces concatenated. `bias` is the residual a decode step
+    /// adds in the epilogue; it belongs to a single matrix, so it is only set when
+    /// the group holds one.
+    pub fn matmul_decode_group(
         &self,
-        weight_scales: &DevicePtr,
-        weight_quants: &DevicePtr,
+        group: &[GroupEntry<'_>],
+        x: &DeviceBuffer,
+        x_offset: usize,
+        k: usize,
+        bias: Option<(DevicePtr, usize)>,
+    ) -> Result<(), EngineError> {
+        assert!(
+            !group.is_empty() && group.len() <= MMA_GROUP_MAX,
+            "decode matmul group holds one to four matrices"
+        );
+        let mut resolved = Vec::with_capacity(group.len());
+        let mut rows = 0;
+        for entry in group {
+            assert!(
+                entry.out.is_multiple_of(DECODE_ROWS_PER_BLOCK),
+                "decode matmul rows come in blocks of four"
+            );
+            let (scales, quants) = self.quantized(entry.identity, entry.bytes)?;
+            rows += entry.out;
+            resolved.push((scales, quants, entry.out, shifted(entry.y.pointer, entry.y_offset)));
+        }
+        while resolved.len() < MMA_GROUP_MAX {
+            resolved.push((resolved[0].0, resolved[0].1, 0, resolved[0].3));
+        }
+        let mut args = [
+            Arg::Pointer(resolved[0].0),
+            Arg::Pointer(resolved[0].1),
+            Arg::Pointer(resolved[1].0),
+            Arg::Pointer(resolved[1].1),
+            Arg::Pointer(resolved[2].0),
+            Arg::Pointer(resolved[2].1),
+            Arg::Pointer(resolved[3].0),
+            Arg::Pointer(resolved[3].1),
+            Arg::Pointer(resolved[0].3),
+            Arg::Pointer(resolved[1].3),
+            Arg::Pointer(resolved[2].3),
+            Arg::Pointer(resolved[3].3),
+            Arg::Int(resolved[0].2 as i32),
+            Arg::Int(resolved[1].2 as i32),
+            Arg::Int(resolved[2].2 as i32),
+            Arg::Int(resolved[3].2 as i32),
+            Arg::Int(group.len() as i32),
+            Arg::Pointer(shifted(x.pointer, x_offset)),
+            Arg::Pointer(bias.map_or(shifted(resolved[0].3, 0), |(p, o)| shifted(p, o))),
+            Arg::Int(bias.is_some() as i32),
+            Arg::Int(k as i32),
+        ];
+        self.launch(
+            self.kernels.matmul_decode,
+            ((rows / DECODE_ROWS_PER_BLOCK) as u32, 1, 1),
+            (4 * LANES, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// One launch for up to four matmuls that share the same activations. Their
+    /// row tiles are concatenated, so the group fills a wave together instead of
+    /// each matrix filling one on its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_prompt_group(
+        &self,
+        group: &[GroupEntry<'_>],
         prepared: &Prepared,
         n: usize,
         k: usize,
-        out: usize,
-        y: &DeviceBuffer,
-        y_offset: usize,
-        bias: Option<(DevicePtr, usize)>,
     ) -> Result<(), EngineError> {
         if n > MMA_TOKENS {
             return Err(EngineError::Unsupported(format!(
                 "prompt matmul holds {MMA_TOKENS} tokens, got {n}"
             )));
         }
+        assert!(
+            !group.is_empty() && group.len() <= MMA_GROUP_MAX,
+            "prompt matmul group holds one to four matrices"
+        );
         let act_quants = prepared.0;
         let act_scales = shifted(prepared.0, n * k / 4);
+        let mut resolved = Vec::with_capacity(group.len());
+        let mut row_tiles = 0;
+        for entry in group {
+            let (scales, quants) = self.quantized(entry.identity, entry.bytes)?;
+            row_tiles += entry.out.div_ceil(MMA_ROWS * MMA_WARPS);
+            resolved.push((scales, quants, entry.out, shifted(entry.y.pointer, entry.y_offset)));
+        }
+        while resolved.len() < MMA_GROUP_MAX {
+            resolved.push((resolved[0].0, resolved[0].1, 0, resolved[0].3));
+        }
+        let token_tiles = n.div_ceil(MMA_BLOCK_TOKENS);
+        let plan = wave_plan(row_tiles, token_tiles, self.multiprocessors());
         let mut args = [
-            Arg::Pointer(*weight_scales),
-            Arg::Pointer(*weight_quants),
+            Arg::Pointer(resolved[0].0),
+            Arg::Pointer(resolved[0].1),
+            Arg::Pointer(resolved[1].0),
+            Arg::Pointer(resolved[1].1),
+            Arg::Pointer(resolved[2].0),
+            Arg::Pointer(resolved[2].1),
+            Arg::Pointer(resolved[3].0),
+            Arg::Pointer(resolved[3].1),
+            Arg::Pointer(resolved[0].3),
+            Arg::Pointer(resolved[1].3),
+            Arg::Pointer(resolved[2].3),
+            Arg::Pointer(resolved[3].3),
+            Arg::Int(resolved[0].2 as i32),
+            Arg::Int(resolved[1].2 as i32),
+            Arg::Int(resolved[2].2 as i32),
+            Arg::Int(resolved[3].2 as i32),
+            Arg::Int(group.len() as i32),
             Arg::Pointer(act_scales),
             Arg::Pointer(act_quants),
-            Arg::Pointer(shifted(y.pointer, y_offset)),
-            Arg::Pointer(bias.map_or(shifted(y.pointer, y_offset), |(p, o)| shifted(p, o))),
-            Arg::Int(bias.is_some() as i32),
             Arg::Int(k as i32),
-            Arg::Int(out as i32),
             Arg::Int(n as i32),
+            Arg::Int(token_tiles as i32),
+            Arg::Int(plan.full_blocks as i32),
+            Arg::Int(plan.tail_slices as i32),
         ];
         self.launch(
             self.kernels.matmul_mma,
-            // Token tiles are the fast dimension so the blocks resident together
-            // share a weight tile and hit L2 instead of re-reading 2,8 GB of it.
-            (
-                n.div_ceil(MMA_BLOCK_TOKENS) as u32,
-                out.div_ceil(MMA_ROWS * MMA_WARPS) as u32,
-                1,
-            ),
+            // One flat grid, token tiles the fast dimension so the blocks resident
+            // together share a weight tile and hit L2 instead of re-reading it.
+            (plan.blocks as u32, 1, 1),
             (LANES, MMA_WARPS as u32, 1),
             MMA_SHARED_BYTES,
             &mut args,
         )
     }
 
-    /// Space for the quantized activations: `quants_bytes` for the int8 side and
     /// `scale_floats` for the per-block scales, in one cached allocation.
     fn activation_workspace(
         &self,
@@ -1217,6 +1343,38 @@ enum Arg {
     Pointer(DevicePtr),
     Int(i32),
     Float(f32),
+}
+
+/// How a prompt matmul fills the device.
+///
+/// A tile is a whole unit of work: 128 output rows by up to 128 tokens. When the
+/// tile count is not a multiple of the blocks that run at once, the last wave is
+/// nearly empty and still costs a full tile, which at 512 tokens is 20% of the
+/// matmul. The tail tiles are therefore cut along the token axis, each slice
+/// writing disjoint columns, so no partial sums need combining.
+struct WavePlan {
+    blocks: usize,
+    full_blocks: usize,
+    tail_slices: usize,
+}
+
+fn wave_plan(row_tiles: usize, token_tiles: usize, multiprocessors: usize) -> WavePlan {
+    let tiles = row_tiles * token_tiles;
+    let waves = tiles.div_ceil(multiprocessors);
+    let full_blocks = waves.saturating_sub(1) * multiprocessors;
+    let tail = tiles - full_blocks;
+    // Slices must divide a tile evenly and stay a multiple of the mma token step.
+    let mut tail_slices = 1;
+    if tail < multiprocessors {
+        let room = multiprocessors / tail.max(1);
+        tail_slices = room.next_power_of_two() / 2;
+        tail_slices = tail_slices.clamp(1, 8);
+    }
+    WavePlan {
+        blocks: full_blocks + tail * tail_slices,
+        full_blocks,
+        tail_slices,
+    }
 }
 
 /// Shape of the attention kernel's grid, kept in one place.

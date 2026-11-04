@@ -1,6 +1,6 @@
 //! The MiniCPM5 transformer: embeddings → 42 decoder layers → logits.
 
-use crate::compute::{Activation, AttentionSpec, Compute};
+use crate::compute::{Activation, AttentionSpec, Compute, GroupMember};
 use crate::error::EngineError;
 use crate::gguf::GgufFile;
 use crate::ops::RopeTable;
@@ -369,32 +369,28 @@ impl<'a> Model<'a> {
             &mut scratch.normed,
             0,
         )?;
-        self.compute.matmul_prepared(
-            &layer.wq,
+        self.compute.matmul_prepared_group(
+            &mut [
+                GroupMember {
+                    weight: &layer.wq,
+                    out: &mut scratch.q,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &layer.wk,
+                    out: &mut scratch.k,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &layer.wv,
+                    out: &mut scratch.v,
+                    out_offset: 0,
+                },
+            ],
             &scratch.normed,
             0,
             &normed,
             n,
-            &mut scratch.q,
-            0,
-        )?;
-        self.compute.matmul_prepared(
-            &layer.wk,
-            &scratch.normed,
-            0,
-            &normed,
-            n,
-            &mut scratch.k,
-            0,
-        )?;
-        self.compute.matmul_prepared(
-            &layer.wv,
-            &scratch.normed,
-            0,
-            &normed,
-            n,
-            &mut scratch.v,
-            0,
         )?;
 
         self.compute.rope(
@@ -458,23 +454,23 @@ impl<'a> Model<'a> {
             &mut scratch.normed,
             0,
         )?;
-        self.compute.matmul_prepared(
-            &layer.w_gate,
+        self.compute.matmul_prepared_group(
+            &mut [
+                GroupMember {
+                    weight: &layer.w_gate,
+                    out: &mut scratch.gate,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &layer.w_up,
+                    out: &mut scratch.up,
+                    out_offset: 0,
+                },
+            ],
             &scratch.normed,
             0,
             &normed,
             n,
-            &mut scratch.gate,
-            0,
-        )?;
-        self.compute.matmul_prepared(
-            &layer.w_up,
-            &scratch.normed,
-            0,
-            &normed,
-            n,
-            &mut scratch.up,
-            0,
         )?;
         let activated = self.compute.silu_mul_prepare(
             &mut scratch.activated,

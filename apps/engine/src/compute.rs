@@ -41,6 +41,28 @@ pub struct Prepared {
     buffer: Option<crate::cuda::Prepared>,
 }
 
+/// Tokens past which the two feed-forward projections are launched separately.
+///
+/// Grouping the projections concatenates their row tiles, which is what fills the
+/// device when a single projection cannot: q, k and v together are one wave's
+/// worth of work at 128 tokens where q alone leaves four SMs idle. The feed-forward
+/// pair already fills ten waves at 512 tokens, and past that point the wider tile
+/// set only costs: at 1024 tokens the grouped launch measured 2,40 ms against
+/// 2 × 0,70 ms for the separate ones.
+const GROUP_FFN_MAX_TOKENS: usize = 512;
+
+/// Whether a group of this many matmuls should share a launch.
+fn group_worth_it(members: usize, n: usize) -> bool {
+    members == 3 || n <= GROUP_FFN_MAX_TOKENS
+}
+
+/// One matmul of a group that shares its activations with its neighbours.
+pub struct GroupMember<'a> {
+    pub weight: &'a Weight<'a>,
+    pub out: &'a mut Activation,
+    pub out_offset: usize,
+}
+
 /// Attention geometry for one launch.
 /// Head dimension the tiled prefill attention kernel is written for.
 const PREFILL_HEAD_DIM: usize = 128;
@@ -286,6 +308,54 @@ impl Compute {
         y_offset: usize,
     ) -> Result<(), EngineError> {
         self.matmul_with(weight, x, x_offset, n, y, y_offset, None, None)
+    }
+
+    /// Several matmuls that read the same activations, in one launch where the
+    /// device allows it. Their row tiles then share a wave: at short prompts a
+    /// single projection leaves part of the device idle, and q, k and v are three
+    /// of those in a row. On the CPU they simply run one after another.
+    pub fn matmul_prepared_group(
+        &self,
+        members: &mut [GroupMember<'_>],
+        x: &Activation,
+        x_offset: usize,
+        prepared: &Prepared,
+        n: usize,
+    ) -> Result<(), EngineError> {
+        let grouped = group_worth_it(members.len(), n);
+        if let (true, Some(gpu), Activation::Device(source)) = (grouped, &self.gpu, x) {
+            let mut entries = Vec::with_capacity(members.len());
+            for member in members.iter() {
+                let Activation::Device(target) = &member.out else {
+                    unreachable!("activation belongs to the other backend");
+                };
+                entries.push(crate::cuda::GroupEntry {
+                    identity: member.weight.identity(),
+                    bytes: member.weight.bytes(),
+                    out: member.weight.out,
+                    y: target,
+                    y_offset: member.out_offset,
+                });
+            }
+            let k = members[0].weight.k;
+            if n == 1 {
+                return gpu.matmul_decode_group(&entries, source, x_offset, k, None);
+            }
+            if let Some(buffer) = prepared.buffer.as_ref() {
+                return gpu.matmul_prompt_group(&entries, buffer, n, k);
+            }
+        }
+        for member in members.iter_mut() {
+            self.matmul(
+                member.weight,
+                x,
+                x_offset,
+                n,
+                member.out,
+                member.out_offset,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

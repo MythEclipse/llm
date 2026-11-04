@@ -34,6 +34,9 @@ __device__ __forceinline__ float warp_block_sum(float value, float* scratch) {
     return total;
 }
 
+// Weight matrices one matmul launch can carry, concatenated along the row axis.
+#define MMA_GROUP_MAX 4
+
 // Sign-extend byte `index` of `word` to a float.
 __device__ __forceinline__ float q8_element(unsigned int word, int index) {
     return (float)((int)(word << (24 - index * 8)) >> 24);
@@ -159,45 +162,104 @@ __device__ __forceinline__ float warp_block_sum4(float value, float* scratch) {
     return total;
 }
 
-extern "C" __global__ void q8_matmul_decode(const __half* __restrict__ scales,
-                                            const signed char* __restrict__ quants,
+// Rows one decode block owns: one warp each, so the activation vector is read
+// once per four rows instead of once per row, and the reduction never leaves the
+// warp (no shared memory, no __syncthreads).
+#define DECODE_ROWS_PER_BLOCK 4
+
+// Up to four matrices that read the same activation vector travel in one launch,
+// their row spaces concatenated: q, k and v are three launches of a few hundred
+// rows each, and a launch that small cannot keep the memory system busy on its
+// own. The group also removes two launches from every layer of every token.
+extern "C" __global__ void q8_matmul_decode(const __half* __restrict__ scales0,
+                                            const signed char* __restrict__ quants0,
+                                            const __half* __restrict__ scales1,
+                                            const signed char* __restrict__ quants1,
+                                            const __half* __restrict__ scales2,
+                                            const signed char* __restrict__ quants2,
+                                            const __half* __restrict__ scales3,
+                                            const signed char* __restrict__ quants3,
+                                            float* __restrict__ y0,
+                                            float* __restrict__ y1,
+                                            float* __restrict__ y2,
+                                            float* __restrict__ y3,
+                                            int out0, int out1, int out2, int out3, int count,
                                             const float* __restrict__ x,
-                                            float* __restrict__ y,
-                                            const float* bias,
+                                            const float* __restrict__ bias,
                                             int use_bias,
-                                            int k, int out) {
-    __shared__ float reduction[4];
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int tid = warp * blockDim.x + lane;
-    const int threads = blockDim.x * blockDim.y;
-    const int o = blockIdx.x;
+                                            int k) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int flat = blockIdx.x * DECODE_ROWS_PER_BLOCK;
+    const int outs[MMA_GROUP_MAX] = {out0, out1, out2, out3};
+    int matrix = 0;
+    int row = flat;
+    for (int candidate = 0, first = 0; candidate < count; ++candidate) {
+        if (flat < first + outs[candidate]) {
+            matrix = candidate;
+            row = flat - first;
+            break;
+        }
+        first += outs[candidate];
+    }
+    const __half* scales = scales0;
+    const signed char* quants = quants0;
+    float* y = y0;
+    if (matrix == 1) {
+        scales = scales1;
+        quants = quants1;
+        y = y1;
+    } else if (matrix == 2) {
+        scales = scales2;
+        quants = quants2;
+        y = y2;
+    } else if (matrix == 3) {
+        scales = scales3;
+        quants = quants3;
+        y = y3;
+    }
+    const int out = outs[matrix];
+    const int o = row + warp;
+    if (o >= out) {
+        return;
+    }
     const __half* row_scales = scales + (size_t)o * (k / Q8_BLOCK_ELEMS);
     const signed char* row_quants = quants + (size_t)o * k;
     float sum = 0.0f;
-    #pragma unroll 2
-    for (int base = tid * 16; base < k; base += threads * 16) {
+    // One warp per row: four weight loads in flight per lane for k = 2048, and
+    // the activation vector comes from the read-only path so four blocks sharing
+    // it stay in L1 while the weight stream passes through.
+    #pragma unroll 4
+    for (int base = lane * 16; base < k; base += 32 * 16) {
         const uint4 raw = *reinterpret_cast<const uint4*>(row_quants + base);
-        const float4 v0 = *reinterpret_cast<const float4*>(x + base);
-        const float4 v1 = *reinterpret_cast<const float4*>(x + base + 4);
-        const float4 v2 = *reinterpret_cast<const float4*>(x + base + 8);
-        const float4 v3 = *reinterpret_cast<const float4*>(x + base + 12);
+        const float4 v0 = __ldg(reinterpret_cast<const float4*>(x + base));
+        const float4 v1 = __ldg(reinterpret_cast<const float4*>(x + base + 4));
+        const float4 v2 = __ldg(reinterpret_cast<const float4*>(x + base + 8));
+        const float4 v3 = __ldg(reinterpret_cast<const float4*>(x + base + 12));
         sum += __half2float(row_scales[base >> 5]) *
             (q8_dot8(make_uint2(raw.x, raw.y), v0, v1) +
              q8_dot8(make_uint2(raw.z, raw.w), v2, v3));
     }
-    sum = warp_block_sum4(sum, reduction);
-    if (tid == 0) {
+    for (int step = 16; step > 0; step >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, step);
+    }
+    if (lane == 0) {
         y[o] = sum + (use_bias ? bias[o] : 0.0f);
     }
 }
 
+// Decode calls this once per layer for a single row, so its cost is latency, not
+// bandwidth: the sum is reduced inside each warp and across warps with one
+// barrier, instead of a shared-memory tree that needs eight.
 extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
                                        float* __restrict__ dst,
                                        const float* __restrict__ weight,
                                        int n, int rows, float eps) {
-    __shared__ float partial[256];
+    __shared__ float partial[32];
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps = blockDim.x >> 5;
     const int row = blockIdx.x;
     if (row >= rows) {
         return;
@@ -207,14 +269,23 @@ extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
     for (int i = tid; i < n; i += blockDim.x) {
         sum += source[i] * source[i];
     }
-    partial[tid] = sum;
-    __syncthreads();
-    for (int width = blockDim.x / 2; width > 0; width >>= 1) {
-        if (tid < width) {
-            partial[tid] += partial[tid + width];
-        }
-        __syncthreads();
+    for (int step = 16; step > 0; step >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, step);
     }
+    if (lane == 0) {
+        partial[warp] = sum;
+    }
+    __syncthreads();
+    float total = (tid < warps) ? partial[tid] : 0.0f;
+    if (warp == 0) {
+        for (int step = 16; step > 0; step >>= 1) {
+            total += __shfl_down_sync(0xffffffffu, total, step);
+        }
+        if (lane == 0) {
+            partial[0] = total;
+        }
+    }
+    __syncthreads();
     const float scale = rsqrtf(partial[0] / (float)n + eps);
     float* target = dst + (size_t)row * n;
     for (int i = tid; i < n; i += blockDim.x) {
@@ -648,14 +719,29 @@ __device__ __forceinline__ void load_a_fragment(int* fragment, const signed char
 //     two-word-per-lane layout — and the per-block scales collapse into one fma
 //     per accumulator element: sum += C * dA * dB.
 // Eight warps of sixteen rows, so registers stay inside the file without spilling.
-extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(const __half* __restrict__ weight_scales,
-                                        const signed char* __restrict__ weight_quants,
+// Up to four weight matrices that read the same activations travel in one launch.
+// Their row spaces are concatenated, so the tiles of q, k and v fill a wave
+// together instead of one matrix's tiles filling a wave each: at 128 tokens a
+// projection with sixteen tiles leaves four SMs idle, and three of those in a row
+// is a fifth of the layer.
+extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
+                                        const __half* __restrict__ scales0,
+                                        const signed char* __restrict__ quants0,
+                                        const __half* __restrict__ scales1,
+                                        const signed char* __restrict__ quants1,
+                                        const __half* __restrict__ scales2,
+                                        const signed char* __restrict__ quants2,
+                                        const __half* __restrict__ scales3,
+                                        const signed char* __restrict__ quants3,
+                                        float* __restrict__ y0,
+                                        float* __restrict__ y1,
+                                        float* __restrict__ y2,
+                                        float* __restrict__ y3,
+                                        int out0, int out1, int out2, int out3, int count,
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
-                                        float* __restrict__ y,
-                                        const float* bias,
-                                        int use_bias,
-                                        int k, int out, int n) {
+                                        int k, int n,
+                                        int token_tiles, int full_blocks, int tail_slices) {
     // ldmatrix needs sixteen-byte-aligned shared addresses, and a plain char array
     // is only guaranteed one-byte alignment.
     // One dynamic allocation instead of four static arrays: a 256-element k chunk
@@ -672,18 +758,67 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
     const int threads = blockDim.x * blockDim.y;
     const int tid = warp * blockDim.x + lane;
     const int k_blocks = k >> 5;
-    // Token tiles vary fastest so the blocks running together share one weight
-    // tile: it stays in L2 while every token tile of those rows is computed.
-    const int row_base = blockIdx.y * MMA_BLOCK_ROWS;
-    const int token_base = blockIdx.x * MMA_BLOCK_TOKENS;
-    const int tile_tokens = min(MMA_BLOCK_TOKENS, n - token_base);
+    // One flat grid of (row tile, token tile) pairs, token tiles varying fastest
+    // so the blocks running together share one weight tile: it stays in L2 while
+    // every token tile of those rows is computed.
+    //
+    // A launch that does not fill a whole wave would leave the last wave nearly
+    // empty, and its cost is a whole tile per block however few blocks there are.
+    // The first `full_blocks` blocks take one tile each; the remaining `tail`
+    // tiles are cut along the token axis into `tail_slices` shorter blocks, so
+    // the last wave is filled with work instead of idling. The slices write
+    // disjoint columns, so no partial sums have to be combined afterwards.
+    int tile = blockIdx.x;
+    int slice = 0;
+    if (blockIdx.x >= (unsigned int)full_blocks) {
+        const int index = blockIdx.x - full_blocks;
+        tile = full_blocks + index / tail_slices;
+        slice = index % tail_slices;
+    }
+    const int tile_row = tile / token_tiles;
+    const int token_tile = tile % token_tiles;
+    // Which matrix of the group this row tile belongs to, and where in it.
+    const int outs[MMA_GROUP_MAX] = {out0, out1, out2, out3};
+    int matrix = 0;
+    int row_base = 0;
+    for (int candidate = 0, first = 0; candidate < count; ++candidate) {
+        const int tiles = (outs[candidate] + MMA_BLOCK_ROWS - 1) / MMA_BLOCK_ROWS;
+        if (tile_row < first + tiles) {
+            matrix = candidate;
+            row_base = (tile_row - first) * MMA_BLOCK_ROWS;
+            break;
+        }
+        first += tiles;
+    }
+    const int out = outs[matrix];
+    const __half* weight_scales = scales0;
+    const signed char* weight_quants = quants0;
+    float* y = y0;
+    if (matrix == 1) {
+        weight_scales = scales1;
+        weight_quants = quants1;
+        y = y1;
+    } else if (matrix == 2) {
+        weight_scales = scales2;
+        weight_quants = quants2;
+        y = y2;
+    } else if (matrix == 3) {
+        weight_scales = scales3;
+        weight_quants = quants3;
+        y = y3;
+    }
+    const int slice_tokens = MMA_BLOCK_TOKENS / tail_slices;
+    const int token_offset = slice * slice_tokens;
+    const int token_base = token_tile * MMA_BLOCK_TOKENS + token_offset;
+    const int tile_tokens = min(slice_tokens, n - token_base);
+    const int first_group = token_offset / MMA_TOKENS_PER_GROUP;
+    const int last_group = first_group + slice_tokens / MMA_TOKENS_PER_GROUP;
     const int group = lane >> 2;
     const int lane4 = lane & 3;
 
     // Every warp owns sixteen rows outright and walks all sixteen token groups, so
     // one weight tile staged in shared serves a hundred and twenty-eight tokens.
     const int row_group = warp * MMA_ROWS_PER_WARP;
-    const int token_offset = 0;
 
     float sums[MMA_TOKEN_GROUPS][MMA_MINI_TILES][4];
     #pragma unroll
@@ -716,7 +851,7 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
             int4* destination = reinterpret_cast<int4*>(b_tile + token * ROW_STRIDE + element);
-            if (position + 16 <= k && token < tile_tokens) {
+            if (position + 16 <= k && token < slice_tokens && token < tile_tokens) {
                 *destination = *reinterpret_cast<const int4*>(
                     act_quants + (size_t)(token_base + token) * k + position);
             } else {
@@ -749,11 +884,25 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
             const int token = index / MMA_CHUNK_BLOCKS;
             const int block = index % MMA_CHUNK_BLOCKS;
             const int position = chunk + block * 32;
-            b_scales[token * MMA_CHUNK_BLOCKS + block] = (position < k && token < tile_tokens)
+            // Block-major: the two columns a lane multiplies sit next to each
+            // other, so the inner loop reads them with one 64-bit load.
+            b_scales[block * MMA_BLOCK_TOKENS + token] =
+                (position < k && token < slice_tokens && token < tile_tokens)
                 ? act_scales[(size_t)(token_base + token) * k_blocks + (position >> 5)]
                 : 0.0f;
         }
         __syncthreads();
+
+        // The rows this lane owns never change inside a chunk, so its weight
+        // scales are loaded once instead of once per token group.
+        float weight_low[MMA_CHUNK_BLOCKS];
+        float weight_high[MMA_CHUNK_BLOCKS];
+        #pragma unroll
+        for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
+            const int row = row_group + group;
+            weight_low[block] = a_scales[row * MMA_CHUNK_BLOCKS + block];
+            weight_high[block] = a_scales[(row + 8) * MMA_CHUNK_BLOCKS + block];
+        }
 
         int fragments[MMA_MINI_TILES][MMA_CHUNK_BLOCKS][4];
         #pragma unroll
@@ -768,7 +917,10 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
 
         #pragma unroll
         for (int j = 0; j < MMA_TOKEN_GROUPS; ++j) {
-            const int first_token = j * MMA_TOKENS_PER_GROUP + token_offset;
+            if (j < first_group || j >= last_group) {
+                continue;
+            }
+            const int first_token = j * MMA_TOKENS_PER_GROUP - token_offset;
             #pragma unroll
             for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
                 const int fragment_token = first_token + group;
@@ -777,22 +929,20 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
                 const int b0 = activations[0];
                 const int b1 = activations[4];
                 const int column = first_token + lane4 * 2;
-                const float act_low = b_scales[column * MMA_CHUNK_BLOCKS + block];
-                const float act_high = b_scales[(column + 1) * MMA_CHUNK_BLOCKS + block];
+                const float2 act = *reinterpret_cast<const float2*>(
+                    b_scales + block * MMA_BLOCK_TOKENS + column);
+                const float act_low = act.x;
+                const float act_high = act.y;
 
                 #pragma unroll
                 for (int t = 0; t < MMA_MINI_TILES; ++t) {
                     int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                     mma_s8(d0, d1, d2, d3, fragments[t][block][0], fragments[t][block][1],
                            fragments[t][block][2], fragments[t][block][3], b0, b1);
-                    const int row = row_group + t * MMA_ROWS;
-                    const float weight_low = a_scales[(row + group) * MMA_CHUNK_BLOCKS + block];
-                    const float weight_high =
-                        a_scales[(row + group + 8) * MMA_CHUNK_BLOCKS + block];
-                    sums[j][t][0] += (float)d0 * (weight_low * act_low);
-                    sums[j][t][1] += (float)d1 * (weight_low * act_high);
-                    sums[j][t][2] += (float)d2 * (weight_high * act_low);
-                    sums[j][t][3] += (float)d3 * (weight_high * act_high);
+                    sums[j][t][0] += (float)d0 * (weight_low[block] * act_low);
+                    sums[j][t][1] += (float)d1 * (weight_low[block] * act_high);
+                    sums[j][t][2] += (float)d2 * (weight_high[block] * act_low);
+                    sums[j][t][3] += (float)d3 * (weight_high[block] * act_high);
                 }
             }
         }
@@ -801,7 +951,10 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
 
     #pragma unroll
     for (int j = 0; j < MMA_TOKEN_GROUPS; ++j) {
-        const int first_token = j * MMA_TOKENS_PER_GROUP + token_offset;
+        if (j < first_group || j >= last_group) {
+            continue;
+        }
+        const int first_token = j * MMA_TOKENS_PER_GROUP - token_offset;
         const int column_low = first_token + lane4 * 2;
         const int column_high = column_low + 1;
         #pragma unroll
@@ -809,19 +962,19 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
             const int row = row_base + row_group + t * MMA_ROWS + group;
             if (column_low < tile_tokens && row < out) {
                 const size_t index = (size_t)(token_base + column_low) * out + row;
-                y[index] = sums[j][t][0] + (use_bias ? bias[index] : 0.0f);
+                y[index] = sums[j][t][0];
             }
             if (column_high < tile_tokens && row < out) {
                 const size_t index = (size_t)(token_base + column_high) * out + row;
-                y[index] = sums[j][t][1] + (use_bias ? bias[index] : 0.0f);
+                y[index] = sums[j][t][1];
             }
             if (column_low < tile_tokens && row + 8 < out) {
                 const size_t index = (size_t)(token_base + column_low) * out + row + 8;
-                y[index] = sums[j][t][2] + (use_bias ? bias[index] : 0.0f);
+                y[index] = sums[j][t][2];
             }
             if (column_high < tile_tokens && row + 8 < out) {
                 const size_t index = (size_t)(token_base + column_high) * out + row + 8;
-                y[index] = sums[j][t][3] + (use_bias ? bias[index] : 0.0f);
+                y[index] = sums[j][t][3];
             }
         }
     }
@@ -860,7 +1013,11 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
     float* v_tile = k_tile + FA_KEY_TILE * FA_KEY_STRIDE;
 
     const int group = blockIdx.x;
-    const int tile = blockIdx.y;
+    // Causal masking makes the last query tile the most expensive one, by the
+    // whole visible length. Blocks are scheduled in index order, so handing out
+    // the heavy tiles first is what keeps the tail from deciding the makespan.
+    const int tiles = (tokens + FA_QUERY_TILE - 1) / FA_QUERY_TILE;
+    const int tile = tiles - 1 - blockIdx.y;
     const int heads_per_kv = n_head / n_head_kv;
     const int kv_head = (group * FA_HEADS) / heads_per_kv;
     const int kv_dim = n_head_kv * head_dim;
@@ -1066,7 +1223,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void attention_prefill_mma(
     __half* v_tile = k_tile + FA8_HEAD_DIM * FA8_KEY_TILE;
 
     const int group = blockIdx.x;
-    const int tile = blockIdx.y;
+    // Causal masking makes the last query tile the most expensive one, by the
+    // whole visible length. Blocks are scheduled in index order, so handing out
+    // the heavy tiles first is what keeps the tail from deciding the makespan.
+    const int tiles = (tokens + FA8_QUERY_TILE - 1) / FA8_QUERY_TILE;
+    const int tile = tiles - 1 - blockIdx.y;
     const int heads_per_kv = n_head / n_head_kv;
     const int kv_head = (group * FA8_HEADS) / heads_per_kv;
     const int kv_dim = n_head_kv * head_dim;
