@@ -286,10 +286,10 @@ sama diulang lima kali):
 
 | Prompt | Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
 |---|---|---:|---:|---:|---:|
-| 215 token | Prompt | 824 tok/s | 3.743–4.263 tok/s | 31,0 tok/s | 78,3 tok/s |
-| 215 token | Generation | 62,2 tok/s | 69,0 tok/s | 16,4 tok/s | 22,7 tok/s |
-| 1071 token | Prompt | 664 tok/s | 5.346–5.401 tok/s | 24,8 tok/s | 74,5 tok/s |
-| 1071 token | Generation | 59,3 tok/s | 67,9 tok/s | 6,4 tok/s | 20,4 tok/s |
+| 215 token | Prompt | 1.569 tok/s | 3.577–3.795 tok/s | 31,0 tok/s | 78,3 tok/s |
+| 215 token | Generation | 62,1 tok/s | 68,6–68,7 tok/s | 16,4 tok/s | 22,7 tok/s |
+| 1071 token | Prompt | 1.038 tok/s | 5.221–5.272 tok/s | 24,8 tok/s | 74,5 tok/s |
+| 1071 token | Generation | 59,0 tok/s | 67,2–67,4 tok/s | 6,4 tok/s | 20,4 tok/s |
 
 Bacaan jujurnya:
 
