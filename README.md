@@ -505,12 +505,17 @@ generation. llama.cpp b11429 di-build dari source dengan CUDA
 (`-DGGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=89`), model sama, mesin sama, tidak
 ada proses lain yang memakai GPU.
 
+Kedua angka di bawah diukur dengan **clock SM dikunci 1800 MHz**
+(`nvidia-smi -lgc 1800,1800`). Tanpa kunci, boost 4050 laptop bergeser 20–25%
+antar proses dan perbandingan kehilangan artinya: pengukuran yang sama bisa
+memberi 4.000 atau 5.200 tok/s hanya karena suhu awal kartu.
+
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.843 ± 27 tok/s | 4.546 ± 482 tok/s | 85% |
-| pp512 | 4.856 ± 5 tok/s | 5.890 ± 161 tok/s | 82% |
-| pp1024 | 5.202 ± 7 tok/s | 5.796 ± 187 tok/s | 90% |
-| tg128 | **67,1 ± 0,1 tok/s** | 71,2 ± 0,03 tok/s | 94% |
+| pp128 | 3.360 ± 35 tok/s | 3.779 ± 228 tok/s | 89% |
+| pp512 | **5.235 ± 1 tok/s** | 4.711 ± 97 tok/s | **111%** |
+| pp1024 | 4.468 ± 1 tok/s | 4.642 ± 118 tok/s | 96% |
+| tg128 | 66,8 ± 0,02 tok/s | 69,4 ± 0,05 tok/s | 96% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
@@ -520,15 +525,41 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 | VRAM (ctx 4096) | 2,9 GiB | 2,49 GiB |
 | Load + 1 token (wall) | 0,9 s | 1,32 s |
 
+### Apa yang menutup jarak prefill
+
+Tiga perubahan, semuanya di bentuk grid dan bukan di aritmetika:
+
+- **Tile sisa mengisi gelombang terakhir.** Satu tile adalah satu unit kerja:
+  128 baris × 128 token. Kalau jumlah tile bukan kelipatan blok yang berjalan
+  serentak, gelombang terakhir hampir kosong tetapi tetap dibayar satu tile
+  penuh — pada 512 token itu 20% dari matmul. Tile sisa sekarang dipotong di
+  sumbu token (`wave_plan` + `tail_slices` di kernel), dan potongannya menulis
+  kolom yang berbeda-beda, jadi tidak ada penjumlahan parsial yang harus
+  digabung. Bukti bahwa gelombang memang penentu: pp640 (80 tile = 4 gelombang
+  penuh) dulu 5.353 tok/s sementara pp512 (64 tile = 3,2 gelombang) 4.972.
+- **Matmul yang berbagi aktivasi berangkat dalam satu launch** (`MMA_GROUP_MAX`).
+  q, k dan v membaca baris ternormalisasi yang sama; sebagai tiga launch masing-
+  masing hanya mengisi 4 + 1 + 1 gelombang dari 34 gelombang per layer, dan
+  ruang barisnya digabung jadi 4 gelombang. gate|up juga, tetapi hanya sampai 512
+  token: pada 1.024 token gabungan itu terukur 2,40 ms melawan 2 × 0,70 ms untuk
+  terpisah (`GROUP_FFN_MAX_TOKENS`).
+- **Attention prefill: tile terberat dulu.** Masker kausal membuat tile query
+  terakhir melihat seluruh konteks, jadi beban antar blok naik linear. Blok
+  dijadwalkan menurut indeks, jadi urutan tile dibalik (`tiles - 1 - blockIdx.y`)
+  dan yang berat jalan lebih dulu: 10,5 → 8,4 ms pada pp512.
+
+Untuk decode, q|k|v dan gate|up juga satu launch: 295 → 169 peluncuran per token,
+dan proyeksi 256 baris tidak lagi mengisi 8 blok dari 20 SM.
+
 Bacaan jujurnya:
 
-- **Decode nyaris sepadan**: 94%, dan kurvanya rata terhadap konteks — sisanya
-  ongkos repack (1,125 vs 1,0625 byte per parameter) plus attention decode yang
-  masih fp32.
-- **Prefill 10–18% tertinggal**, dan selisihnya sekarang menyusut seiring konteks
-  bertambah. Dua sisa yang terukur: matmul masih membayar kuantisasi gelombang
-  pada proyeksi 2048 baris (80% efisien), dan attention prefill masih bisa
-  memakai query tile yang lebih besar.
+- **Prefill sudah menyusul di 512 token** (111%) dan tinggal 4% di 1.024. Sisa
+  terbesar ada di 128 token (89%), di mana satu tile token berarti bobot dibaca
+  ulang untuk setiap tile baris: di situ yang dibutuhkan pemecahan sumbu k, bukan
+  pemotongan token, karena potongan token tetap membayar salinan bobot penuh.
+- **Decode 96%.** Lantai DRAM-nya 2,39 GB per token dibagi 187,8 GB/s = 12,7 ms,
+  dan matmul-nya sudah 13,4 ms (178 GB/s). Sisanya 0,9 ms kernel kecil (attention
+  decode, rmsnorm, rope) plus ±0,3 ms celah antar peluncuran.
 - **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks
   (jalur CPU belum memakai tiling attention).
 
