@@ -157,6 +157,33 @@ lantai itu. Dua hal yang memangkas sisa jarak:
   jadi 14,5 / 14,8 / 15,0 / 15,7 / 16,5 / 18,5 ms pada konteks
   0 / 128 / 512 / 1024 / 2048 / 4090.
 
+### Dibanding llama.cpp, dan berapa VRAM-nya
+
+`llm-cli bench` mencetak jejak VRAM-nya sendiri di baris terakhir tabel. Angka di
+bawah diambil pada clock SM yang dikunci 1800 MHz untuk kedua engine, model yang
+sama, `-r 5`, llama.cpp `8ab29fa` dengan `-ngl 99`:
+
+| | llm-cli | llama.cpp | rasio |
+|---|---:|---:|---:|
+| pp128 | 3.585 | 4.180 | 85,8% |
+| pp512 | 4.659 | 5.316 | 87,7% |
+| pp1024 | 4.489 | 5.246 | 85,6% |
+| tg128 | 68,9 | 69,7 | 98,8% |
+
+Konteks 4096, prefill 1024 token:
+
+| | bobot | KV | scratch | total di device |
+|---|---:|---:|---:|---:|
+| llm-cli | 2,50 GiB | 0,16 GiB | 0,12 GiB | **2,78 GiB** |
+| llama.cpp | 2,23 GiB | 0,16 GiB | 0,055 GiB | 2,45 GiB |
+
+KV cache sama persis — 41 KiB per token, f16, geometri yang sama. Sisa selisih
+0,33 GiB punya dua sebab, dan keduanya pilihan llama.cpp: 271 MiB bobotnya tetap
+di berkas yang di-mmap dan dibaca dari host, dan seluruh operasinya berbagi satu
+compute buffer 56 MiB, sedangkan engine ini menyimpan sembilan buffer scratch
+terpisah. Persentase di tabel sebelumnya diukur tanpa mengunci clock dan dengan
+build llama.cpp lain, jadi kedua tabel tidak sebanding.
+
 Prefill dulu ±670 GFLOPS (5–10% dari puncak fp32); sekarang matmul-nya sendiri
 berjalan 12,5 TMAC/s lewat tensor core int8 dan attention lewat tensor core f16
 (lihat bagian-bagian berikut).
