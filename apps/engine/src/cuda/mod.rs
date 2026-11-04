@@ -19,7 +19,7 @@ use sys::{
     Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet,
     cuDeviceGetAttribute, cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy,
     cuEventElapsedTime, cuEventRecord,
-    cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
+    cuCtxSynchronize, cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
     cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
     error_message,
 };
@@ -279,6 +279,15 @@ impl Gpu {
 
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    /// Waits for every launch queued on the default stream.
+    pub fn synchronize(&self) {
+        // SAFETY: the context is current on this thread, set by each entry point.
+        unsafe {
+            cuCtxSetCurrent(self.context);
+            cuCtxSynchronize();
+        }
     }
 
     /// Blocks that run concurrently: one wave.
@@ -932,7 +941,7 @@ impl Gpu {
         self.launch(
             self.kernels.matmul_decode,
             ((rows / DECODE_ROWS_PER_BLOCK) as u32, 1, 1),
-            (4 * LANES, 1, 1),
+            ((DECODE_ROWS_PER_BLOCK as u32) * LANES, 1, 1),
             0,
             &mut args,
         )

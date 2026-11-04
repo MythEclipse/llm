@@ -54,6 +54,8 @@ unsafe extern "C" {
     pub fn cuMemFree_v2(pointer: DevicePtr) -> i32;
     pub fn cuMemcpyHtoD_v2(destination: DevicePtr, source: *const c_void, bytes: usize) -> i32;
     pub fn cuMemcpyDtoH_v2(destination: *mut c_void, source: DevicePtr, bytes: usize) -> i32;
+    /// Waits for every queued launch on the current context's default stream.
+    pub fn cuCtxSynchronize() -> i32;
     pub fn cuModuleLoadData(module: *mut Module, image: *const c_void) -> i32;
     pub fn cuModuleGetFunction(function: *mut Function, module: Module, name: *const c_char)
     -> i32;

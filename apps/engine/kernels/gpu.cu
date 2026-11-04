@@ -412,8 +412,9 @@ extern "C" __global__ void rope(float* __restrict__ x,
         const int position = start + token;
         // Same frequency as the CPU table: base^(-2 * pair / n_rot).
         const float angle = (float)position * powf(base, -2.0f * (float)pair / (float)n_rot);
-        const float cosine = cosf(angle);
-        const float sine = sinf(angle);
+        float sine;
+        float cosine;
+        sincosf(angle, &sine, &cosine);
         float* base = x + ((size_t)token * heads + head) * head_dim + 2 * pair;
         const float a = *base;
         const float b = *(base + 1);

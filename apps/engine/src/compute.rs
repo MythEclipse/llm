@@ -142,6 +142,19 @@ impl Compute {
         self.gpu.as_ref().map(Gpu::name)
     }
 
+    /// Whether the live backend is the device, so a host timer around a launch
+    /// measures GPU work instead of the queueing of it.
+    pub fn is_device(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Blocks until every launch already queued has finished.
+    pub fn synchronize(&self) {
+        if let Some(gpu) = &self.gpu {
+            gpu.synchronize();
+        }
+    }
+
     pub fn device_bytes(&self) -> Option<usize> {
         self.gpu.as_ref().map(Gpu::total_bytes)
     }

@@ -107,12 +107,21 @@ pub fn matmul(weight: &Weight<'_>, x: &[f32], n: usize, y: &mut [f32]) {
     let blocks = weight.k / Q8_0_BLOCK_ELEMS;
     let mut quants = vec![0i8; n * weight.k];
     let mut scales = vec![0.0f32; n * blocks];
-    for t in 0..n {
-        quantize_q8_0(
-            &x[t * weight.k..(t + 1) * weight.k],
-            &mut quants[t * weight.k..(t + 1) * weight.k],
-            &mut scales[t * blocks..(t + 1) * blocks],
-        );
+    if n >= 8 {
+        x.par_chunks(weight.k)
+            .zip(quants.par_chunks_mut(weight.k))
+            .zip(scales.par_chunks_mut(blocks))
+            .for_each(|((values, token_quants), token_scales)| {
+                quantize_q8_0(values, token_quants, token_scales);
+            });
+    } else {
+        for t in 0..n {
+            quantize_q8_0(
+                &x[t * weight.k..(t + 1) * weight.k],
+                &mut quants[t * weight.k..(t + 1) * weight.k],
+                &mut scales[t * blocks..(t + 1) * blocks],
+            );
+        }
     }
 
     // Transposed scratch so the parallel loop can own one output row at a time.
@@ -130,11 +139,13 @@ pub fn matmul(weight: &Weight<'_>, x: &[f32], n: usize, y: &mut [f32]) {
             }
         });
 
-    for o in 0..weight.out {
-        for t in 0..n {
-            y[t * weight.out + o] = scratch[o * n + t];
-        }
-    }
+    y.par_chunks_mut(weight.out)
+        .enumerate()
+        .for_each(|(t, row_out)| {
+            for (o, slot) in row_out.iter_mut().enumerate() {
+                *slot = scratch[o * n + t];
+            }
+        });
 }
 
 fn dot_f32(weights: &[f32], x: &[f32]) -> f32 {
