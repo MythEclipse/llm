@@ -123,25 +123,42 @@ CPU saat load, bukan gagal di tengah jawaban.
 ### Kinerja terukur
 
 RTX 4050 Laptop 6 GB (sm_89, driver 615.78.08), model 2,68 GB, konteks 4096,
-median 9 langkah decode per titik, gateway dimatikan:
+VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
-| 0 token | **36,2 tok/s** (27,6 ms) | 21,7 tok/s (46,0 ms) | 29 ms | 50 ms |
-| 128 token | **34,6 tok/s** (28,9 ms) | 19,5 tok/s (51,4 ms) | 100 tok/s (1,27 s) | 30 tok/s (4,26 s) |
-| 512 token | **30,4 tok/s** (32,9 ms) | 15,6 tok/s (64,1 ms) | 99 tok/s (5,18 s) | 27 tok/s (18,8 s) |
-| 1024 token | **26,1 tok/s** (38,3 ms) | 11,1 tok/s (90,3 ms) | 97 tok/s (10,6 s) | 23 tok/s (44,6 s) |
+| 0 token | **64,8 tok/s** (15,4 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
+| 128 token | **59,8 tok/s** (16,7 ms) | 19,5 tok/s (51,4 ms) | 278 tok/s (0,46 s) | 30 tok/s (4,26 s) |
+| 512 token | **48,3 tok/s** (20,7 ms) | 15,6 tok/s (64,1 ms) | 259 tok/s (1,98 s) | 27 tok/s (18,8 s) |
+| 1024 token | **38,4 tok/s** (26,0 ms) | 11,1 tok/s (90,3 ms) | 242 tok/s (4,22 s) | 23 tok/s (44,6 s) |
 
-Decode 1,7–2,4× lebih cepat, prefill 3,3–4,2× lebih cepat. Angka CPU di tabel
-ini lebih baik dari tabel lama di bawah karena `attend` sekarang membaca
-key/value sekali per grup GQA.
+Decode 3,0–3,5× lebih cepat, prefill 9,3–10,6× lebih cepat. Satu generasi 120
+token di CLI: 60,6 tok/s, TTFT 175 ms.
 
-Batas atas decode di 4050 (≈192 GB/s) adalah 2,68 GB bobot / 192 GB/s ≈ 14 ms
-per token ≈ 71 tok/s; yang terukur 27,6 ms berarti ≈ 97 GB/s efektif. Sisanya
-ada di kernel matmul: setiap lane membaca 1 byte kuantisasi per elemen, bukan
-load vektor 16 byte, sehingga satu instruksi hanya memindahkan 32 byte per warp.
-Repack baris Q8_0 ke `scales[] + quants[]` yang sejajar 32 byte adalah langkah
-berikutnya untuk mendekati 71 tok/s itu.
+Lantai decode di 4050 (≈192 GB/s) adalah 2,68 GB bobot / 192 GB/s ≈ 14 ms per
+token; yang terukur 15,4 ms, jadi decode sudah 91% dari lantai itu. Tidak ada
+ruang berarti lagi di jalur decode tanpa mengubah presisi bobot.
+
+Prefill masih di ±670 GFLOPS (5–10% dari puncak fp32 kartu ini). Jalur prompt
+memakai 4 baris bobot × 8 token per blok dengan k dipecah 1024 elemen, jadi satu
+baca shared menghasilkan 32 MAC; menaikkan lagi berarti tile 8×8 (64 akumulator
+per lane, register tidak cukup) atau tensor core lewat bobot f16/bf16 — yang
+mengubah numerik dan karenanya belum dilakukan.
+
+### Kenapa decode butuh repack bobot
+
+Format GGUF menyimpan Q8_0 sebagai blok 34 byte (`f16 skala` + 32 `i8`). Selama
+baris dibaca apa adanya, satu lane hanya bisa memuat 1 byte per instruksi dan
+satu warp memindahkan 32 byte — seperempat dari satu cache line. Itu yang
+membuat decode berhenti di 27,6 ms/token (≈97 GB/s efektif).
+
+Saat diunggah, tiap tensor Q8_0 dipecah jadi dua bidang: `scales` (k/32 `f32`
+per baris) dan `quants` (k `i8` per baris), keduanya sejajar 32 byte. Dengan
+begitu satu lane memuat 8 kuantisasi sekaligus lewat satu load 64-bit dan dua
+load `float4` untuk aktivasi. Hasilnya 15,4 ms/token (≈174 GB/s efektif).
+
+Harganya: 1,125 byte per parameter, bukan 1,0625 — VRAM bobot naik dari 2,68 GB
+ke ±2,83 GB, dan repack menambah ±0,4 s saat load.
 
 ### Kenapa CPU masih dipakai sebagai pembanding
 

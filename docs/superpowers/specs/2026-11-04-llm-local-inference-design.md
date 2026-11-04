@@ -159,6 +159,15 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | seluruh forward pass di device, kernel matmul lama | 65,4 ms/token | masih lambat: n=1 memakai 1 dari 8 warp, shared 24 KB membatasi occupancy |
 | + jalur n<8 tanpa shared, semua warp pada satu dot | 32,6 ms/token | occupancy dan util warp adalah masalahnya |
 | + attention 4 warp (posisi dipecah antar warp) | 27,6 ms/token | kurva decode rata: 27,6 → 38,3 ms dari ctx 0 ke 1024 |
+| + repack Q8_0 jadi `scales[] + quants[]` sejajar 32 byte | 15,4 ms/token | decode 91% dari lantai bandwidth (14 ms); 8 kuantisasi per load 64-bit |
+| + jalur prompt 4 baris × 8 token, k dipecah 1024 | prefill 278 tok/s | satu baca shared = 32 MAC; 242 tok/s pada ctx 1024 |
+
+Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
+warp menjalankan jumlah iterasi yang sama. Versi pertama memakai
+`for (group = warp*8; group < n; ...)`, jadi pada n < 64 sebagian warp tidak
+pernah masuk loop dan hasilnya sampah (max |Δ| 2,5e38). Perbaikannya: loop atas
+`base` yang seragam, `group = base + warp*8` di dalamnya, tulis hasilnya dijaga
+`group + slot < n`.
 
 Detail yang mudah salah:
 
