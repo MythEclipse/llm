@@ -128,9 +128,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,3 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 1.829 tok/s (0,07 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,6 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 1.437 tok/s (0,36 s) | 30 tok/s (16,7 s) |
-| 1024 token | **59,5 tok/s** (16,8 ms) | 11,1 tok/s (90,3 ms) | 1.071 tok/s (0,96 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 1.954 tok/s (0,07 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 1.600 tok/s (0,32 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 1.292 tok/s (0,79 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -225,6 +225,36 @@ pada ctx 1024 kira-kira 47% waktu prefill ada di attention, dan jalur prefill
 masih memakai kernel `attention` serial per head (yang dipecah antar blok baru
 jalur decode). Tiling attention untuk prefill adalah pekerjaan berikutnya.
 
+### Attention prefill: query di-tile, softmax online
+
+Kernel lama meluncurkan satu blok per (head, token) dan menulis setiap baris skor
+lewat global memory, jadi makin panjang konteks makin mahal. Yang menggantikannya
+mengikuti bentuk `fattn-tile.cuh`: satu blok per head dan 16 posisi query, K/V
+di-stage ke shared memory 32 posisi sekaligus, dan softmax dijaga online
+(`running_max`/`running_sum` plus koreksi `exp(m_lama - m_baru)` pada akumulator)
+sehingga tidak ada buffer seukuran `visible` yang pernah dibentuk.
+
+Dua hal yang menentukan bentuknya:
+
+- **K di-stage transpose** (`k_tile[dim][key]`). Dengan layout baris-major, satu
+  lane membaca `k_tile[key][dim]` untuk key-nya sendiri dan seluruh warp jatuh ke
+  bank yang sama; ditranspose, tiap lane menyentuh bank berbeda dan tidak ada
+  konflik. Efek sampingnya: tiap lane menyelesaikan satu skor penuh, jadi tidak
+  ada `warp_sum` di loop dalam.
+- **Satu lane satu kunci**. Versi pertama saya mencampur dua skema — lane
+  menghitung dot untuk kunci berbeda lalu `warp_sum` menjumlahkannya, yang
+  artinya menjumlahkan skor dari kunci yang tidak berhubungan. Hasilnya sampah
+  yang hanya terlihat pada prompt panjang.
+
+Hasilnya prefill 1.829 → 1.954 tok/s (ctx 128), 1.437 → 1.600 (512), 1.071 →
+1.292 (1024). Decode tidak berubah.
+
+Sisa biaya attention sekarang berasal dari pembacaan K/V berulang: satu head punya
+empat blok query, jadi setiap baris K/V dibaca empat kali per chunk per head. Pada
+ctx 1024 itu sekitar 2,7 GB per chunk untuk 42 layer. Menaikkan tile query dari 16
+ke 32 memangkasnya setengah, tetapi shared memory-nya menjadi 52 KB dan butuh
+dynamic shared memory (`cuFuncSetAttribute`) karena batas statis 48 KB.
+
 ### Attention decode: posisi dipecah antar blok
 
 Model ini punya 16 head, jadi satu blok per head hanya memberi 16 blok — di kartu
@@ -286,10 +316,10 @@ sama diulang lima kali):
 
 | Prompt | Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
 |---|---|---:|---:|---:|---:|
-| 215 token | Prompt | 1.569 tok/s | 3.577–3.795 tok/s | 31,0 tok/s | 78,3 tok/s |
-| 215 token | Generation | 62,1 tok/s | 68,6–68,7 tok/s | 16,4 tok/s | 22,7 tok/s |
-| 1071 token | Prompt | 1.038 tok/s | 5.221–5.272 tok/s | 24,8 tok/s | 74,5 tok/s |
-| 1071 token | Generation | 59,0 tok/s | 67,2–67,4 tok/s | 6,4 tok/s | 20,4 tok/s |
+| 215 token | Prompt | 1.629 tok/s | 3.420–3.731 tok/s | 31,0 tok/s | 78,3 tok/s |
+| 215 token | Generation | 62,1 tok/s | 68,7–68,8 tok/s | 16,4 tok/s | 22,7 tok/s |
+| 1071 token | Prompt | 1.244 tok/s | 5.039–5.306 tok/s | 24,8 tok/s | 74,5 tok/s |
+| 1071 token | Generation | 59,2 tok/s | 67,3 tok/s | 6,4 tok/s | 20,4 tok/s |
 
 Bacaan jujurnya:
 

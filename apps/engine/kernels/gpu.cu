@@ -612,6 +612,149 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
     }
 }
 
+// Prefill attention, tiled the way ggml's fattn-tile does it: one block per head
+// and per sixteen query positions, keys and values staged in shared memory
+// thirty-two positions at a time, and the softmax kept online so nothing of size
+// `visible` is ever materialised. The serial kernel it replaces launched one block
+// per (head, token) and wrote every score row through global memory, which made a
+// 64-token prompt at context 1024 spend about half its prefill time there.
+//
+// Keys are staged transposed, dim-major, so a lane reads k_tile[dim][lane] and the
+// whole warp touches thirty-two different banks; keeping them row-major instead
+// gives every lane the same bank and serialises the read.
+#define FA_QUERY_TILE 16
+#define FA_KEY_TILE 32
+#define FA_WARPS 4
+#define FA_QUERIES_PER_WARP (FA_QUERY_TILE / FA_WARPS)
+#define FA_MAX_HEAD_DIM 128
+#define FA_DIMS_PER_LANE 4
+
+extern "C" __global__ void attention_prefill(const float* __restrict__ query,
+                                            const float* __restrict__ keys,
+                                            const float* __restrict__ values,
+                                            float* __restrict__ out,
+                                            int n_head, int n_head_kv, int head_dim,
+                                            int start, int tokens, float scale) {
+    __shared__ float q_tile[FA_QUERY_TILE][FA_MAX_HEAD_DIM];
+    __shared__ float k_tile[FA_MAX_HEAD_DIM][FA_KEY_TILE];
+    __shared__ float v_tile[FA_KEY_TILE][FA_MAX_HEAD_DIM];
+    __shared__ float weight[FA_QUERY_TILE][FA_KEY_TILE];
+
+    const int head = blockIdx.x;
+    const int tile = blockIdx.y;
+    const int kv_head = head / (n_head / n_head_kv);
+    const int kv_dim = n_head_kv * head_dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int threads = blockDim.x;
+    const int first_query = tile * FA_QUERY_TILE;
+    const int queries = min(FA_QUERY_TILE, tokens - first_query);
+    if (queries <= 0) {
+        return;
+    }
+
+    for (int index = threadIdx.x; index < queries * head_dim; index += threads) {
+        const int row = index / head_dim;
+        const int dim = index % head_dim;
+        q_tile[row][dim] = query[((size_t)(first_query + row) * n_head + head) * head_dim + dim];
+    }
+
+    float acc[FA_QUERIES_PER_WARP][FA_DIMS_PER_LANE];
+    float running_max[FA_QUERIES_PER_WARP];
+    float running_sum[FA_QUERIES_PER_WARP];
+    #pragma unroll
+    for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
+        running_max[i] = -INFINITY;
+        running_sum[i] = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < FA_DIMS_PER_LANE; ++d) {
+            acc[i][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int max_visible = start + min(first_query + queries, tokens);
+    for (int base = 0; base < max_visible; base += FA_KEY_TILE) {
+        const int keys_here = min(FA_KEY_TILE, max_visible - base);
+        for (int index = threadIdx.x; index < keys_here * head_dim; index += threads) {
+            const int row = index / head_dim;
+            const int dim = index % head_dim;
+            const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
+            k_tile[dim][row] = keys[source];
+            v_tile[row][dim] = values[source];
+        }
+        __syncthreads();
+
+        // One lane per key: the lane walks the whole head dimension, so no warp
+        // reduction is needed to finish a score.
+        #pragma unroll
+        for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
+            const int query_index = warp * FA_QUERIES_PER_WARP + i;
+            if (query_index >= queries) {
+                continue;
+            }
+            const int visible = start + first_query + query_index + 1;
+            float score = -INFINITY;
+            if (base + lane < visible) {
+                float dot = 0.0f;
+                for (int dim = 0; dim < head_dim; ++dim) {
+                    dot += q_tile[query_index][dim] * k_tile[dim][lane];
+                }
+                score = dot * scale;
+            }
+            const float tile_max = warp_max(score);
+            const float new_max = fmaxf(running_max[i], tile_max);
+            const float probability = score == -INFINITY ? 0.0f : expf(score - new_max);
+            const float tile_sum = warp_sum(probability);
+            const float correction = running_max[i] == -INFINITY
+                ? 0.0f
+                : expf(running_max[i] - new_max);
+            running_sum[i] = running_sum[i] * correction + tile_sum;
+            running_max[i] = new_max;
+            #pragma unroll
+            for (int d = 0; d < FA_DIMS_PER_LANE; ++d) {
+                acc[i][d] *= correction;
+            }
+            weight[query_index][lane] = probability;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
+            const int query_index = warp * FA_QUERIES_PER_WARP + i;
+            if (query_index >= queries) {
+                continue;
+            }
+            for (int row = 0; row < keys_here; ++row) {
+                const float probability = weight[query_index][row];
+                const float4 value =
+                    *reinterpret_cast<const float4*>(&v_tile[row][lane * FA_DIMS_PER_LANE]);
+                acc[i][0] += probability * value.x;
+                acc[i][1] += probability * value.y;
+                acc[i][2] += probability * value.z;
+                acc[i][3] += probability * value.w;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
+        const int query_index = warp * FA_QUERIES_PER_WARP + i;
+        if (query_index >= queries) {
+            continue;
+        }
+        const float inverse = running_sum[i] > 0.0f ? 1.0f / running_sum[i] : 0.0f;
+        float* destination =
+            out + ((size_t)(first_query + query_index) * n_head + head) * head_dim;
+        const int dim = lane * FA_DIMS_PER_LANE;
+        destination[dim] = acc[i][0] * inverse;
+        destination[dim + 1] = acc[i][1] * inverse;
+        destination[dim + 2] = acc[i][2] * inverse;
+        destination[dim + 3] = acc[i][3] * inverse;
+    }
+}
+
 extern "C" __global__ void attention(const float* __restrict__ query,
                                      const float* __restrict__ keys,
                                      const float* __restrict__ values,

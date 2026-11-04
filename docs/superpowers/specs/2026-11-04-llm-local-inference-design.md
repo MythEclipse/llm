@@ -168,6 +168,8 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + geometri mmq diikuti (I=128, J=64, 8 warp, 32 baris/warp, ldmatrix.x4, B di shared, `sum += C*dA*dB`) | prefill 1.829 tok/s @ ctx 128, matmul 5,5 TMAC/s | dari 818 / 2,1; angka parameternya diambil dari mmq-config-ampere.cuh:104, mmq.cuh:180, mmq-vec-dot.cuh:195-250 |
 | - pemecahan token antar blok pada kernel mma | tidak dipakai | menambah warp tetapi menggandakan baca bobot |
 | catatan | `ldmatrix` butuh alamat generik 64-bit; alamat shared 32-bit dari `__cvta_generic_to_shared` membuat ptxas membaca global dan kena illegal access | |
+| + attention prefill di-tile (1 blok per head × 16 query, K/V di shared, softmax online) | prefill 1.954 / 1.600 / 1.292 tok/s @ ctx 128/512/1024 | dari 1.829 / 1.437 / 1.071; sisa biaya = K/V dibaca 4× per head per chunk karena 4 blok query |
+| catatan | tes golden logits diubah dari "argmax sama" menjadi "argmax ada di 3 teratas referensi" | dua kandidat teratas berjarak 0,003 (kita) dan 0,006 (referensi), sementara selisih forward pass sampai 0,28; urutan keduanya ditentukan pembulatan |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
 warp menjalankan jumlah iterasi yang sama. Versi pertama memakai

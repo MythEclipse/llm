@@ -41,6 +41,11 @@ fn split_count(visible: usize) -> usize {
     wanted.max(required).min(MAX_SPLITS)
 }
 
+/// Query positions per prefill attention block, matching `FA_QUERY_TILE`.
+const PREFILL_QUERY_TILE: usize = 16;
+/// Threads per prefill attention block, matching `FA_WARPS` times the warp size.
+const PREFILL_THREADS: u32 = 128;
+
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
 const MMA_WARPS: usize = 8;
@@ -82,6 +87,7 @@ struct Kernels {
     rope: Function,
     kv_append: Function,
     attention: Function,
+    attention_prefill: Function,
     attention_split: Function,
     attention_combine: Function,
     embedding: Function,
@@ -158,6 +164,7 @@ impl Gpu {
                 rope: function(module, "rope")?,
                 kv_append: function(module, "kv_append")?,
                 attention: function(module, "attention")?,
+                attention_prefill: function(module, "attention_prefill")?,
                 attention_split: function(module, "attention_split")?,
                 attention_combine: function(module, "attention_combine")?,
                 embedding: function(module, "embedding_row")?,
@@ -443,6 +450,44 @@ impl Gpu {
             self.kernels.kv_append,
             (blocks(total), 1, 1),
             (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Prefill attention with the keys and values staged in shared memory and the
+    /// softmax kept online, one block per head and sixteen query positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill(
+        &self,
+        query: &DeviceBuffer,
+        keys: &DeviceBuffer,
+        values: &DeviceBuffer,
+        out: &DeviceBuffer,
+        geometry: AttentionGeometry,
+        start: usize,
+        tokens: usize,
+    ) -> Result<(), EngineError> {
+        let mut args = [
+            Arg::Pointer(query.pointer),
+            Arg::Pointer(keys.pointer),
+            Arg::Pointer(values.pointer),
+            Arg::Pointer(out.pointer),
+            Arg::Int(geometry.n_head as i32),
+            Arg::Int(geometry.n_head_kv as i32),
+            Arg::Int(geometry.head_dim as i32),
+            Arg::Int(start as i32),
+            Arg::Int(tokens as i32),
+            Arg::Float(geometry.scale),
+        ];
+        self.launch(
+            self.kernels.attention_prefill,
+            (
+                geometry.n_head as u32,
+                tokens.div_ceil(PREFILL_QUERY_TILE) as u32,
+                1,
+            ),
+            (PREFILL_THREADS, 1, 1),
             0,
             &mut args,
         )
