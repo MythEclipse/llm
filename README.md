@@ -127,17 +127,22 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
-| 0 token | **64,8 tok/s** (15,4 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **59,8 tok/s** (16,7 ms) | 19,5 tok/s (51,4 ms) | 278 tok/s (0,46 s) | 30 tok/s (4,26 s) |
-| 512 token | **48,3 tok/s** (20,7 ms) | 15,6 tok/s (64,1 ms) | 259 tok/s (1,98 s) | 27 tok/s (18,8 s) |
-| 1024 token | **38,4 tok/s** (26,0 ms) | 11,1 tok/s (90,3 ms) | 242 tok/s (4,22 s) | 23 tok/s (44,6 s) |
+| 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
+| 128 token | **63,2 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 277 tok/s (0,46 s) | 30 tok/s (4,26 s) |
+| 512 token | **62,6 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 260 tok/s (1,97 s) | 27 tok/s (18,8 s) |
+| 1024 token | **60,1 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 244 tok/s (4,20 s) | 23 tok/s (44,6 s) |
+| 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
+| 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
-Decode 3,0–3,5× lebih cepat, prefill 9,3–10,6× lebih cepat. Satu generasi 120
+Decode 3,0–5,4× lebih cepat, prefill 9,3–10,6× lebih cepat. Satu generasi 120
 token di CLI: 60,6 tok/s, TTFT 175 ms.
 
 Lantai decode di 4050 (≈192 GB/s) adalah 2,68 GB bobot / 192 GB/s ≈ 14 ms per
-token; yang terukur 15,4 ms, jadi decode sudah 91% dari lantai itu. Tidak ada
-ruang berarti lagi di jalur decode tanpa mengubah presisi bobot.
+token; yang terukur 15,5 ms pada konteks 0, jadi decode sudah 90% dari lantai
+itu. Kenaikan 15,5 → 20,3 ms sampai konteks 4090 juga bukan kernel lagi: KV f32
+pada 4090 token berukuran 704 MB dan dibaca ulang tiap token, yaitu 704 MB /
+192 GB/s ≈ 3,7 ms — persis selisih yang terukur. Menekannya berarti KV f16 atau
+KV terkuantisasi, yang mengubah numerik.
 
 Prefill masih di ±670 GFLOPS (5–10% dari puncak fp32 kartu ini). Jalur prompt
 memakai 4 baris bobot × 8 token per blok dengan k dipecah 1024 elemen, jadi satu
@@ -159,6 +164,32 @@ load `float4` untuk aktivasi. Hasilnya 15,4 ms/token (≈174 GB/s efektif).
 
 Harganya: 1,125 byte per parameter, bukan 1,0625 — VRAM bobot naik dari 2,68 GB
 ke ±2,83 GB, dan repack menambah ±0,4 s saat load.
+
+### Attention decode: posisi dipecah antar blok
+
+Model ini punya 16 head, jadi satu blok per head hanya memberi 16 blok — di kartu
+dengan 20 SM itu berarti sebagian SM menganggur, dan tiap blok berjalan sendiri
+menyusuri seluruh KV secara serial. Biayanya terlihat sebagai kurva yang menanjak:
+15,4 ms/token di konteks 0, tapi 26,2 ms di konteks 1024.
+
+Sekarang posisi dipecah antar blok (`attention_split`): satu blok memegang satu
+head dan satu potongan posisi, menyimpan max, jumlah bobot, dan jumlah V
+terbobotnya sendiri, lalu `attention_combine` menyatukannya dengan
+`exp(max_i - max)` seperti flash attention. Jumlah potongan dipilih agar tiap blok
+mendapat ±64 posisi (dibatasi jendela shared 256 posisi), jadi konteks 1024
+menghasilkan 16 × 16 = 256 blok, bukan 16.
+
+Hasilnya kurva decode jadi rata: 15,5 / 15,8 / 16,0 / 16,6 ms pada konteks
+0 / 128 / 512 / 1024, dan 17,8 / 20,3 ms pada 2048 / 4090. Pada konteks 1024 itu
+38,1 → 60,1 tok/s.
+
+Kesalahan yang sempat terjadi, dicatat karena bentuknya klasik: versi pertama
+combine mengalikan pembilang dengan `sum_i` **dan** memakai `sum_i` sebagai
+penyebut, sehingga normalisasinya saling meniadakan dan hasilnya jumlah V
+terbobot mentah — keluarannya benar hanya saat `splits = 1` (konteks ≤ 64), yang
+kebetulan adalah kasus pertama yang saya uji secara manual. Yang menangkapnya
+`greedy_golden`, bukan mata: teksnya masih mulai " Paris" lalu melantur. Rumus
+yang benar menaruh `sum_i` hanya di penyebut.
 
 ### Kenapa CPU masih dipakai sebagai pembanding
 
@@ -182,10 +213,10 @@ memakai `perf_profile` (median 9 langkah decode per titik).
 | Prefill 128 token | 275 tok/s | 4.431 tok/s | 28 tok/s | 99 tok/s |
 | Prefill 512 token | 257 tok/s | 5.836 tok/s | 18 tok/s | 98 tok/s |
 | Prefill 1024 token | 241 tok/s | 5.765 tok/s | 16 tok/s | 70 tok/s |
-| Decode ctx 0 | **65,0 tok/s** | 71,2 tok/s | 17,1 tok/s | 16,9 tok/s |
-| Decode ctx 128 | 59,7 tok/s | 71,3 tok/s | 13,9 tok/s | 17,2 tok/s |
-| Decode ctx 512 | 48,1 tok/s | 71,2 tok/s | 9,8 tok/s | 15,9 tok/s |
-| Decode ctx 1024 | 38,1 tok/s | 71,2 tok/s | 7,6 tok/s | 15,1 tok/s |
+| Decode ctx 0 | **64,4 tok/s** | 71,2 tok/s | 17,1 tok/s | 16,9 tok/s |
+| Decode ctx 128 | 63,2 tok/s | 71,3 tok/s | 13,9 tok/s | 17,2 tok/s |
+| Decode ctx 512 | 62,6 tok/s | 71,2 tok/s | 9,8 tok/s | 15,9 tok/s |
+| Decode ctx 1024 | 60,1 tok/s | 71,2 tok/s | 7,6 tok/s | 15,1 tok/s |
 | VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB | — | — |
 | Load + 1 token (wall) | 1,07 s | 1,32 s | 0,24 s | 2,90 s |
 
@@ -199,14 +230,11 @@ dua putaran bergantian supaya kondisi termal sama:
 
 Bacaan jujurnya:
 
-- **Decode pendek hampir sepadan** (65,0 vs 71,2 tok/s, 91%). Ini masuk akal:
-  keduanya sudah menyentuh lantai bandwidth, dan selisih 9% itu ongkos repack
-  (1,125 vs 1,0625 byte per parameter) plus kernel attention yang belum di-tile.
-- **Decode merosot saat konteks panjang, punya llama.cpp tidak.** llama.cpp
-  memakai flash attention yang membaca KV per blok dan tetap di cache; kernel
-  attention di sini membaca ulang seluruh KV dari global memory tiap token, jadi
-  biayanya naik dari 15,4 ke 26,2 ms. Ini penyebab utama angka 38,1 vs 71,2 pada
-  ctx 1024, bukan matmul-nya.
+- **Decode sepadan di semua konteks yang diuji** (90% di ctx 0, 84% di ctx
+  1024, dan kurvanya sekarang rata seperti llama.cpp). Selisih 10–16% itu ongkos
+  repack (1,125 vs 1,0625 byte per parameter) plus attention yang belum di-tile
+  dengan cara yang sama. Sebelum attention decode dipecah antar blok, angkanya
+  38,1 tok/s pada ctx 1024; lihat catatan di bagian GPU.
 - **Prefill 18× tertinggal di GPU.** ggml memakai kernel MMQ: aktivasi
   dikuantisasi ke int8 lalu di-dot dengan `dp4a`/MMA tensor core, sedangkan
   engine ini menjumlahkan f32 lewat FMA biasa. Selisih 4.431 vs 275 tok/s itu

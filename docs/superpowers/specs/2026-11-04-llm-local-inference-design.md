@@ -161,6 +161,7 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + attention 4 warp (posisi dipecah antar warp) | 27,6 ms/token | kurva decode rata: 27,6 → 38,3 ms dari ctx 0 ke 1024 |
 | + repack Q8_0 jadi `scales[] + quants[]` sejajar 32 byte | 15,4 ms/token | decode 91% dari lantai bandwidth (14 ms); 8 kuantisasi per load 64-bit |
 | + jalur prompt 4 baris × 8 token, k dipecah 1024 | prefill 278 tok/s | satu baca shared = 32 MAC; 242 tok/s pada ctx 1024 |
+| + attention decode dipecah antar blok (flash-decoding) | 16,6 ms @ ctx 1024 | dari 26,2 ms; kurva decode rata 15,5 → 20,3 ms sampai ctx 4090 |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
 warp menjalankan jumlah iterasi yang sama. Versi pertama memakai
