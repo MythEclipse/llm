@@ -27,8 +27,8 @@ const LANES: u32 = 32;
 const WARPS: u32 = 8;
 /// Four warps per attention block, matching `ATTENTION_WARPS` in the kernel.
 const ATTENTION_THREADS: u32 = 128;
-/// Shared memory per matmul block is `k * 4` bytes.
-const MAX_SHARED_K: usize = 12_288;
+/// Output rows per block on the prompt path, matching `ROWS_PER_BLOCK`.
+const ROWS_PER_BLOCK: usize = 4;
 
 /// A device allocation of `len` f32 values, freed on drop.
 pub struct DeviceBuffer {
@@ -56,6 +56,7 @@ impl Drop for DeviceBuffer {
 /// A kernel handle, looked up by name once at open time.
 struct Kernels {
     matmul: Function,
+    matmul_batch: Function,
     rmsnorm: Function,
     silu_mul: Function,
     residual_add: Function,
@@ -126,6 +127,7 @@ impl Gpu {
 
             let kernels = Kernels {
                 matmul: function(module, "q8_matmul")?,
+                matmul_batch: function(module, "q8_matmul_batch")?,
                 rmsnorm: function(module, "rmsnorm_rows")?,
                 silu_mul: function(module, "silu_mul")?,
                 residual_add: function(module, "residual_add")?,
@@ -241,7 +243,6 @@ impl Gpu {
         y: &DeviceBuffer,
         y_offset: usize,
     ) -> Result<(), EngineError> {
-        assert!(k <= MAX_SHARED_K, "k too large for the shared-memory row");
         assert!(
             k.is_multiple_of(32),
             "Q8_0 rows are whole 32-element blocks"
@@ -259,18 +260,23 @@ impl Gpu {
             Arg::Int(out as i32),
             Arg::Int(n as i32),
         ];
-        // The single-token path keeps the row in registers, so it needs no
-        // shared memory — and asking for 24 KB anyway costs occupancy.
-        let shared_bytes = if n < WARPS as usize {
-            0
-        } else {
-            (k * 4) as u32
-        };
+        if n >= WARPS as usize {
+            // Prompt path: four rows per block, eight tokens per warp, k chunked.
+            return self.launch(
+                self.kernels.matmul_batch,
+                (out.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+                (LANES, WARPS, 1),
+                0,
+                &mut args,
+            );
+        }
+        // Decode path keeps the row in registers, so it needs no shared memory —
+        // and asking for 24 KB anyway costs occupancy.
         self.launch(
             self.kernels.matmul,
             (out as u32, 1, 1),
             (LANES, WARPS, 1),
-            shared_bytes,
+            0,
             &mut args,
         )
     }

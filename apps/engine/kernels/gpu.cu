@@ -92,17 +92,121 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
     }
     __syncthreads();
 
-    for (int token = warp; token < n; token += blockDim.y) {
-        const float* activation = x + (size_t)token * k;
-        float sum = 0.0f;
-        for (int i = lane; i < k; i += blockDim.x) {
-            sum += row[i] * activation[i];
+    // Eight tokens per warp, eight independent accumulators: one shared read of
+    // the weight row feeds eight fused multiply-adds, and the chains do not
+    // depend on each other, so the pipeline stays full.
+    const int group_stride = blockDim.y * 8;
+    for (int group = warp * 8; group < n; group += group_stride) {
+        float sums[8];
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            sums[slot] = 0.0f;
         }
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        for (int i = lane; i < k; i += 32) {
+            const float weight = row[i];
+            #pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                if (group + slot < n) {
+                    sums[slot] += weight * x[(size_t)(group + slot) * k + i];
+                }
+            }
         }
-        if (lane == 0) {
-            y[(size_t)token * out + o] = sum;
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            if (group + slot < n) {
+                float total = sums[slot];
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    total += __shfl_down_sync(0xffffffffu, total, offset);
+                }
+                if (lane == 0) {
+                    y[(size_t)(group + slot) * out + o] = total;
+                }
+            }
+        }
+    }
+}
+
+// Prompt path: four output rows and eight tokens per block, so one shared read
+// of a weight feeds 32 multiply-adds. The k loop is chunked because four rows of
+// 6144 floats would not fit in shared memory.
+#define ROWS_PER_BLOCK 4
+#define K_CHUNK 1024
+#define TOKENS_PER_WARP 8
+
+extern "C" __global__ void q8_matmul_batch(const float* __restrict__ scales,
+                                          const signed char* __restrict__ quants,
+                                          const float* __restrict__ x,
+                                          float* __restrict__ y,
+                                          int k, int out, int n) {
+    __shared__ float tile[ROWS_PER_BLOCK][K_CHUNK];
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int threads = blockDim.x * blockDim.y;
+    const int tid = warp * blockDim.x + lane;
+    const int first_row = blockIdx.x * ROWS_PER_BLOCK;
+
+    // Every warp runs the same number of group iterations: the __syncthreads in
+    // the chunk loop would deadlock if a warp with no tokens skipped out early.
+    const int group_stride = blockDim.y * TOKENS_PER_WARP;
+    for (int base = 0; base < n; base += group_stride) {
+        const int group = base + warp * TOKENS_PER_WARP;
+        float sums[ROWS_PER_BLOCK][TOKENS_PER_WARP];
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            #pragma unroll
+            for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
+                sums[row][slot] = 0.0f;
+            }
+        }
+
+        for (int chunk = 0; chunk < k; chunk += K_CHUNK) {
+            for (int index = tid; index < ROWS_PER_BLOCK * K_CHUNK; index += threads) {
+                const int row = index / K_CHUNK;
+                const int element = index % K_CHUNK;
+                const int position = chunk + element;
+                const int target = first_row + row;
+                float value = 0.0f;
+                if (position < k && target < out) {
+                    const float scale =
+                        scales[(size_t)target * (k / Q8_BLOCK_ELEMS) + (position >> 5)];
+                    value = scale * (float)quants[(size_t)target * k + position];
+                }
+                tile[row][element] = value;
+            }
+            __syncthreads();
+
+            for (int element = lane; element < K_CHUNK; element += 32) {
+                if (chunk + element < k) {
+                    #pragma unroll
+                    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+                        const float weight = tile[row][element];
+                        #pragma unroll
+                        for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
+                            if (group + slot < n) {
+                                sums[row][slot] +=
+                                    weight * x[(size_t)(group + slot) * k + chunk + element];
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            #pragma unroll
+            for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
+                if (group + slot < n && first_row + row < out) {
+                    float total = sums[row][slot];
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        total += __shfl_down_sync(0xffffffffu, total, offset);
+                    }
+                    if (lane == 0) {
+                        y[(size_t)(group + slot) * out + first_row + row] = total;
+                    }
+                }
+            }
         }
     }
 }
