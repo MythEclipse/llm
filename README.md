@@ -512,10 +512,10 @@ memberi 4.000 atau 5.200 tok/s hanya karena suhu awal kartu.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.618 ± 33 tok/s | 3.700 ± 309 tok/s | 98% |
-| pp512 | 4.269 ± 8 tok/s | 4.700 ± 100 tok/s | 91% |
-| pp1024 | 4.108 ± 2 tok/s | 4.647 ± 121 tok/s | 88% |
-| tg128 | 68,3 ± 0,02 tok/s | 69,4 ± 0,04 tok/s | 98% |
+| pp128 | 3.536 ± 21 tok/s | 3.788 ± 235 tok/s | 93% |
+| pp512 | 4.601 ± 3 tok/s | 4.735 ± 73 tok/s | 97% |
+| pp1024 | 4.429 ± 1 tok/s | 4.677 ± 92 tok/s | 95% |
+| tg128 | 68,2 ± 0,03 tok/s | 69,3 ± 0,04 tok/s | 98% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
@@ -541,6 +541,16 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
   aktivasi, dan kedua bidang skala berangkat bersama, jadi blok menunggu sekali per
   potongan, bukan empat kali: 99,9 → 90,5 ms matmul pada pp512. Ini yang di
   profiler terbaca sebagai `long_scoreboard` dengan 8 warp.
+- **Enam belas warp dan 256 baris per blok.** Tile aktivasi dulu di-stage sekali
+  per blok 128 baris, jadi pada 512 token aktivasi disalin sesering bobot: 200 MB
+  salinan tile per layer melawan 201 MB bobot, 16,8 GB untuk seluruh prefill.
+  Dengan 256 baris, separuh trafik itu hilang, dan SM punya 16 warp untuk
+  menyembunyikan latensi staging: 90,5 → 83,3 ms, tensor pipe 29% → 35%.
+- **Fragmen B satu load.** Kuantiser menulis tiap blok 32 elemen sebagai (0-3,
+  16-19, 4-7, 20-23, 8-11, 24-27, 12-15, 28-31), jadi dua word yang satu lane
+  suapkan ke mma bersebelahan dan tiba dalam satu load 64-bit, bukan dua. Permutasi
+  itu terjadi saat kuantisasi, jadi salinan tile tetap 16 byte lurus; hanya jalur
+  prompt yang melihatnya, decode membaca aktivasi f32 mentah.
 - **Tile sisa dipotong di sumbu token** (`wave_plan` + `tail_slices`) supaya
   gelombang terakhir tidak kosong: +4% pada pp512. Potongannya menulis kolom
   berbeda, jadi tidak ada penjumlahan parsial yang harus digabung.
@@ -552,13 +562,17 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 
 ### Sisa jarak, dan ke mana harus pergi
 
-- **Matmul prefill masih ±25% di belakang** dan itu seluruh selisihnya: 90,5 ms
-  lawan ±70 ms pada pp512, sementara attention (11,1 lawan 4,7) dan elementwise
-  kita sudah lebih murah dari llama.cpp. Dua hal yang mereka punya dan kita belum:
-  tile aktivasi yang sudah di-*swizzle* saat kuantisasi (`block_q8_1_mmq`, skala
-  menempel pada data sehingga fragmen B datang lewat satu `ldmatrix`, bukan dua
-  load), dan *stream-k* yang membagi sumbu k supaya tidak ada gelombang setengah
-  kosong. Keduanya perubahan besar, bukan tambalan.
+- **Matmul prefill tinggal ±2–4%** (83 ms lawan ±80 ms pada pp512). Sisa yang
+  terukur di profiler: `wait` dan `mio_throttle` di loop dalam, yaitu antrean
+  shared memory — bukan lagi salinan tile. Yang belum kita punya dari llama.cpp:
+  *stream-k*, yang membagi sumbu k supaya tidak ada gelombang setengah kosong
+  (pp128 paling terasa: proyeksi 2048 baris hanya 8 tile).
+- **Attention prefill masih 2,3× lebih lambat** (11,1 ms lawan ±4,9 ms) dan itu
+  sekarang 10% dari runtime prefill. Profilnya jelas: tensor pipe 11%, dan dua
+  stall teratas `long_scoreboard` 5,6 serta `mio_throttle` 5,2 — blok menganggur
+  menunggu tile K/V yang di-stage skalar dan dibaca ulang 32× per KV head. Yang
+  dibutuhkan tile query lebih besar (K/V dibaca 16× bukan 32×) dengan warp yang
+  cukup untuk menyembunyikan staging-nya, bukan tambalan satu baris.
 - **Decode 98%**: lantai DRAM 2,39 GB/token ÷ 187,8 GB/s = 12,7 ms, matmul-nya
   13,4 ms (178 GB/s), sisanya ±0,9 ms kernel kecil + ±0,4 ms celah antar
   peluncuran. Untuk menutup itu yang benar CUDA graph (satu replay per token),
