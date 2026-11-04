@@ -6,7 +6,7 @@ use crate::ops::RopeTable;
 
 /// Prompt tokens per forward call. Large enough to amortize the weight read,
 /// small enough that the activation scratch stays a few megabytes.
-const PREFILL_CHUNK: usize = 64;
+const PREFILL_CHUNK: usize = 1024;
 
 pub struct Session<'a> {
     model: &'a Model<'a>,

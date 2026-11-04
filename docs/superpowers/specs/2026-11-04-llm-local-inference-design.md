@@ -172,7 +172,11 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + potongan k kernel prompt 128 → 256 elemen (shared memory dinamis, `cuFuncSetAttribute`) | pp128/512/1024 = 2.104 / 1.738 / 1.378 tok/s | dari 1.959 / 1.607 / 1.297; 58.368 byte shared per blok |
 | + attention prefill: 4 head per blok (satu KV head), 8 warp, 72 KB shared dinamis | pp128/512/1024 = 2.190 / 1.880 / 1.576 tok/s | dari 2.104 / 1.738 / 1.378; pembacaan K/V per chunk 16 → 4 blok-baca; probe referensi host 4,5e-7 |
 | - tile attention 16 → 32 query | tidak dipakai | buffer K/V dipakai bergantian (nilai jadi pass terpisah) dan register 65 → 98 menurunkan okupansi; 1.932 / 1.574 / 1.261 |
-| + `llm-cli bench` mengikuti antarmuka `llama-bench` (`-p`, `-n`, `-r`, `-o json`, `±` deviasi standar) | angka prefill/decode bisa dibandingkan langsung | pp512 1.738 vs 5.890; tg128 63,2 vs 71,2 |
+| + chunk prefill 64 → 1024 token, tile token jadi dimensi tercepat di grid (tile bobot tetap di L2) | pp128/512/1024 = 2.813 / 3.000 / 2.557 tok/s | dari 2.190 / 1.880 / 1.576; sebelumnya 2,8 GB bobot dibaca ulang tiap 64 token |
+| + kernel prompt 16 warp, 256 baris/blok, 16 baris/warp (`__launch_bounds__(512)`) | 2.740 / 3.165 / 2.686 tok/s | pp512 +5,5%, pp1024 +5%; 128 register/thread, tanpa spill |
+| - jalur tensor core f16 (dekuantisasi Q8_0 → f16 saat staging) | tidak dipakai | 1,6× lebih lambat (1.893 vs 3.000): dekuantisasi diulang per tile token dan f16 menggandakan trafik shared; presisi juga 3× lebih longgar (3,5e-3 vs 1e-3) |
+| - `cp.async` dua tahap pada bentuk blok 16 warp | belum bisa dipakai | 130 register × 512 thread melebihi berkas register; butuh tile lebih kecil |
+| - `llm-cli bench` mengikuti antarmuka `llama-bench` (`-p`, `-n`, `-r`, `-o json`, `±` deviasi standar) | angka prefill/decode bisa dibandingkan langsung | pp512 1.738 vs 5.890; tg128 63,2 vs 71,2 |
 | catatan | tes golden logits diubah dari "argmax sama" menjadi "argmax ada di 3 teratas referensi" | dua kandidat teratas berjarak 0,003 (kita) dan 0,006 (referensi), sementara selisih forward pass sampai 0,28; urutan keduanya ditentukan pembulatan |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**

@@ -418,13 +418,13 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
 }
 
 #define MMA_ROWS 16
-#define MMA_WARPS 8
-#define MMA_BLOCK_ROWS 128
-#define MMA_ROWS_PER_WARP 32
+#define MMA_WARPS 16
+#define MMA_BLOCK_ROWS 256
+#define MMA_ROWS_PER_WARP 16
 #define MMA_MINI_TILES (MMA_ROWS_PER_WARP / MMA_ROWS)
 #define MMA_BLOCK_TOKENS 64
-#define MMA_TOKEN_GROUPS 4
-#define MMA_TOKENS_PER_GROUP 16
+#define MMA_TOKEN_GROUPS 8
+#define MMA_TOKENS_PER_GROUP 8
 #define MMA_CHUNK 256
 #define MMA_CHUNK_BLOCKS (MMA_CHUNK / 32)
 #define MMA_PAD 16
@@ -463,7 +463,10 @@ __device__ __forceinline__ void load_a_fragment(int* fragment, const signed char
 //   * both operands sit in shared memory — A is read with ldmatrix.x4, B with the
 //     two-word-per-lane layout — and the per-block scales collapse into one fma
 //     per accumulator element: sum += C * dA * dB.
-extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales,
+// Sixteen warps put 512 threads in the block, so registers have to stay at or
+// below 128 per thread or the launch is refused.
+extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
+                                        const float* __restrict__ weight_scales,
                                         const signed char* __restrict__ weight_quants,
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
@@ -485,12 +488,18 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
     const int threads = blockDim.x * blockDim.y;
     const int tid = warp * blockDim.x + lane;
     const int k_blocks = k >> 5;
-    const int row_base = blockIdx.x * MMA_BLOCK_ROWS;
+    // Token tiles vary fastest so the blocks running together share one weight
+    // tile: it stays in L2 while every token tile of those rows is computed.
+    const int row_base = blockIdx.y * MMA_BLOCK_ROWS;
+    const int token_base = blockIdx.x * MMA_BLOCK_TOKENS;
+    const int tile_tokens = min(MMA_BLOCK_TOKENS, n - token_base);
     const int group = lane >> 2;
     const int lane4 = lane & 3;
 
-    const int row_group = (warp / 2) * MMA_ROWS_PER_WARP;
-    const int token_offset = (warp % 2) * 8;
+    // Sixteen warps cover the block's rows directly; every warp then walks all
+    // four token groups, so no warp is left holding a row range nobody reads.
+    const int row_group = warp * MMA_ROWS_PER_WARP;
+    const int token_offset = 0;
 
     float sums[MMA_TOKEN_GROUPS][MMA_MINI_TILES][4];
     #pragma unroll
@@ -523,9 +532,9 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
             int4* destination = reinterpret_cast<int4*>(b_tile + token * ROW_STRIDE + element);
-            if (position + 16 <= k && token < n) {
-                *destination =
-                    *reinterpret_cast<const int4*>(act_quants + (size_t)token * k + position);
+            if (position + 16 <= k && token < tile_tokens) {
+                *destination = *reinterpret_cast<const int4*>(
+                    act_quants + (size_t)(token_base + token) * k + position);
             } else {
                 *destination = make_int4(0, 0, 0, 0);
             }
@@ -543,8 +552,8 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int token = index / MMA_CHUNK_BLOCKS;
             const int block = index % MMA_CHUNK_BLOCKS;
             const int position = chunk + block * 32;
-            b_scales[token * MMA_CHUNK_BLOCKS + block] = (position < k && token < n)
-                ? act_scales[(size_t)token * k_blocks + (position >> 5)]
+            b_scales[token * MMA_CHUNK_BLOCKS + block] = (position < k && token < tile_tokens)
+                ? act_scales[(size_t)(token_base + token) * k_blocks + (position >> 5)]
                 : 0.0f;
         }
         __syncthreads();
@@ -601,17 +610,19 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
         #pragma unroll
         for (int t = 0; t < MMA_MINI_TILES; ++t) {
             const int row = row_base + row_group + t * MMA_ROWS + group;
-            if (column_low < n && row < out) {
-                y[(size_t)column_low * out + row] = sums[j][t][0];
+            if (column_low < tile_tokens && row < out) {
+                y[(size_t)(token_base + column_low) * out + row] =
+                    sums[j][t][0];
             }
-            if (column_high < n && row < out) {
-                y[(size_t)column_high * out + row] = sums[j][t][1];
+            if (column_high < tile_tokens && row < out) {
+                y[(size_t)(token_base + column_high) * out + row] =
+                    sums[j][t][1];
             }
-            if (column_low < n && row + 8 < out) {
-                y[(size_t)column_low * out + row + 8] = sums[j][t][2];
+            if (column_low < tile_tokens && row + 8 < out) {
+                y[(size_t)(token_base + column_low) * out + row + 8] = sums[j][t][2];
             }
-            if (column_high < n && row + 8 < out) {
-                y[(size_t)column_high * out + row + 8] = sums[j][t][3];
+            if (column_high < tile_tokens && row + 8 < out) {
+                y[(size_t)(token_base + column_high) * out + row + 8] = sums[j][t][3];
             }
         }
     }

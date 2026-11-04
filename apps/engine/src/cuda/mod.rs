@@ -55,13 +55,16 @@ const PREFILL_SHARED_BYTES: u32 = 73_728;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
-const MMA_WARPS: usize = 8;
+const MMA_WARPS: usize = 16;
 /// Dynamic shared memory the prompt matmul asks for: weights and activations for
 /// one k chunk, both padded by `MMA_PAD`, plus their per-block scales.
-const MMA_SHARED_BYTES: u32 = 58_368;
+const MMA_SHARED_BYTES: u32 = 97_280;
 /// Tokens one prompt block can hold, matching `MMA_BLOCK_TOKENS` in the kernel
 /// and the engine's prefill chunk.
-const MMA_TOKENS: usize = 64;
+/// Tokens one prompt-matmul block covers, matching `MMA_BLOCK_TOKENS`.
+const MMA_BLOCK_TOKENS: usize = 64;
+/// Largest prompt the kernel is launched with, matching `PREFILL_CHUNK`.
+const MMA_TOKENS: usize = 1024;
 
 /// A device allocation of `len` f32 values, freed on drop.
 pub struct DeviceBuffer {
@@ -659,7 +662,13 @@ impl Gpu {
         ];
         self.launch(
             self.kernels.matmul_mma,
-            (out.div_ceil(MMA_ROWS * MMA_WARPS) as u32, 1, 1),
+            // Token tiles are the fast dimension so the blocks resident together
+            // share a weight tile and hit L2 instead of re-reading 2,8 GB of it.
+            (
+                n.div_ceil(MMA_BLOCK_TOKENS) as u32,
+                out.div_ceil(MMA_ROWS * MMA_WARPS) as u32,
+                1,
+            ),
             (LANES, MMA_WARPS as u32, 1),
             MMA_SHARED_BYTES,
             &mut args,
