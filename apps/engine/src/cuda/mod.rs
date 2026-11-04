@@ -13,10 +13,11 @@ use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
 use sys::{
-    Context, Device, DevicePtr, Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2,
-    cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName, cuDeviceTotalMem_v2, cuInit, cuLaunchKernel,
-    cuMemAlloc_v2, cuMemFree_v2, cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2,
-    cuModuleGetFunction, cuModuleLoadData, error_message,
+    Context, Device, DevicePtr, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module, SUCCESS,
+    cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName,
+    cuDeviceTotalMem_v2, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
+    cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
+    error_message,
 };
 
 use crate::error::EngineError;
@@ -49,6 +50,9 @@ const PREFILL_THREADS: u32 = 128;
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
 const MMA_WARPS: usize = 8;
+/// Dynamic shared memory the prompt matmul asks for: weights and activations for
+/// one k chunk, both padded by `MMA_PAD`, plus their per-block scales.
+const MMA_SHARED_BYTES: u32 = 58_368;
 /// Tokens one prompt block can hold, matching `MMA_BLOCK_TOKENS` in the kernel
 /// and the engine's prefill chunk.
 const MMA_TOKENS: usize = 64;
@@ -156,7 +160,9 @@ impl Gpu {
 
             let kernels = Kernels {
                 matmul: function(module, "q8_matmul")?,
-                matmul_mma: function(module, "q8_matmul_mma")?,
+                // The prompt matmul stages a 256-element k chunk, which is 57 KB of
+                // shared memory, so its ceiling is raised once here.
+                matmul_mma: reserve_shared(function(module, "q8_matmul_mma")?, MMA_SHARED_BYTES)?,
                 quantize_rows: function(module, "quantize_rows")?,
                 rmsnorm: function(module, "rmsnorm_rows")?,
                 silu_mul: function(module, "silu_mul")?,
@@ -646,7 +652,7 @@ impl Gpu {
             self.kernels.matmul_mma,
             (out.div_ceil(MMA_ROWS * MMA_WARPS) as u32, 1, 1),
             (LANES, MMA_WARPS as u32, 1),
-            0,
+            MMA_SHARED_BYTES,
             &mut args,
         )
     }
@@ -852,6 +858,21 @@ pub struct AttentionGeometry {
     pub head_dim: usize,
     pub scores_stride: usize,
     pub scale: f32,
+}
+
+/// Raises the dynamic shared memory one kernel may ask for, past the 48 KiB a
+/// kernel gets without it.
+fn reserve_shared(function: Function, bytes: u32) -> Result<Function, EngineError> {
+    // SAFETY: `function` came from cuModuleGetFunction; the driver validates the
+    // value against the device limit and reports failure through the status.
+    let status =
+        unsafe { cuFuncSetAttribute(function, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, bytes as i32) };
+    if status != 0 {
+        return Err(EngineError::Unsupported(format!(
+            "cuda: raising shared memory to {bytes} failed with status {status}"
+        )));
+    }
+    Ok(function)
 }
 
 fn function(module: Module, name: &str) -> Result<Function, EngineError> {

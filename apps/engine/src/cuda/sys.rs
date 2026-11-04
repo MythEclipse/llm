@@ -22,6 +22,9 @@ pub struct Module(pub *mut c_void);
 #[derive(Debug, Clone, Copy)]
 pub struct Function(pub *mut c_void);
 
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` from the driver API.
+pub const FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED: i32 = 8;
+
 /// A device pointer, passed to kernels by value.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,9 @@ unsafe extern "C" {
     pub fn cuModuleLoadData(module: *mut Module, image: *const c_void) -> i32;
     pub fn cuModuleGetFunction(function: *mut Function, module: Module, name: *const c_char)
     -> i32;
+    /// Raises the dynamic shared memory a kernel may ask for. Without it a launch
+    /// over 48 KiB fails, which is where the tiled kernels land.
+    pub fn cuFuncSetAttribute(function: Function, attribute: i32, value: i32) -> i32;
     pub fn cuLaunchKernel(
         function: Function,
         grid_x: u32,

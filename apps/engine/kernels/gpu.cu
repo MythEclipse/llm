@@ -425,7 +425,7 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
 #define MMA_BLOCK_TOKENS 64
 #define MMA_TOKEN_GROUPS 4
 #define MMA_TOKENS_PER_GROUP 16
-#define MMA_CHUNK 128
+#define MMA_CHUNK 256
 #define MMA_CHUNK_BLOCKS (MMA_CHUNK / 32)
 #define MMA_PAD 16
 
@@ -471,10 +471,14 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
                                         int k, int out, int n) {
     // ldmatrix needs sixteen-byte-aligned shared addresses, and a plain char array
     // is only guaranteed one-byte alignment.
-    __shared__ __align__(16) signed char a_tile[MMA_BLOCK_ROWS][MMA_CHUNK + MMA_PAD];
-    __shared__ float a_scales[MMA_BLOCK_ROWS][MMA_CHUNK_BLOCKS];
-    __shared__ __align__(16) signed char b_tile[MMA_BLOCK_TOKENS][MMA_CHUNK + MMA_PAD];
-    __shared__ float b_scales[MMA_BLOCK_TOKENS][MMA_CHUNK_BLOCKS];
+    // One dynamic allocation instead of four static arrays: a 256-element k chunk
+    // needs 57 KB, and a kernel may only take 48 KB statically.
+    extern __shared__ __align__(16) signed char smem[];
+    constexpr int ROW_STRIDE = MMA_CHUNK + MMA_PAD;
+    signed char* a_tile = smem;
+    signed char* b_tile = a_tile + MMA_BLOCK_ROWS * ROW_STRIDE;
+    float* a_scales = reinterpret_cast<float*>(b_tile + MMA_BLOCK_TOKENS * ROW_STRIDE);
+    float* b_scales = a_scales + MMA_BLOCK_ROWS * MMA_CHUNK_BLOCKS;
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -506,7 +510,7 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
             const int target = row_base + row;
-            int4* destination = reinterpret_cast<int4*>(&a_tile[row][element]);
+            int4* destination = reinterpret_cast<int4*>(a_tile + row * ROW_STRIDE + element);
             if (position + 16 <= k && target < out) {
                 *destination =
                     *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position);
@@ -518,7 +522,7 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int token = index / MMA_CHUNK;
             const int element = index % MMA_CHUNK;
             const int position = chunk + element;
-            int4* destination = reinterpret_cast<int4*>(&b_tile[token][element]);
+            int4* destination = reinterpret_cast<int4*>(b_tile + token * ROW_STRIDE + element);
             if (position + 16 <= k && token < n) {
                 *destination =
                     *reinterpret_cast<const int4*>(act_quants + (size_t)token * k + position);
@@ -531,7 +535,7 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int block = index % MMA_CHUNK_BLOCKS;
             const int position = chunk + block * 32;
             const int target = row_base + row;
-            a_scales[row][block] = (position < k && target < out)
+            a_scales[row * MMA_CHUNK_BLOCKS + block] = (position < k && target < out)
                 ? weight_scales[(size_t)target * k_blocks + (position >> 5)]
                 : 0.0f;
         }
@@ -539,7 +543,7 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             const int token = index / MMA_CHUNK_BLOCKS;
             const int block = index % MMA_CHUNK_BLOCKS;
             const int position = chunk + block * 32;
-            b_scales[token][block] = (position < k && token < n)
+            b_scales[token * MMA_CHUNK_BLOCKS + block] = (position < k && token < n)
                 ? act_scales[(size_t)token * k_blocks + (position >> 5)]
                 : 0.0f;
         }
@@ -551,8 +555,8 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             #pragma unroll
             for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
                 load_a_fragment(fragments[t][block],
-                                &a_tile[row_group + t * MMA_ROWS][block * 32],
-                                MMA_CHUNK + MMA_PAD, lane);
+                                a_tile + (row_group + t * MMA_ROWS) * ROW_STRIDE + block * 32,
+                                ROW_STRIDE, lane);
             }
         }
 
@@ -562,13 +566,13 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
             #pragma unroll
             for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
                 const int fragment_token = first_token + group;
-                const int* activations =
-                    reinterpret_cast<const int*>(&b_tile[fragment_token][block * 32 + lane4 * 4]);
+                const int* activations = reinterpret_cast<const int*>(
+                    b_tile + fragment_token * ROW_STRIDE + block * 32 + lane4 * 4);
                 const int b0 = activations[0];
                 const int b1 = activations[4];
                 const int column = first_token + lane4 * 2;
-                const float act_low = b_scales[column][block];
-                const float act_high = b_scales[column + 1][block];
+                const float act_low = b_scales[column * MMA_CHUNK_BLOCKS + block];
+                const float act_high = b_scales[(column + 1) * MMA_CHUNK_BLOCKS + block];
 
                 #pragma unroll
                 for (int t = 0; t < MMA_MINI_TILES; ++t) {
@@ -576,8 +580,9 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
                     mma_s8(d0, d1, d2, d3, fragments[t][block][0], fragments[t][block][1],
                            fragments[t][block][2], fragments[t][block][3], b0, b1);
                     const int row = row_group + t * MMA_ROWS;
-                    const float weight_low = a_scales[row + group][block];
-                    const float weight_high = a_scales[row + group + 8][block];
+                    const float weight_low = a_scales[(row + group) * MMA_CHUNK_BLOCKS + block];
+                    const float weight_high =
+                        a_scales[(row + group + 8) * MMA_CHUNK_BLOCKS + block];
                     sums[j][t][0] += (float)d0 * (weight_low * act_low);
                     sums[j][t][1] += (float)d1 * (weight_low * act_high);
                     sums[j][t][2] += (float)d2 * (weight_high * act_low);

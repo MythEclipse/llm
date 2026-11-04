@@ -120,6 +120,13 @@ ke device, decode jadi 27,6 ms/token. Satu forward pass, dua backend
 Kalau VRAM tidak cukup untuk bobot + 512 MB headroom, model otomatis kembali ke
 CPU saat load, bukan gagal di tengah jawaban.
 
+### Benchmark sendiri, bentuknya seperti llama-bench
+
+`llm-cli bench` mengikuti antarmuka `llama-bench` supaya dua angka bisa
+dibandingkan langsung: `-p` daftar panjang prompt, `-n` daftar panjang generasi,
+`-r` jumlah pengulangan, `-o json`, dan keluaran berupa tabel `test | t/s` dengan
+sebaran `±` (deviasi standar sampel, rumus yang sama dengan llama-bench).
+
 ### Kinerja terukur
 
 RTX 4050 Laptop 6 GB (sm_89, driver 615.78.08), model 2,68 GB, konteks 4096,
@@ -128,9 +135,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 1.954 tok/s (0,07 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 1.600 tok/s (0,32 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 1.292 tok/s (0,79 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 2.104 tok/s (0,06 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 1.738 tok/s (0,29 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 1.378 tok/s (0,74 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -225,6 +232,24 @@ pada ctx 1024 kira-kira 47% waktu prefill ada di attention, dan jalur prefill
 masih memakai kernel `attention` serial per head (yang dipecah antar blok baru
 jalur decode). Tiling attention untuk prefill adalah pekerjaan berikutnya.
 
+### Satu chunk k lebih besar: 128 → 256 elemen
+
+Kernel prompt men-stage satu potong `k` ke shared memory per iterasi. Dengan 128
+elemen, satu potong hanya 24 KB dan tiap iterasi harus menunggu salinannya selesai
+sebelum mengalikan; dengan 256 elemen potongannya dua kali lebih besar sehingga
+waktu tunggu itu lebih sedikit menutupi pekerjaan aritmetika. Ukurannya melewati
+batas 48 KB untuk shared memory statis, jadi kernel ini sekarang memakai alokasi
+dinamis dan `cuFuncSetAttribute` untuk menaikkan batasnya (58.368 byte).
+
+Hasilnya pp128 1.959 → 2.104 tok/s, pp512 1.607 → 1.738, pp1024 1.297 → 1.378.
+Decode tidak tersentuh.
+
+Yang **tidak** menolong, dan sebabnya: memperbesar tile attention prefill dari 16
+ke 32 query supaya K/V dibaca separuh lebih jarang. Hasilnya justru lebih lambat
+(1.932 / 1.574 / 1.261) karena dua hal sekaligus — buffer K dan V harus dipakai
+bergantian sehingga nilai di-stage di pass terpisah, dan register per thread naik
+65 → 98 sehingga okupansi turun. Dibatalkan.
+
 ### Attention prefill: query di-tile, softmax online
 
 Kernel lama meluncurkan satu blok per (head, token) dan menulis setiap baris skor
@@ -291,71 +316,48 @@ greedy identik). Jadi GPU bukan jalur "kira-kira benar" yang terpisah.
 
 ### Perbandingan dengan llama.cpp
 
-llama.cpp b11429 di-build dari source dengan CUDA (`-DGGML_CUDA=ON`,
-`CMAKE_CUDA_ARCHITECTURES=89`) supaya GPU vs GPU-nya sebanding, bukan GPU lawan
-CPU. Berkas model sama (`MiniCPM5-2B-Q8_0.gguf`), mesin sama, tidak ada proses
-lain yang memakai GPU, dan tiap angka diambil setelah satu putaran pemanasan.
-Sisi llama.cpp memakai `llama-bench` (`-r 2`/`-r 3`, `-t 20`); sisi engine ini
-memakai `perf_profile` (median 9 langkah decode per titik).
+Keduanya diukur dengan harness yang sama bentuknya: `llama-bench` di sisi
+llama.cpp, dan `llm-cli bench` di sisi engine ini — nama tes yang sama (`pp`/`tg`),
+jumlah pengulangan yang sama, dan sebaran yang dilaporkan sebagai `±`. Perintahnya
+persis sepadan:
 
-| Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
-|---|---:|---:|---:|---:|
-| Prefill 128 token | 275 tok/s | 4.431 tok/s | 28 tok/s | 99 tok/s |
-| Prefill 512 token | 257 tok/s | 5.836 tok/s | 18 tok/s | 98 tok/s |
-| Prefill 1024 token | 241 tok/s | 5.765 tok/s | 16 tok/s | 70 tok/s |
-| Decode ctx 0 | **64,4 tok/s** | 71,2 tok/s | 17,1 tok/s | 16,9 tok/s |
-| Decode ctx 128 | 63,2 tok/s | 71,3 tok/s | 13,9 tok/s | 17,2 tok/s |
-| Decode ctx 512 | 62,6 tok/s | 71,2 tok/s | 9,8 tok/s | 15,9 tok/s |
-| Decode ctx 1024 | 60,1 tok/s | 71,2 tok/s | 7,6 tok/s | 15,1 tok/s |
-| VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB | — | — |
-| Load + 1 token (wall) | 1,07 s | 1,32 s | 0,24 s | 2,90 s |
+```text
+llama-bench -m models/MiniCPM5-2B-Q8_0.gguf -ngl 99 -p 128,512,1024 -n 128 -r 3
+llm-cli bench -m models/MiniCPM5-2B-Q8_0.gguf -p 128,512,1024 -n 128 -r 3
+```
 
-Uji ujung-ke-ujung lewat CLI, `-n 128`, `--temp 0`, dua putaran bergantian supaya
-kondisi termal sama. Prompt pendek 215 token, prompt panjang 1071 token (teks
-sama diulang lima kali):
+`pp` mengukur prefill N token saja; `tg` mem-prefill prompt pendek lalu mengukur
+fase decode saja, jadi prefill yang lambat tidak bisa bersembunyi di angka
+generation. llama.cpp b11429 di-build dari source dengan CUDA
+(`-DGGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=89`), model sama, mesin sama, tidak
+ada proses lain yang memakai GPU.
 
-| Prompt | Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
-|---|---|---:|---:|---:|---:|
-| 215 token | Prompt | 1.629 tok/s | 3.420–3.731 tok/s | 31,0 tok/s | 78,3 tok/s |
-| 215 token | Generation | 62,1 tok/s | 68,7–68,8 tok/s | 16,4 tok/s | 22,7 tok/s |
-| 1071 token | Prompt | 1.244 tok/s | 5.039–5.306 tok/s | 24,8 tok/s | 74,5 tok/s |
-| 1071 token | Generation | 59,2 tok/s | 67,3 tok/s | 6,4 tok/s | 20,4 tok/s |
+| Tes | llm GPU | llama.cpp GPU | Rasio |
+|---|---:|---:|---:|
+| pp128 | 2.104 ± 31 tok/s | 4.546 ± 482 tok/s | 46% |
+| pp512 | 1.738 ± 1,4 tok/s | 5.890 ± 161 tok/s | 30% |
+| pp1024 | 1.378 ± 0,8 tok/s | 5.796 ± 187 tok/s | 24% |
+| tg128 | **63,2 ± 0,02 tok/s** | 71,2 ± 0,03 tok/s | 89% |
+
+Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
+17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
+
+| Metrik | llm GPU | llama.cpp GPU |
+|---|---:|---:|
+| VRAM (ctx 4096) | 3,1 GiB | 2,49 GiB |
+| Load + 1 token (wall) | 1,07 s | 1,32 s |
 
 Bacaan jujurnya:
 
-- **Decode sepadan di semua konteks yang diuji** (90% di ctx 0, 84% di ctx
-  1024, dan kurvanya sekarang rata seperti llama.cpp). Selisih 10–16% itu ongkos
-  repack (1,125 vs 1,0625 byte per parameter) plus attention yang belum di-tile
-  dengan cara yang sama. Sebelum attention decode dipecah antar blok, angkanya
-  38,1 tok/s pada ctx 1024; lihat catatan di bagian GPU.
-- **Prefill 18× tertinggal di GPU.** ggml memakai kernel MMQ: aktivasi
-  dikuantisasi ke int8 lalu di-dot dengan `dp4a`/MMA tensor core, sedangkan
-  engine ini menjumlahkan f32 lewat FMA biasa. Selisih 4.431 vs 275 tok/s itu
-  kelas algoritma, bukan tuning.
-- **Di CPU prefill tertinggal 3,5×, dan decode masih menurun dengan konteks**
-  (14,5 → 7,4 tok/s dari prompt 215 ke 1071 token) sementara llama.cpp tetap
-  19,2–19,3. Pemecahan attention antar blok baru dikerjakan di jalur CUDA; jalur
-  CPU masih menyusuri KV secara serial per (head, token). Prefill tertinggal
-  karena sebab yang sama seperti di GPU: ggml memakai `_mm256_maddubs_epi16`
-  (int8×int8) setelah aktivasi dikuantisasi, engine ini memakai
-  `_mm256_cvtepi8_epi32` (int8×f32) supaya tidak perlu langkah kuantisasi.
-- **VRAM 3,1 vs 2,49 GiB** karena bidang `scales` f32 menyimpan 4 byte per 32
-  elemen yang di GGUF hanya 2 byte (f16).
-
-Yang belum dikerjakan untuk menutup selisih itu: dot int8 (`dp4a`) plus akumulasi
-f16 di jalur prompt, tensor core MMA untuk prefill, dan attention bertile ala
-flash attention untuk konteks panjang. Ketiganya mengubah numerik, jadi butuh
-fixture baru sebelum bisa diterima.
-
-KV cache f32: 86 KB/token → 704 MB pada ctx 8192, 1,4 GB pada ctx 16384.
-f32 dipilih setelah pengukuran: versi f16 menyimpan setengah memori tapi
-memaksa konversi f16→f32 di dalam loop attention (16 head × posisi × 128),
-dan itu membuat decode 3–4× lebih lambat pada konteks panjang.
-
-Batas jujur: satu generasi pada satu waktu (permintaan kedua ditolak 429
-`engine busy`), tanpa batching antar-permintaan, tanpa multi-model, tanpa auth
-(bind ke loopback). Bobot diunggah ke VRAM saat load, jadi startup menambah
-±0,3 s dan VRAM terpakai walau belum ada permintaan.
+- **Decode sepadan**: 89% dan kurvanya rata terhadap konteks seperti llama.cpp.
+  Selisihnya ongkos repack (1,125 vs 1,0625 byte per parameter) ditambah attention
+  yang belum di-tile dengan cara yang sama.
+- **Prefill 2–4× tertinggal**, dan selisihnya melebar dengan konteks: 46% pada
+  128 token, 30% pada 512, 24% pada 1024. Dua penyebab yang sudah terukur:
+  matmul sendirian berjalan 5,5 TMAC/s sedangkan prefill llama.cpp setara
+  ≈7,5 TMAC/s, dan attention prefill membaca ulang K/V untuk setiap blok query.
+- **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks
+  (jalur CPU belum memakai tiling attention).
 
 ## Catatan implementasi
 

@@ -5,6 +5,8 @@
 //! llm-cli                                 # chat REPL with the ChatML template
 //! ```
 
+mod bench;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -19,13 +21,27 @@ const DEFAULT_CONTEXT: usize = 4096;
 const DEFAULT_MAX_TOKENS: usize = 256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args()
+        .skip(1)
+        .collect::<Vec<String>>()
+        .into_iter();
+    let command = arguments.next();
+    if command.as_deref() == Some("bench") {
+        let options = bench::parse(&mut arguments)?;
+        let measurements = bench::run(&options)?;
+        if options.json {
+            println!("{}", bench::to_json(&measurements, "llm"));
+        }
+        return Ok(());
+    }
+
     let mut model_path = PathBuf::from(DEFAULT_MODEL);
     let mut context = DEFAULT_CONTEXT;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut temperature = 0.7f32;
     let mut prompt_parts = Vec::new();
 
-    let mut args = std::env::args().skip(1);
+    let mut args = command.into_iter().chain(arguments);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--model" => model_path = PathBuf::from(args.next().ok_or("--model needs a path")?),

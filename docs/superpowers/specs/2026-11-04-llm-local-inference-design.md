@@ -169,6 +169,9 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | - pemecahan token antar blok pada kernel mma | tidak dipakai | menambah warp tetapi menggandakan baca bobot |
 | catatan | `ldmatrix` butuh alamat generik 64-bit; alamat shared 32-bit dari `__cvta_generic_to_shared` membuat ptxas membaca global dan kena illegal access | |
 | + attention prefill di-tile (1 blok per head × 16 query, K/V di shared, softmax online) | prefill 1.954 / 1.600 / 1.292 tok/s @ ctx 128/512/1024 | dari 1.829 / 1.437 / 1.071; sisa biaya = K/V dibaca 4× per head per chunk karena 4 blok query |
+| + potongan k kernel prompt 128 → 256 elemen (shared memory dinamis, `cuFuncSetAttribute`) | pp128/512/1024 = 2.104 / 1.738 / 1.378 tok/s | dari 1.959 / 1.607 / 1.297; 58.368 byte shared per blok |
+| - tile attention 16 → 32 query | tidak dipakai | buffer K/V dipakai bergantian (nilai jadi pass terpisah) dan register 65 → 98 menurunkan okupansi; 1.932 / 1.574 / 1.261 |
+| + `llm-cli bench` mengikuti antarmuka `llama-bench` (`-p`, `-n`, `-r`, `-o json`, `±` deviasi standar) | angka prefill/decode bisa dibandingkan langsung | pp512 1.738 vs 5.890; tg128 63,2 vs 71,2 |
 | catatan | tes golden logits diubah dari "argmax sama" menjadi "argmax ada di 3 teratas referensi" | dua kandidat teratas berjarak 0,003 (kita) dan 0,006 (referensi), sementara selisih forward pass sampai 0,28; urutan keduanya ditentukan pembulatan |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
