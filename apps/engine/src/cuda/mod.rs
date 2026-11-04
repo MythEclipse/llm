@@ -66,7 +66,10 @@ const PREFILL_SHARED_BYTES: u32 = 49_152;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
-const MMA_WARPS: usize = 8;
+/// Sixteen warps of sixteen rows: a block owns 256 output rows, which halves how
+/// often the activation tile is staged, and the SM has twice as many warps to
+/// hide the staging latency with.
+const MMA_WARPS: usize = 16;
 /// Dynamic shared memory the prompt matmul asks for: two k-chunk stages of
 /// weights and activations, both padded by `MMA_PAD`, plus their per-block scales.
 /// 2 × 128 × 144 twice over, plus 2 × 2 × 128 × 4 scales.
@@ -1368,9 +1371,11 @@ fn wave_plan(row_tiles: usize, token_tiles: usize, multiprocessors: usize) -> Wa
     // Slices must divide a tile evenly and stay a multiple of the mma token step.
     let mut tail_slices = 1;
     if tail < multiprocessors {
+        // Cut each tail tile into as many pieces as the last wave has room for,
+        // rounded down to a power of two so the pieces stay a multiple of the
+        // mma's eight tokens.
         let room = multiprocessors / tail.max(1);
-        tail_slices = room.next_power_of_two() / 2;
-        tail_slices = tail_slices.clamp(1, 8);
+        tail_slices = (1usize << (usize::BITS - 1 - room.leading_zeros())).clamp(1, 8);
     }
     WavePlan {
         blocks: full_blocks + tail * tail_slices,

@@ -37,6 +37,18 @@ __device__ __forceinline__ float warp_block_sum(float value, float* scratch) {
 // Weight matrices one matmul launch can carry, concatenated along the row axis.
 #define MMA_GROUP_MAX 4
 
+// The prompt matmul reads a lane's B fragment as two 32-bit words sixteen bytes
+// apart in the natural layout, which is two shared loads per mma. Storing each
+// thirty-two-element block as (0-3, 16-19, 4-7, 20-23, 8-11, 24-27, 12-15,
+// 28-31) puts them next to each other instead, so one 64-bit load serves both.
+// The permutation is applied here, at quantisation, so the staging copy stays a
+// plain sixteen-byte copy. Only the prompt path sees this layout: decode reads
+// raw f32 activations.
+__device__ __forceinline__ int mma_activation_slot(int group) {
+    const int order[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+    return order[group];
+}
+
 // Sign-extend byte `index` of `word` to a float.
 __device__ __forceinline__ float q8_element(unsigned int word, int index) {
     return (float)((int)(word << (24 - index * 8)) >> 24);
@@ -360,7 +372,7 @@ extern "C" __global__ void rmsnorm_quantize_rows(const float* __restrict__ src,
         quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
         quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
         quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
-        *reinterpret_cast<char4*>(quant + offset + step * 4) = quantized;
+        *reinterpret_cast<char4*>(quant + offset + mma_activation_slot(step) * 4) = quantized;
     }
 }
 
@@ -644,7 +656,7 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
         quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
         quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
         quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
-        *reinterpret_cast<char4*>(quants + offset + step * 4) = quantized;
+        *reinterpret_cast<char4*>(quants + offset + mma_activation_slot(step) * 4) = quantized;
     }
 }
 
@@ -690,19 +702,19 @@ extern "C" __global__ void silu_mul_quantize_rows(const float* __restrict__ gate
         quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
         quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
         quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
-        *reinterpret_cast<char4*>(quants + offset + step * 4) = quantized;
+        *reinterpret_cast<char4*>(quants + offset + mma_activation_slot(step) * 4) = quantized;
     }
 }
 
 #define MMA_ROWS 16
-#define MMA_WARPS 8
-#define MMA_BLOCK_ROWS 128
+#define MMA_WARPS 16
+#define MMA_BLOCK_ROWS 256
 #define MMA_ROWS_PER_WARP 16
 #define MMA_MINI_TILES (MMA_ROWS_PER_WARP / MMA_ROWS)
 #define MMA_BLOCK_TOKENS 128
 #define MMA_TOKEN_GROUPS 16
 #define MMA_TOKENS_PER_GROUP 8
-#define MMA_CHUNK 256
+#define MMA_CHUNK 128
 #define MMA_CHUNK_BLOCKS (MMA_CHUNK / 32)
 #define MMA_PAD 16
 
@@ -994,10 +1006,12 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
             #pragma unroll
             for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
                 const int fragment_token = first_token + group;
-                const int* activations = reinterpret_cast<const int*>(
-                    b_tile + fragment_token * ROW_STRIDE + block * 32 + lane4 * 4);
-                const int b0 = activations[0];
-                const int b1 = activations[4];
+                // The two words of a lane's B fragment sit next to each other
+                // because the quantiser wrote them that way: one 64-bit load.
+                const int2 pair = *reinterpret_cast<const int2*>(
+                    b_tile + fragment_token * ROW_STRIDE + block * 32 + lane4 * 8);
+                const int b0 = pair.x;
+                const int b1 = pair.y;
                 const int column = first_token + lane4 * 2;
                 const float2 act = *reinterpret_cast<const float2*>(
                     b_scales + block * MMA_BLOCK_TOKENS + column);
