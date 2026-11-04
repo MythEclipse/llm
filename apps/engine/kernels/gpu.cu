@@ -635,20 +635,21 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(co
 // serving one head per block read the same K/V rows eight times over; four heads
 // to a block cuts that to two, and the staged tile is then the only copy.
 //
-// Keys are staged transposed, dim-major: a lane reads k_tile[dim][lane] and the
-// warp touches thirty-two different banks, where row-major would put every lane on
-// the same bank. Because a lane owns one key outright, a score needs no warp
-// reduction.
+// The inner loops are written around what shared memory can deliver. A scalar dot
+// needs two shared reads for every multiply-add, which caps the warp at sixteen
+// multiply-adds per cycle however fast the arithmetic units are. Carrying two
+// queries through the same key load moves that to forty-two: the four key reads
+// serve both queries, and each query's four dims arrive in one broadcast.
 #define FA_HEADS 4
 #define FA_QUERY_TILE 16
 #define FA_KEY_TILE 32
 #define FA_WARPS 8
 #define FA_WARPS_PER_HEAD (FA_WARPS / FA_HEADS)
 #define FA_QUERIES_PER_WARP (FA_QUERY_TILE / FA_WARPS_PER_HEAD)
+#define FA_QUERY_PAIRS (FA_QUERIES_PER_WARP / 2)
 #define FA_MAX_HEAD_DIM 128
 #define FA_DIMS_PER_LANE 4
-#define FA_QUERY_STRIDE (FA_MAX_HEAD_DIM)
-#define FA_HEAD_STRIDE (FA_QUERY_TILE * FA_MAX_HEAD_DIM)
+#define FA_KEY_STRIDE (FA_MAX_HEAD_DIM)
 
 extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                                             const float* __restrict__ keys,
@@ -656,12 +657,10 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                                             float* __restrict__ out,
                                             int n_head, int n_head_kv, int head_dim,
                                             int start, int tokens, float scale) {
-    // Same declaration type as the prompt matmul's dynamic block; the compiler
-    // wants one `extern __shared__` type per translation unit.
     extern __shared__ __align__(16) signed char smem[];
     float* q_tile = reinterpret_cast<float*>(smem);
-    float* k_tile = q_tile + FA_HEADS * FA_HEAD_STRIDE;
-    float* v_tile = k_tile + FA_MAX_HEAD_DIM * FA_KEY_TILE;
+    float* k_tile = q_tile + FA_HEADS * FA_QUERY_TILE * FA_MAX_HEAD_DIM;
+    float* v_tile = k_tile + FA_KEY_TILE * FA_KEY_STRIDE;
     float* weight = v_tile + FA_KEY_TILE * FA_MAX_HEAD_DIM;
 
     const int group = blockIdx.x;
@@ -686,7 +685,7 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
         const int rest = index % (queries * head_dim);
         const int row = rest / head_dim;
         const int dim = rest % head_dim;
-        q_tile[slot * FA_HEAD_STRIDE + row * FA_QUERY_STRIDE + dim] =
+        q_tile[(slot * FA_QUERY_TILE + row) * FA_MAX_HEAD_DIM + dim] =
             query[((size_t)(first_query + row) * n_head + group * FA_HEADS + slot) * head_dim + dim];
     }
 
@@ -712,60 +711,97 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
             const int row = index / head_dim;
             const int dim = index % head_dim;
             const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
+            // Keys stay dim-major: a lane owns one key and reads k_tile[dim][lane],
+            // so the warp touches thirty-two different banks. Key-major would put
+            // every lane on the same bank and serialise the read.
             k_tile[dim * FA_KEY_TILE + row] = keys[source];
             v_tile[row * FA_MAX_HEAD_DIM + dim] = values[source];
         }
         __syncthreads();
 
         #pragma unroll
-        for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
-            const int query_index = first_of_warp + i;
-            if (query_index >= queries) {
-                continue;
-            }
-            const int visible = start + first_query + query_index + 1;
-            float score = -INFINITY;
-            if (base + lane < visible) {
-                const float* row = q_tile + head_slot * FA_HEAD_STRIDE + query_index * FA_QUERY_STRIDE;
-                float dot = 0.0f;
-                for (int dim = 0; dim < head_dim; ++dim) {
-                    dot += row[dim] * k_tile[dim * FA_KEY_TILE + lane];
+        for (int pair = 0; pair < FA_QUERY_PAIRS; ++pair) {
+            const int query_index = first_of_warp + pair * 2;
+            // The second query of the pair sees exactly one more key than the
+            // first, so the guard is per query even though the load is shared.
+            const int visible_low = start + first_query + query_index + 1;
+            const int visible_high = visible_low + 1;
+            float score_low = -INFINITY;
+            float score_high = -INFINITY;
+            if (base + lane < visible_low || base + lane < visible_high) {
+                const float* low =
+                    q_tile + head_slot * FA_QUERY_TILE * FA_MAX_HEAD_DIM
+                    + query_index * FA_MAX_HEAD_DIM;
+                const float* high = low + FA_MAX_HEAD_DIM;
+                float dot_low = 0.0f;
+                float dot_high = 0.0f;
+                for (int dim = 0; dim < head_dim; dim += FA_DIMS_PER_LANE) {
+                    const float key0 = k_tile[(dim + 0) * FA_KEY_TILE + lane];
+                    const float key1 = k_tile[(dim + 1) * FA_KEY_TILE + lane];
+                    const float key2 = k_tile[(dim + 2) * FA_KEY_TILE + lane];
+                    const float key3 = k_tile[(dim + 3) * FA_KEY_TILE + lane];
+                    const float4 low_values = *reinterpret_cast<const float4*>(low + dim);
+                    const float4 high_values = *reinterpret_cast<const float4*>(high + dim);
+                    dot_low += low_values.x * key0 + low_values.y * key1
+                        + low_values.z * key2 + low_values.w * key3;
+                    dot_high += high_values.x * key0 + high_values.y * key1
+                        + high_values.z * key2 + high_values.w * key3;
                 }
-                score = dot * scale;
+                score_low = base + lane < visible_low ? dot_low * scale : -INFINITY;
+                score_high = base + lane < visible_high ? dot_high * scale : -INFINITY;
             }
-            const float tile_max = warp_max(score);
-            const float new_max = fmaxf(running_max[i], tile_max);
-            const float probability = score == -INFINITY ? 0.0f : expf(score - new_max);
-            const float tile_sum = warp_sum(probability);
-            const float correction = running_max[i] == -INFINITY
+            // The pair shares one key load, but the softmax stays per query.
+            const float low_max = warp_max(score_low);
+            const float high_max = warp_max(score_high);
+            const float new_low = fmaxf(running_max[pair * 2], low_max);
+            const float new_high = fmaxf(running_max[pair * 2 + 1], high_max);
+            const float probability_low =
+                score_low == -INFINITY ? 0.0f : expf(score_low - new_low);
+            const float probability_high =
+                score_high == -INFINITY ? 0.0f : expf(score_high - new_high);
+            const float low_sum = warp_sum(probability_low);
+            const float high_sum = warp_sum(probability_high);
+            const float low_correction = running_max[pair * 2] == -INFINITY
                 ? 0.0f
-                : expf(running_max[i] - new_max);
-            running_sum[i] = running_sum[i] * correction + tile_sum;
-            running_max[i] = new_max;
+                : expf(running_max[pair * 2] - new_low);
+            const float high_correction = running_max[pair * 2 + 1] == -INFINITY
+                ? 0.0f
+                : expf(running_max[pair * 2 + 1] - new_high);
+            running_sum[pair * 2] = running_sum[pair * 2] * low_correction + low_sum;
+            running_sum[pair * 2 + 1] = running_sum[pair * 2 + 1] * high_correction + high_sum;
+            running_max[pair * 2] = new_low;
+            running_max[pair * 2 + 1] = new_high;
             #pragma unroll
             for (int d = 0; d < FA_DIMS_PER_LANE; ++d) {
-                acc[i][d] *= correction;
+                acc[pair * 2][d] *= low_correction;
+                acc[pair * 2 + 1][d] *= high_correction;
             }
-            weight[(head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE + lane] = probability;
+            weight[(head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE + lane] =
+                probability_low;
+            weight[(head_slot * FA_QUERY_TILE + query_index + 1) * FA_KEY_TILE + lane] =
+                probability_high;
         }
         __syncthreads();
 
         #pragma unroll
-        for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
-            const int query_index = first_of_warp + i;
-            if (query_index >= queries) {
-                continue;
-            }
-            const float* probabilities =
+        for (int pair = 0; pair < FA_QUERY_PAIRS; ++pair) {
+            const int query_index = first_of_warp + pair * 2;
+            const float* probabilities_low =
                 weight + (head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE;
+            const float* probabilities_high = probabilities_low + FA_KEY_TILE;
             for (int row = 0; row < keys_here; ++row) {
-                const float probability = probabilities[row];
+                const float probability_low = probabilities_low[row];
+                const float probability_high = probabilities_high[row];
                 const float4 value = *reinterpret_cast<const float4*>(
                     v_tile + row * FA_MAX_HEAD_DIM + lane * FA_DIMS_PER_LANE);
-                acc[i][0] += probability * value.x;
-                acc[i][1] += probability * value.y;
-                acc[i][2] += probability * value.z;
-                acc[i][3] += probability * value.w;
+                acc[pair * 2][0] += probability_low * value.x;
+                acc[pair * 2][1] += probability_low * value.y;
+                acc[pair * 2][2] += probability_low * value.z;
+                acc[pair * 2][3] += probability_low * value.w;
+                acc[pair * 2 + 1][0] += probability_high * value.x;
+                acc[pair * 2 + 1][1] += probability_high * value.y;
+                acc[pair * 2 + 1][2] += probability_high * value.z;
+                acc[pair * 2 + 1][3] += probability_high * value.w;
             }
         }
         __syncthreads();

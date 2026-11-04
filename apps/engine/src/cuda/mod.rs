@@ -51,6 +51,9 @@ const PREFILL_HEADS: usize = 4;
 const PREFILL_WARPS: usize = 8;
 /// Shared memory the tiled attention kernel asks for: four heads of queries, one
 /// key tile, one value tile, and the probabilities.
+/// Shared memory the tiled attention kernel asks for: four heads of queries, one
+/// key tile, one value tile, and the probabilities. Keys and values are key-major
+/// so a lane can pull four dims of its own key in one read.
 const PREFILL_SHARED_BYTES: u32 = 73_728;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
