@@ -55,14 +55,14 @@ const PREFILL_SHARED_BYTES: u32 = 73_728;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
-const MMA_WARPS: usize = 16;
+const MMA_WARPS: usize = 8;
 /// Dynamic shared memory the prompt matmul asks for: weights and activations for
 /// one k chunk, both padded by `MMA_PAD`, plus their per-block scales.
 const MMA_SHARED_BYTES: u32 = 97_280;
 /// Tokens one prompt block can hold, matching `MMA_BLOCK_TOKENS` in the kernel
 /// and the engine's prefill chunk.
 /// Tokens one prompt-matmul block covers, matching `MMA_BLOCK_TOKENS`.
-const MMA_BLOCK_TOKENS: usize = 64;
+const MMA_BLOCK_TOKENS: usize = 128;
 /// Largest prompt the kernel is launched with, matching `PREFILL_CHUNK`.
 const MMA_TOKENS: usize = 1024;
 

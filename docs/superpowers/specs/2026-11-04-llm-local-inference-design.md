@@ -175,7 +175,10 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + chunk prefill 64 → 1024 token, tile token jadi dimensi tercepat di grid (tile bobot tetap di L2) | pp128/512/1024 = 2.813 / 3.000 / 2.557 tok/s | dari 2.190 / 1.880 / 1.576; sebelumnya 2,8 GB bobot dibaca ulang tiap 64 token |
 | + kernel prompt 16 warp, 256 baris/blok, 16 baris/warp (`__launch_bounds__(512)`) | 2.740 / 3.165 / 2.686 tok/s | pp512 +5,5%, pp1024 +5%; 128 register/thread, tanpa spill |
 | - jalur tensor core f16 (dekuantisasi Q8_0 → f16 saat staging) | tidak dipakai | 1,6× lebih lambat (1.893 vs 3.000): dekuantisasi diulang per tile token dan f16 menggandakan trafik shared; presisi juga 3× lebih longgar (3,5e-3 vs 1e-3) |
-| - `cp.async` dua tahap pada bentuk blok 16 warp | belum bisa dipakai | 130 register × 512 thread melebihi berkas register; butuh tile lebih kecil |
+| + tile token kernel prompt 64 → 128 (satu tile bobot di shared untuk 128 token), 8 warp/128 baris, k chunk 256 | pp128/512/1024 = 2.929 / 3.190 / 2.747 tok/s | 178 register tanpa spill, 77.824 byte shared |
+| - `cp.async` dua tahap | tidak dipakai | pada 16 warp 130 register × 512 thread melebihi berkas register; pada bentuk yang muat (8 warp, k chunk 128) hasilnya 2.793 dan test toleransi gagal — lebih lambat dan tidak benar |
+| - tile 128 token dengan k chunk 128 | tidak dipakai | 2.947 / 2.946 / 2.599; k chunk 128 kalah di semua jumlah warp |
+| - pad baris 8 (bukan 16) | tidak dipakai | `ldmatrix` butuh alamat 16-byte, pad 8 memberi stride 264 byte → misaligned address |
 | - `llm-cli bench` mengikuti antarmuka `llama-bench` (`-p`, `-n`, `-r`, `-o json`, `±` deviasi standar) | angka prefill/decode bisa dibandingkan langsung | pp512 1.738 vs 5.890; tg128 63,2 vs 71,2 |
 | catatan | tes golden logits diubah dari "argmax sama" menjadi "argmax ada di 3 teratas referensi" | dua kandidat teratas berjarak 0,003 (kita) dan 0,006 (referensi), sementara selisih forward pass sampai 0,28; urutan keduanya ditentukan pembulatan |
 

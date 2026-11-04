@@ -418,12 +418,12 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
 }
 
 #define MMA_ROWS 16
-#define MMA_WARPS 16
-#define MMA_BLOCK_ROWS 256
+#define MMA_WARPS 8
+#define MMA_BLOCK_ROWS 128
 #define MMA_ROWS_PER_WARP 16
 #define MMA_MINI_TILES (MMA_ROWS_PER_WARP / MMA_ROWS)
-#define MMA_BLOCK_TOKENS 64
-#define MMA_TOKEN_GROUPS 8
+#define MMA_BLOCK_TOKENS 128
+#define MMA_TOKEN_GROUPS 16
 #define MMA_TOKENS_PER_GROUP 8
 #define MMA_CHUNK 256
 #define MMA_CHUNK_BLOCKS (MMA_CHUNK / 32)
@@ -463,10 +463,8 @@ __device__ __forceinline__ void load_a_fragment(int* fragment, const signed char
 //   * both operands sit in shared memory — A is read with ldmatrix.x4, B with the
 //     two-word-per-lane layout — and the per-block scales collapse into one fma
 //     per accumulator element: sum += C * dA * dB.
-// Sixteen warps put 512 threads in the block, so registers have to stay at or
-// below 128 per thread or the launch is refused.
-extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
-                                        const float* __restrict__ weight_scales,
+// Eight warps of sixteen rows, so registers stay inside the file without spilling.
+extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(const float* __restrict__ weight_scales,
                                         const signed char* __restrict__ weight_quants,
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
@@ -496,8 +494,8 @@ extern "C" __global__ __launch_bounds__(32 * MMA_WARPS, 1) void q8_matmul_mma(
     const int group = lane >> 2;
     const int lane4 = lane & 3;
 
-    // Sixteen warps cover the block's rows directly; every warp then walks all
-    // four token groups, so no warp is left holding a row range nobody reads.
+    // Every warp owns sixteen rows outright and walks all sixteen token groups, so
+    // one weight tile staged in shared serves a hundred and twenty-eight tokens.
     const int row_group = warp * MMA_ROWS_PER_WARP;
     const int token_offset = 0;
 
