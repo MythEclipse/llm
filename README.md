@@ -298,6 +298,28 @@ ctx 1024 itu sekitar 2,7 GB per chunk untuk 42 layer. Menaikkan tile query dari 
 ke 32 memangkasnya setengah, tetapi shared memory-nya menjadi 52 KB dan butuh
 dynamic shared memory (`cuFuncSetAttribute`) karena batas statis 48 KB.
 
+### Profil per kernel (`LLM_PROFILE=1`)
+
+`LLM_PROFILE=1` membungkus setiap peluncuran kernel dengan CUDA event dan
+mencetak tabel waktu di dalam GPU saat proses selesai — waktu kernel, bukan waktu
+antre. Untuk satu prefill 512 token:
+
+| Kernel | Total ms | Panggilan | ms/panggilan |
+|---|---:|---:|---:|
+| `q8_matmul_mma` | 81,9 | 294 | 0,279 |
+| `attention_prefill` | 27,8 | 42 | 0,663 |
+| `quantize_rows` | 13,6 | 168 | 0,081 |
+| `silu_mul` | 7,8 | 42 | 0,186 |
+| `residual_add` | 3,5 | 84 | 0,042 |
+| `rmsnorm_rows` | 2,6 | 85 | 0,031 |
+| `rope` | 2,1 | 84 | 0,025 |
+| sisanya | ~1,9 | — | — |
+| **jumlah** | **141,4** | | |
+
+Wall prefill 150 ms, jadi 94% waktunya memang kernel — tidak ada kebocoran di
+antara peluncuran. Matmul berjalan 12,4 TMAC/s di dalam model versus 13,5 TMAC/s
+saat diukur sendirian, jadi jalur itu sudah 92% dari kecepatannya sendiri.
+
 ### Ke mana waktu prefill pergi (pp512, 149 ms)
 
 Diukur dengan mematikan satu bagian sekali jalan, bukan diperkirakan:

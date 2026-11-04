@@ -22,6 +22,9 @@ pub struct Module(pub *mut c_void);
 #[derive(Debug, Clone, Copy)]
 pub struct Function(pub *mut c_void);
 
+/// `CUevent` is an opaque driver pointer.
+pub type Event = *mut c_void;
+
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` from the driver API.
 pub const FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED: i32 = 8;
 
@@ -52,6 +55,13 @@ unsafe extern "C" {
     /// Raises the dynamic shared memory a kernel may ask for. Without it a launch
     /// over 48 KiB fails, which is where the tiled kernels land.
     pub fn cuFuncSetAttribute(function: Function, attribute: i32, value: i32) -> i32;
+    /// Device timestamps, so a kernel can be timed where it runs instead of where
+    /// it is queued.
+    pub fn cuEventCreate(event: *mut Event, flags: u32) -> i32;
+    pub fn cuEventRecord(event: Event, stream: *mut c_void) -> i32;
+    pub fn cuEventSynchronize(event: Event) -> i32;
+    pub fn cuEventElapsedTime(milliseconds: *mut f32, start: Event, end: Event) -> i32;
+    pub fn cuEventDestroy(event: Event) -> i32;
     pub fn cuLaunchKernel(
         function: Function,
         grid_x: u32,

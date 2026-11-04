@@ -13,9 +13,10 @@ use std::ffi::{CString, c_void};
 use std::sync::Mutex;
 
 use sys::{
-    Context, Device, DevicePtr, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module, SUCCESS,
-    cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName,
-    cuDeviceTotalMem_v2, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
+    Context, Device, DevicePtr, Event, FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module,
+    SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetName,
+    cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy, cuEventElapsedTime, cuEventRecord,
+    cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
     cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
     error_message,
 };
@@ -132,6 +133,9 @@ pub struct Gpu {
     weights: Mutex<HashMap<(usize, usize), Resident>>,
     workspace: Mutex<Option<DeviceBuffer>>,
     activation: Mutex<Option<DeviceBuffer>>,
+    names: Vec<(Function, &'static str)>,
+    profile_enabled: bool,
+    profile: Mutex<Option<HashMap<&'static str, (f64, u64)>>>,
 }
 
 impl Gpu {
@@ -173,28 +177,37 @@ impl Gpu {
                 "cuModuleLoadData",
             )?;
 
+            let mut names: Vec<(Function, &'static str)> = Vec::new();
+            let mut load = |name: &'static str| -> Result<Function, EngineError> {
+                let loaded = function(module, name)?;
+                names.push((loaded, name));
+                Ok(loaded)
+            };
             let kernels = Kernels {
-                matmul: function(module, "q8_matmul")?,
+                matmul: load("q8_matmul")?,
                 // The prompt matmul stages a 256-element k chunk, which is 57 KB of
                 // shared memory, so its ceiling is raised once here.
-                matmul_mma: reserve_shared(function(module, "q8_matmul_mma")?, MMA_SHARED_BYTES)?,
-                quantize_rows: function(module, "quantize_rows")?,
-                rmsnorm: function(module, "rmsnorm_rows")?,
-                silu_mul: function(module, "silu_mul")?,
-                residual_add: function(module, "residual_add")?,
-                rope: function(module, "rope")?,
-                kv_append: function(module, "kv_append")?,
-                attention: function(module, "attention")?,
+                matmul_mma: reserve_shared(load("q8_matmul_mma")?, MMA_SHARED_BYTES)?,
+                quantize_rows: load("quantize_rows")?,
+                rmsnorm: load("rmsnorm_rows")?,
+                silu_mul: load("silu_mul")?,
+                residual_add: load("residual_add")?,
+                rope: load("rope")?,
+                kv_append: load("kv_append")?,
+                attention: load("attention")?,
                 attention_prefill: reserve_shared(
-                    function(module, "attention_prefill")?,
+                    load("attention_prefill")?,
                     PREFILL_SHARED_BYTES,
                 )?,
-                attention_split: function(module, "attention_split")?,
-                attention_combine: function(module, "attention_combine")?,
-                embedding: function(module, "embedding_row")?,
+                attention_split: load("attention_split")?,
+                attention_combine: load("attention_combine")?,
+                embedding: load("embedding_row")?,
             };
 
             Ok(Self {
+                names,
+                profile_enabled: std::env::var("LLM_PROFILE").is_ok(),
+                profile: Mutex::new(std::env::var("LLM_PROFILE").ok().map(|_| HashMap::new())),
                 context,
                 kernels,
                 name,
@@ -839,6 +852,16 @@ impl Gpu {
         args: &mut [Arg],
     ) -> Result<(), EngineError> {
         self.bind()?;
+        let start = if self.profile_enabled {
+            let event = self.event()?;
+            // SAFETY: the event was just created and the stream is the default.
+            unsafe {
+                cuEventRecord(event, std::ptr::null_mut());
+            }
+            Some(event)
+        } else {
+            None
+        };
         let mut pointers: Vec<*mut c_void> = args
             .iter_mut()
             .map(|arg| match arg {
@@ -869,7 +892,75 @@ impl Gpu {
                 error_message(status)
             )));
         }
+        if let Some(start) = start {
+            self.record(start, function);
+        }
         Ok(())
+    }
+
+    fn event(&self) -> Result<Event, EngineError> {
+        let mut event: Event = std::ptr::null_mut();
+        // SAFETY: the driver writes one handle into a pointer we own.
+        let status = unsafe { cuEventCreate(&mut event, 0) };
+        if status != 0 {
+            return Err(EngineError::Unsupported(format!(
+                "cuda: cuEventCreate failed with status {status}"
+            )));
+        }
+        Ok(event)
+    }
+
+    /// Closes the window opened before the launch and adds it to the table.
+    fn record(&self, start: Event, function: Function) {
+        let Ok(end) = self.event() else {
+            return;
+        };
+        // SAFETY: both events exist and the stream is the default one.
+        unsafe {
+            cuEventRecord(end, std::ptr::null_mut());
+            cuEventSynchronize(end);
+        }
+        let mut milliseconds = 0.0f32;
+        // SAFETY: two recorded events and one f32 out-parameter.
+        let status = unsafe { cuEventElapsedTime(&mut milliseconds, start, end) };
+        let name = self
+            .names
+            .iter()
+            .find(|(handle, _)| handle.0 == function.0)
+            .map_or("unknown", |(_, name)| *name);
+        if status == 0
+            && let Some(table) = self.profile.lock().expect("profile lock").as_mut()
+        {
+            let slot = table.entry(name).or_insert((0.0, 0));
+            slot.0 += f64::from(milliseconds);
+            slot.1 += 1;
+        }
+        // SAFETY: both events were created here and are no longer used.
+        unsafe {
+            cuEventDestroy(start);
+            cuEventDestroy(end);
+        }
+    }
+
+    /// Prints the table gathered under `LLM_PROFILE` and clears it.
+    pub fn report_profile(&self) {
+        let Some(table) = self.profile.lock().expect("profile lock").take() else {
+            return;
+        };
+        let mut rows: Vec<(&str, f64, u64)> = table
+            .iter()
+            .map(|(name, (ms, calls))| (*name, *ms, *calls))
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f64 = rows.iter().map(|(_, ms, _)| *ms).sum();
+        eprintln!("kernel              total ms   calls   ms/call");
+        for (name, ms, calls) in &rows {
+            eprintln!(
+                "{name:<18} {ms:9.2} {calls:7} {:9.4}",
+                ms / (*calls).max(1) as f64
+            );
+        }
+        eprintln!("{:<18} {total:9.2}", "sum");
     }
 }
 
@@ -881,6 +972,7 @@ unsafe impl Sync for Gpu {}
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        self.report_profile();
         self.weights.lock().expect("weight cache lock").clear();
         // SAFETY: the context was created by this struct and is destroyed once.
         unsafe {

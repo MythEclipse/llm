@@ -103,7 +103,7 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
         });
     }
 
-    for &generation in &options.generations {
+    for &generation in options.generations.iter().filter(|&&count| count > 0) {
         let tokens = repeat_to(&filler, TG_PROMPT);
         let mut samples = Vec::with_capacity(options.repeats);
         for _ in 0..options.repeats {
