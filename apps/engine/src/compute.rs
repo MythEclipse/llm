@@ -363,22 +363,22 @@ impl Compute {
                 Activation::Device(v),
                 Activation::Device(target),
                 Activation::Device(scratch),
-            ) => gpu.attention(
-                q,
-                k,
-                v,
-                target,
-                scratch,
-                AttentionGeometry {
+            ) => {
+                let geometry = AttentionGeometry {
                     n_head: spec.n_head,
                     n_head_kv: spec.n_head_kv,
                     head_dim: spec.head_dim,
                     scores_stride: spec.scores_stride,
                     scale: spec.scale,
-                },
-                start,
-                tokens,
-            ),
+                };
+                if tokens == 1 {
+                    // Decode: one token has no batch to hide latency behind, so
+                    // the positions are spread over blocks instead.
+                    gpu.attention_split(q, k, v, target, geometry, start + tokens)
+                } else {
+                    gpu.attention(q, k, v, target, scratch, geometry, start, tokens)
+                }
+            }
             (
                 None,
                 Activation::Host(q),

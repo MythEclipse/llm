@@ -27,6 +27,20 @@ const LANES: u32 = 32;
 const WARPS: u32 = 8;
 /// Four warps per attention block, matching `ATTENTION_WARPS` in the kernel.
 const ATTENTION_THREADS: u32 = 128;
+/// Positions per attention block on the decode path, and the shared window the
+/// kernel reserves per block.
+const SPLIT_POSITIONS: usize = 64;
+const MAX_SPLIT_POSITIONS: usize = 256;
+const MAX_SPLITS: usize = 1024;
+
+/// Enough blocks to fill the device, and never a window wider than the kernel's
+/// shared array — the second bound is what keeps long contexts legal.
+fn split_count(visible: usize) -> usize {
+    let wanted = visible.div_ceil(SPLIT_POSITIONS).max(1);
+    let required = visible.div_ceil(MAX_SPLIT_POSITIONS).max(1);
+    wanted.max(required).min(MAX_SPLITS)
+}
+
 /// Output rows per block on the prompt path, matching `ROWS_PER_BLOCK`.
 const ROWS_PER_BLOCK: usize = 4;
 
@@ -63,6 +77,8 @@ struct Kernels {
     rope: Function,
     kv_append: Function,
     attention: Function,
+    attention_split: Function,
+    attention_combine: Function,
     embedding: Function,
 }
 
@@ -84,6 +100,7 @@ pub struct Gpu {
     name: String,
     total_bytes: usize,
     weights: Mutex<HashMap<(usize, usize), Resident>>,
+    workspace: Mutex<Option<DeviceBuffer>>,
 }
 
 impl Gpu {
@@ -134,6 +151,8 @@ impl Gpu {
                 rope: function(module, "rope")?,
                 kv_append: function(module, "kv_append")?,
                 attention: function(module, "attention")?,
+                attention_split: function(module, "attention_split")?,
+                attention_combine: function(module, "attention_combine")?,
                 embedding: function(module, "embedding_row")?,
             };
 
@@ -143,6 +162,7 @@ impl Gpu {
                 name,
                 total_bytes,
                 weights: Mutex::new(HashMap::new()),
+                workspace: Mutex::new(None),
             })
         }
     }
@@ -452,6 +472,86 @@ impl Gpu {
             0,
             &mut args,
         )
+    }
+
+    /// Decode attention: positions split across blocks, then combined.
+    pub fn attention_split(
+        &self,
+        query: &DeviceBuffer,
+        keys: &DeviceBuffer,
+        values: &DeviceBuffer,
+        out: &DeviceBuffer,
+        geometry: AttentionGeometry,
+        visible: usize,
+    ) -> Result<(), EngineError> {
+        let splits = split_count(visible);
+        let positions = visible.div_ceil(splits);
+        assert!(
+            positions <= MAX_SPLIT_POSITIONS,
+            "visible positions per block exceed the shared window"
+        );
+        let heads = geometry.n_head;
+        let floats = heads * splits * geometry.head_dim + heads * splits * 2;
+        let workspace = self.workspace(floats)?;
+
+        let mut args = [
+            Arg::Pointer(query.pointer),
+            Arg::Pointer(keys.pointer),
+            Arg::Pointer(values.pointer),
+            Arg::Pointer(workspace),
+            Arg::Pointer(shifted(workspace, heads * splits * geometry.head_dim)),
+            Arg::Pointer(shifted(
+                workspace,
+                heads * splits * geometry.head_dim + heads * splits,
+            )),
+            Arg::Int(geometry.n_head as i32),
+            Arg::Int(geometry.n_head_kv as i32),
+            Arg::Int(geometry.head_dim as i32),
+            Arg::Int(visible as i32),
+            Arg::Int(splits as i32),
+            Arg::Float(geometry.scale),
+        ];
+        self.launch(
+            self.kernels.attention_split,
+            (heads as u32, splits as u32, 1),
+            (ATTENTION_THREADS, 1, 1),
+            (positions * 4) as u32,
+            &mut args,
+        )?;
+
+        let mut combine_args = [
+            Arg::Pointer(workspace),
+            Arg::Pointer(shifted(workspace, heads * splits * geometry.head_dim)),
+            Arg::Pointer(shifted(
+                workspace,
+                heads * splits * geometry.head_dim + heads * splits,
+            )),
+            Arg::Pointer(out.pointer),
+            Arg::Int(geometry.head_dim as i32),
+            Arg::Int(splits as i32),
+        ];
+        self.launch(
+            self.kernels.attention_combine,
+            (heads as u32, 1, 1),
+            (ATTENTION_THREADS, 1, 1),
+            0,
+            &mut combine_args,
+        )
+    }
+
+    /// Scratch that survives between launches, so a per-layer call does not
+    /// allocate. Grows to the largest request and is reused after that.
+    fn workspace(&self, floats: usize) -> Result<DevicePtr, EngineError> {
+        let mut slot = self.workspace.lock().expect("workspace lock");
+        if let Some(buffer) = slot.as_ref()
+            && buffer.len() >= floats
+        {
+            return Ok(buffer.pointer);
+        }
+        let buffer = self.alloc(floats)?;
+        let pointer = buffer.pointer;
+        *slot = Some(buffer);
+        Ok(pointer)
     }
 
     pub fn embedding(

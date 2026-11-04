@@ -15,7 +15,7 @@ pub mod session;
 pub mod tensor;
 pub mod tokenizer;
 
-pub use compute::Compute;
+pub use compute::{Activation, AttentionSpec, Compute};
 pub use error::EngineError;
 pub use generate::{Event, GenerationRequest, RunStats, StopReason, generate};
 pub use gguf::{DType, GgufFile, TensorInfo};

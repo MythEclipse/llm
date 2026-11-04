@@ -359,6 +359,126 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     return result;
 }
 
+// Decode attention, split across blocks: one block owns one head and one slice
+// of the visible positions, so a 16-head model still fills 20 SMs at long
+// context instead of launching 16 blocks that each walk the whole KV serially.
+//
+// Each block emits a normalised partial sum plus its own max and sum, and the
+// combine kernel rescales them by exp(max_i - max). That is the same arithmetic
+// as a single-pass softmax, only summed in a different order.
+#define MAX_SPLIT_POSITIONS 256
+
+extern "C" __global__ void attention_split(const float* __restrict__ query,
+                                           const float* __restrict__ keys,
+                                           const float* __restrict__ values,
+                                           float* __restrict__ partial_acc,
+                                           float* __restrict__ partial_max,
+                                           float* __restrict__ partial_sum,
+                                           int n_head, int n_head_kv, int head_dim,
+                                           int visible, int splits, float scale) {
+    extern __shared__ float weights[];
+    __shared__ float scratch[ATTENTION_WARPS];
+    __shared__ float partial[ATTENTION_WARPS][MAX_HEAD_DIM];
+
+    const int head = blockIdx.x;
+    const int split = blockIdx.y;
+    const int kv_head = head / (n_head / n_head_kv);
+    const int kv_dim = n_head_kv * head_dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int elements = head_dim / 32;
+
+    const int per_split = (visible + splits - 1) / splits;
+    const int begin = split * per_split;
+    const int end = min(begin + per_split, visible);
+    const float* query_head = query + (size_t)head * head_dim;
+
+    float local_max = -INFINITY;
+    for (int offset = begin + warp; offset < end; offset += ATTENTION_WARPS) {
+        const float* key = keys + (size_t)offset * kv_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int i = lane; i < head_dim; i += 32) {
+            dot += query_head[i] * key[i];
+        }
+        dot = warp_sum(dot);
+        if (lane == 0) {
+            const float score = dot * scale;
+            weights[offset - begin] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+    __syncthreads();
+    if (end > begin) {
+        local_max = block_max(local_max, scratch);
+    }
+    __syncthreads();
+
+    float accumulator[4];
+    #pragma unroll
+    for (int element = 0; element < 4; ++element) {
+        accumulator[element] = 0.0f;
+    }
+    float total = 0.0f;
+    for (int offset = begin + warp; offset < end; offset += ATTENTION_WARPS) {
+        float weight = 0.0f;
+        if (lane == 0) {
+            weight = expf(weights[offset - begin] - local_max);
+            weights[offset - begin] = weight;
+            total += weight;
+        }
+        weight = __shfl_sync(0xffffffffu, weight, 0);
+        const float* value = values + (size_t)offset * kv_dim + kv_head * head_dim;
+        for (int element = 0; element < elements; ++element) {
+            accumulator[element] += weight * value[lane + element * 32];
+        }
+    }
+    for (int element = 0; element < elements; ++element) {
+        partial[warp][lane + element * 32] = accumulator[element];
+    }
+    total = block_sum(total, scratch);
+    __syncthreads();
+
+    const size_t base = ((size_t)head * splits + split) * head_dim;
+    if (threadIdx.x < head_dim) {
+        float sum = 0.0f;
+        for (int source = 0; source < ATTENTION_WARPS; ++source) {
+            sum += partial[source][threadIdx.x];
+        }
+        partial_acc[base + threadIdx.x] = sum;
+    }
+    if (threadIdx.x == 0) {
+        partial_max[(size_t)head * splits + split] = local_max;
+        partial_sum[(size_t)head * splits + split] = total;
+    }
+}
+
+extern "C" __global__ void attention_combine(const float* __restrict__ partial_acc,
+                                             const float* __restrict__ partial_max,
+                                             const float* __restrict__ partial_sum,
+                                             float* __restrict__ out,
+                                             int head_dim, int splits) {
+    const int head = blockIdx.x;
+    if (threadIdx.x >= head_dim) {
+        return;
+    }
+    float global_max = -INFINITY;
+    for (int split = 0; split < splits; ++split) {
+        global_max = fmaxf(global_max, partial_max[(size_t)head * splits + split]);
+    }
+    float denominator = 0.0f;
+    float numerator = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        const size_t index = (size_t)head * splits + split;
+        // The partial sums are unnormalised, so the split's weight is its own
+        // sum rescaled against the global max: numerator and denominator both
+        // scale by it, and only the denominator carries the sum.
+        const float factor = expf(partial_max[index] - global_max);
+        denominator += partial_sum[index] * factor;
+        numerator += partial_acc[index * head_dim + threadIdx.x] * factor;
+    }
+    out[(size_t)head * head_dim + threadIdx.x] = numerator / denominator;
+}
+
 extern "C" __global__ void attention(const float* __restrict__ query,
                                      const float* __restrict__ keys,
                                      const float* __restrict__ values,
