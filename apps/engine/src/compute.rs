@@ -33,6 +33,8 @@ impl Activation {
 /// Attention geometry for one launch.
 /// Head dimension the tiled prefill attention kernel is written for.
 const PREFILL_HEAD_DIM: usize = 128;
+/// Heads one prefill attention block serves; they must all share one KV head.
+const PREFILL_HEADS: usize = 4;
 
 pub struct AttentionSpec {
     pub n_head: usize,
@@ -378,7 +380,10 @@ impl Compute {
                     // Decode: one token has no batch to hide latency behind, so
                     // the positions are spread over blocks instead.
                     gpu.attention_split(q, k, v, target, geometry, start + tokens)
-                } else if spec.head_dim == PREFILL_HEAD_DIM {
+                } else if spec.head_dim == PREFILL_HEAD_DIM
+                    && spec.n_head.is_multiple_of(PREFILL_HEADS)
+                    && (spec.n_head / spec.n_head_kv).is_multiple_of(PREFILL_HEADS)
+                {
                     // Prefill: sixteen queries per block, keys and values staged
                     // in shared memory, softmax kept online.
                     gpu.attention_prefill(q, k, v, target, geometry, start, tokens)

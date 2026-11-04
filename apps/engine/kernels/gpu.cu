@@ -618,21 +618,28 @@ extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales
 }
 
 // Prefill attention, tiled the way ggml's fattn-tile does it: one block per head
-// and per sixteen query positions, keys and values staged in shared memory
+// group and per sixteen query positions, keys and values staged in shared memory
 // thirty-two positions at a time, and the softmax kept online so nothing of size
-// `visible` is ever materialised. The serial kernel it replaces launched one block
-// per (head, token) and wrote every score row through global memory, which made a
-// 64-token prompt at context 1024 spend about half its prefill time there.
+// `visible` is ever materialised.
 //
-// Keys are staged transposed, dim-major, so a lane reads k_tile[dim][lane] and the
-// whole warp touches thirty-two different banks; keeping them row-major instead
-// gives every lane the same bank and serialises the read.
+// The head group is what makes it cheap. Sixteen heads share two KV heads, so
+// serving one head per block read the same K/V rows eight times over; four heads
+// to a block cuts that to two, and the staged tile is then the only copy.
+//
+// Keys are staged transposed, dim-major: a lane reads k_tile[dim][lane] and the
+// warp touches thirty-two different banks, where row-major would put every lane on
+// the same bank. Because a lane owns one key outright, a score needs no warp
+// reduction.
+#define FA_HEADS 4
 #define FA_QUERY_TILE 16
 #define FA_KEY_TILE 32
-#define FA_WARPS 4
-#define FA_QUERIES_PER_WARP (FA_QUERY_TILE / FA_WARPS)
+#define FA_WARPS 8
+#define FA_WARPS_PER_HEAD (FA_WARPS / FA_HEADS)
+#define FA_QUERIES_PER_WARP (FA_QUERY_TILE / FA_WARPS_PER_HEAD)
 #define FA_MAX_HEAD_DIM 128
 #define FA_DIMS_PER_LANE 4
+#define FA_QUERY_STRIDE (FA_MAX_HEAD_DIM)
+#define FA_HEAD_STRIDE (FA_QUERY_TILE * FA_MAX_HEAD_DIM)
 
 extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                                             const float* __restrict__ keys,
@@ -640,30 +647,41 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
                                             float* __restrict__ out,
                                             int n_head, int n_head_kv, int head_dim,
                                             int start, int tokens, float scale) {
-    __shared__ float q_tile[FA_QUERY_TILE][FA_MAX_HEAD_DIM];
-    __shared__ float k_tile[FA_MAX_HEAD_DIM][FA_KEY_TILE];
-    __shared__ float v_tile[FA_KEY_TILE][FA_MAX_HEAD_DIM];
-    __shared__ float weight[FA_QUERY_TILE][FA_KEY_TILE];
+    // Same declaration type as the prompt matmul's dynamic block; the compiler
+    // wants one `extern __shared__` type per translation unit.
+    extern __shared__ __align__(16) signed char smem[];
+    float* q_tile = reinterpret_cast<float*>(smem);
+    float* k_tile = q_tile + FA_HEADS * FA_HEAD_STRIDE;
+    float* v_tile = k_tile + FA_MAX_HEAD_DIM * FA_KEY_TILE;
+    float* weight = v_tile + FA_KEY_TILE * FA_MAX_HEAD_DIM;
 
-    const int head = blockIdx.x;
+    const int group = blockIdx.x;
     const int tile = blockIdx.y;
-    const int kv_head = head / (n_head / n_head_kv);
+    const int heads_per_kv = n_head / n_head_kv;
+    const int kv_head = (group * FA_HEADS) / heads_per_kv;
     const int kv_dim = n_head_kv * head_dim;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int threads = blockDim.x;
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int threads = blockDim.x * blockDim.y;
+    const int tid = warp * blockDim.x + lane;
+    const int head_slot = warp / FA_WARPS_PER_HEAD;
+    const int head = group * FA_HEADS + head_slot;
     const int first_query = tile * FA_QUERY_TILE;
     const int queries = min(FA_QUERY_TILE, tokens - first_query);
     if (queries <= 0) {
         return;
     }
 
-    for (int index = threadIdx.x; index < queries * head_dim; index += threads) {
-        const int row = index / head_dim;
-        const int dim = index % head_dim;
-        q_tile[row][dim] = query[((size_t)(first_query + row) * n_head + head) * head_dim + dim];
+    for (int index = tid; index < FA_HEADS * queries * head_dim; index += threads) {
+        const int slot = index / (queries * head_dim);
+        const int rest = index % (queries * head_dim);
+        const int row = rest / head_dim;
+        const int dim = rest % head_dim;
+        q_tile[slot * FA_HEAD_STRIDE + row * FA_QUERY_STRIDE + dim] =
+            query[((size_t)(first_query + row) * n_head + group * FA_HEADS + slot) * head_dim + dim];
     }
 
+    const int first_of_warp = (warp % FA_WARPS_PER_HEAD) * FA_QUERIES_PER_WARP;
     float acc[FA_QUERIES_PER_WARP][FA_DIMS_PER_LANE];
     float running_max[FA_QUERIES_PER_WARP];
     float running_sum[FA_QUERIES_PER_WARP];
@@ -681,29 +699,28 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
     const int max_visible = start + min(first_query + queries, tokens);
     for (int base = 0; base < max_visible; base += FA_KEY_TILE) {
         const int keys_here = min(FA_KEY_TILE, max_visible - base);
-        for (int index = threadIdx.x; index < keys_here * head_dim; index += threads) {
+        for (int index = tid; index < keys_here * head_dim; index += threads) {
             const int row = index / head_dim;
             const int dim = index % head_dim;
             const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
-            k_tile[dim][row] = keys[source];
-            v_tile[row][dim] = values[source];
+            k_tile[dim * FA_KEY_TILE + row] = keys[source];
+            v_tile[row * FA_MAX_HEAD_DIM + dim] = values[source];
         }
         __syncthreads();
 
-        // One lane per key: the lane walks the whole head dimension, so no warp
-        // reduction is needed to finish a score.
         #pragma unroll
         for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
-            const int query_index = warp * FA_QUERIES_PER_WARP + i;
+            const int query_index = first_of_warp + i;
             if (query_index >= queries) {
                 continue;
             }
             const int visible = start + first_query + query_index + 1;
             float score = -INFINITY;
             if (base + lane < visible) {
+                const float* row = q_tile + head_slot * FA_HEAD_STRIDE + query_index * FA_QUERY_STRIDE;
                 float dot = 0.0f;
                 for (int dim = 0; dim < head_dim; ++dim) {
-                    dot += q_tile[query_index][dim] * k_tile[dim][lane];
+                    dot += row[dim] * k_tile[dim * FA_KEY_TILE + lane];
                 }
                 score = dot * scale;
             }
@@ -720,20 +737,22 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
             for (int d = 0; d < FA_DIMS_PER_LANE; ++d) {
                 acc[i][d] *= correction;
             }
-            weight[query_index][lane] = probability;
+            weight[(head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE + lane] = probability;
         }
         __syncthreads();
 
         #pragma unroll
         for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
-            const int query_index = warp * FA_QUERIES_PER_WARP + i;
+            const int query_index = first_of_warp + i;
             if (query_index >= queries) {
                 continue;
             }
+            const float* probabilities =
+                weight + (head_slot * FA_QUERY_TILE + query_index) * FA_KEY_TILE;
             for (int row = 0; row < keys_here; ++row) {
-                const float probability = weight[query_index][row];
-                const float4 value =
-                    *reinterpret_cast<const float4*>(&v_tile[row][lane * FA_DIMS_PER_LANE]);
+                const float probability = probabilities[row];
+                const float4 value = *reinterpret_cast<const float4*>(
+                    v_tile + row * FA_MAX_HEAD_DIM + lane * FA_DIMS_PER_LANE);
                 acc[i][0] += probability * value.x;
                 acc[i][1] += probability * value.y;
                 acc[i][2] += probability * value.z;
@@ -745,7 +764,7 @@ extern "C" __global__ void attention_prefill(const float* __restrict__ query,
 
     #pragma unroll
     for (int i = 0; i < FA_QUERIES_PER_WARP; ++i) {
-        const int query_index = warp * FA_QUERIES_PER_WARP + i;
+        const int query_index = first_of_warp + i;
         if (query_index >= queries) {
             continue;
         }

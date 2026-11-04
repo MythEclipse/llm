@@ -135,9 +135,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 2.104 tok/s (0,06 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 1.738 tok/s (0,29 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 1.378 tok/s (0,74 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 2.190 tok/s (0,06 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (15,9 ms) | 15,6 tok/s (64,1 ms) | 1.880 tok/s (0,27 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 1.576 tok/s (0,65 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -280,6 +280,26 @@ ctx 1024 itu sekitar 2,7 GB per chunk untuk 42 layer. Menaikkan tile query dari 
 ke 32 memangkasnya setengah, tetapi shared memory-nya menjadi 52 KB dan butuh
 dynamic shared memory (`cuFuncSetAttribute`) karena batas statis 48 KB.
 
+### Attention prefill: empat head per blok
+
+Enam belas head berbagi dua KV head, jadi satu blok per head membaca baris K/V
+yang sama delapan kali. Satu blok sekarang melayani empat head yang pasti berbagi
+satu KV head (`FA_HEADS`), dengan delapan warp: dua warp per head, masing-masing
+delapan posisi query. Tile K/V di shared memory jadi satu-satunya salinan, dan
+pembacaan K/V per chunk turun dari 16 blok-baca menjadi 4.
+
+Shared memory yang dibutuhkan 72 KB (query empat head 32 KB, K 16 KB, V 16 KB,
+probabilitas 8 KB), jadi kernel ini memakai alokasi dinamis dan
+`cuFuncSetAttribute` — sama seperti kernel prompt.
+
+Hasilnya pp128 2.104 → 2.190 tok/s, pp512 1.738 → 1.880, pp1024 1.378 → 1.576.
+Decode tidak tersentuh. Diverifikasi terhadap referensi host: selisih maksimum
+4,5e-7 pada 40 token, 16 head, dengan `start = 32`.
+
+Delapan head per blok (K/V tinggal dibaca dua kali per chunk) butuh 112 KB dan
+melewati batas 99 KB per blok di sm_89, jadi langkah itu menunggu tile query yang
+lebih kecil atau query dalam f16.
+
 ### Attention decode: posisi dipecah antar blok
 
 Model ini punya 16 head, jadi satu blok per head hanya memberi 16 blok — di kartu
@@ -334,9 +354,9 @@ ada proses lain yang memakai GPU.
 
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 2.104 ± 31 tok/s | 4.546 ± 482 tok/s | 46% |
-| pp512 | 1.738 ± 1,4 tok/s | 5.890 ± 161 tok/s | 30% |
-| pp1024 | 1.378 ± 0,8 tok/s | 5.796 ± 187 tok/s | 24% |
+| pp128 | 2.190 ± 10 tok/s | 4.546 ± 482 tok/s | 48% |
+| pp512 | 1.880 ± 1,7 tok/s | 5.890 ± 161 tok/s | 32% |
+| pp1024 | 1.576 ± 1,9 tok/s | 5.796 ± 187 tok/s | 27% |
 | tg128 | **63,2 ± 0,02 tok/s** | 71,2 ± 0,03 tok/s | 89% |
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
@@ -352,8 +372,8 @@ Bacaan jujurnya:
 - **Decode sepadan**: 89% dan kurvanya rata terhadap konteks seperti llama.cpp.
   Selisihnya ongkos repack (1,125 vs 1,0625 byte per parameter) ditambah attention
   yang belum di-tile dengan cara yang sama.
-- **Prefill 2–4× tertinggal**, dan selisihnya melebar dengan konteks: 46% pada
-  128 token, 30% pada 512, 24% pada 1024. Dua penyebab yang sudah terukur:
+- **Prefill 2–3,7× tertinggal**, dan selisihnya melebar dengan konteks: 48% pada
+  128 token, 32% pada 512, 27% pada 1024. Dua penyebab yang sudah terukur:
   matmul sendirian berjalan 5,5 TMAC/s sedangkan prefill llama.cpp setara
   ≈7,5 TMAC/s, dan attention prefill membaca ulang K/V untuk setiap blok query.
 - **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks

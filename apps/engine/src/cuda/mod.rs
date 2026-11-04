@@ -44,8 +44,14 @@ fn split_count(visible: usize) -> usize {
 
 /// Query positions per prefill attention block, matching `FA_QUERY_TILE`.
 const PREFILL_QUERY_TILE: usize = 16;
-/// Threads per prefill attention block, matching `FA_WARPS` times the warp size.
-const PREFILL_THREADS: u32 = 128;
+/// Heads per prefill attention block, matching `FA_HEADS`: four heads that share
+/// one KV head, so the staged keys and values are read once instead of four times.
+const PREFILL_HEADS: usize = 4;
+/// Warps per prefill attention block, matching `FA_WARPS`.
+const PREFILL_WARPS: usize = 8;
+/// Shared memory the tiled attention kernel asks for: four heads of queries, one
+/// key tile, one value tile, and the probabilities.
+const PREFILL_SHARED_BYTES: u32 = 73_728;
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
@@ -170,7 +176,10 @@ impl Gpu {
                 rope: function(module, "rope")?,
                 kv_append: function(module, "kv_append")?,
                 attention: function(module, "attention")?,
-                attention_prefill: function(module, "attention_prefill")?,
+                attention_prefill: reserve_shared(
+                    function(module, "attention_prefill")?,
+                    PREFILL_SHARED_BYTES,
+                )?,
                 attention_split: function(module, "attention_split")?,
                 attention_combine: function(module, "attention_combine")?,
                 embedding: function(module, "embedding_row")?,
@@ -489,12 +498,12 @@ impl Gpu {
         self.launch(
             self.kernels.attention_prefill,
             (
-                geometry.n_head as u32,
+                geometry.n_head.div_ceil(PREFILL_HEADS) as u32,
                 tokens.div_ceil(PREFILL_QUERY_TILE) as u32,
                 1,
             ),
-            (PREFILL_THREADS, 1, 1),
-            0,
+            (LANES, PREFILL_WARPS as u32, 1),
+            PREFILL_SHARED_BYTES,
             &mut args,
         )
     }
