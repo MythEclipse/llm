@@ -162,6 +162,8 @@ Keputusan yang diambil dari pengukuran, bukan dari selera:
 | + repack Q8_0 jadi `scales[] + quants[]` sejajar 32 byte | 15,4 ms/token | decode 91% dari lantai bandwidth (14 ms); 8 kuantisasi per load 64-bit |
 | + jalur prompt 4 baris × 8 token, k dipecah 1024 | prefill 278 tok/s | satu baca shared = 32 MAC; 242 tok/s pada ctx 1024 |
 | + attention decode dipecah antar blok (flash-decoding) | 16,6 ms @ ctx 1024 | dari 26,2 ms; kurva decode rata 15,5 → 20,3 ms sampai ctx 4090 |
+| + aktivasi dikuantisasi ke q8_0, dot int8×int8 (maddubs / dp4a) | prefill 534 tok/s @ ctx 128 | dari 275; CPU 28 → 35 tok/s; sisa selisih ke llama.cpp ada di tensor core |
+| + tile bobot disalin per 16 byte dan lewat cp.async dua tahap | 1,4× pada matmul | salinan per 1 byte hanya 25 GB/s; cp.async sendiri tidak menambah apa pun di titik ini |
 
 Catatan jalur prompt: `__syncthreads` di dalam loop chunk mengharuskan **semua**
 warp menjalankan jumlah iterasi yang sama. Versi pertama memakai

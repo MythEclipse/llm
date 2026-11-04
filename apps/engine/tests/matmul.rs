@@ -45,6 +45,34 @@ fn activations(n: usize) -> Vec<f32> {
     (0..n * K).map(|i| (i as f32 * 0.017).sin()).collect()
 }
 
+/// The batched path quantizes each activation row to int8 first, exactly as ggml
+/// does, so the reference has to quantize too. Comparing it against the f32 dot
+/// instead would only be measuring that difference.
+fn quantized_reference(data: &[u8], x: &[f32], n: usize) -> Vec<f32> {
+    let blocks = K / 32;
+    let mut quants = vec![0i8; K];
+    let mut scales = vec![0.0f32; blocks];
+    let mut y = vec![0.0f32; n * OUT];
+    for t in 0..n {
+        llm_engine::quant::quantize_q8_0(&x[t * K..(t + 1) * K], &mut quants, &mut scales);
+        for o in 0..OUT {
+            let base = o * Q8_0_BLOCK_BYTES;
+            let scale = f16::from_bits(u16::from_le_bytes([data[base], data[base + 1]])).to_f32();
+            let mut sum = 0.0f64;
+            for block in 0..blocks {
+                let mut inner = 0i64;
+                for i in 0..32 {
+                    let q = data[base + 2 + block * 32 + i] as i8 as i64;
+                    inner += q * quants[block * 32 + i] as i64;
+                }
+                sum += inner as f64 * scales[block] as f64;
+            }
+            y[t * OUT + o] = (scale as f64 * sum) as f32;
+        }
+    }
+    y
+}
+
 #[test]
 fn decode_step_matches_reference() {
     let data = quantized_matrix();
@@ -70,14 +98,14 @@ fn prefill_batch_matches_reference() {
 
     matmul(&weight, &x, n, &mut y);
 
-    let expected = reference(&data, &x, n);
+    let expected = quantized_reference(&data, &x, n);
     for (actual, want) in y.iter().zip(&expected) {
         assert!((actual - want).abs() < 1e-3, "got {actual}, want {want}");
     }
 }
 
 #[test]
-fn batch_and_single_agree_token_by_token() {
+fn batch_and_single_agree_up_to_activation_quantization() {
     let data = quantized_matrix();
     let weight = Weight::new(DType::Q8_0, K, OUT, &data);
     let n = 3;
@@ -89,8 +117,19 @@ fn batch_and_single_agree_token_by_token() {
     for t in 0..n {
         let mut single = vec![0.0f32; OUT];
         matmul(&weight, &x[t * K..(t + 1) * K], 1, &mut single);
+        // Decode keeps the activation in f32 and prefill rounds it to int8, so
+        // these differ by one quantization step — the same asymmetry llama.cpp
+        // has between its gemv and batched paths. The step scales with the row,
+        // hence a tolerance taken from the largest output of that token.
+        let row = single
+            .iter()
+            .fold(0.0f32, |peak, value| peak.max(value.abs()));
         for o in 0..OUT {
-            assert!((single[o] - batched[t * OUT + o]).abs() < 1e-6);
+            let tolerance = 0.02 * row.max(1.0);
+            assert!(
+                (single[o] - batched[t * OUT + o]).abs() < tolerance,
+                "token {t} output {o}: single {single:?} batched {batched:?}"
+            );
         }
     }
 }

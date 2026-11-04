@@ -128,9 +128,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,2 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 277 tok/s (0,46 s) | 30 tok/s (4,26 s) |
-| 512 token | **62,6 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 260 tok/s (1,97 s) | 27 tok/s (18,8 s) |
-| 1024 token | **60,1 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 244 tok/s (4,20 s) | 23 tok/s (44,6 s) |
+| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 534 tok/s (0,24 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,7 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 491 tok/s (1,04 s) | 30 tok/s (16,7 s) |
+| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 444 tok/s (2,31 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -164,6 +164,37 @@ load `float4` untuk aktivasi. Hasilnya 15,4 ms/token (≈174 GB/s efektif).
 
 Harganya: 1,125 byte per parameter, bukan 1,0625 — VRAM bobot naik dari 2,68 GB
 ke ±2,83 GB, dan repack menambah ±0,4 s saat load.
+
+### Prefill: int8 × int8, seperti ggml
+
+Selisih prefill sebelumnya 16× karena kelas algoritmanya beda, bukan karena
+kurang tuning: versi lama men-dequant setiap bobot ke f32 lalu mengalikannya
+dengan FMA, sedangkan ggml mengkuantisasi aktivasi ke q8_0 dan mengalikan int8
+dengan int8. Yang diport dari llama.cpp:
+
+- `quantize_row_q8_0` (ggml/src/ggml-cpu/arch/x86/quants.c) — satu skala f32 per
+  32 elemen, `q = round(x·127/amax)`;
+- `ggml_vec_dot_q8_0_q8_0` — `_mm256_sign_epi8` + `_mm256_maddubs_epi16` +
+  `_mm256_madd_epi16`, jadi 32 perkalian per pasang instruksi, bukan 8;
+- `mmq` (ggml/src/ggml-cuda/mmq.cuh) — `__dp4a` di GPU, tile 4 baris di shared
+  memory sebagai int8, dan salinan tile lewat `cp.async` dua tahap supaya tile
+  berikutnya sudah dalam perjalanan saat tile sekarang dikalikan.
+
+Hasilnya prefill GPU 275 → 534 tok/s pada konteks 128 (dan 235 → 824 tok/s lewat
+CLI pada prompt 215 token), CPU 28 → 35 tok/s. Decode tidak tersentuh.
+
+Yang belum, dan ini yang menjelaskan sisa selisihnya: ggml memakai tensor core
+(`mma.sync.m16n8k32.s8`) untuk Q8_0 di sm_80+, bukan `dp4a`. Angkanya bisa
+dihitung: prefill 5.836 tok/s × 2,58 GFLOP/token ≈ 15 TFLOP/s, sedangkan matmul
+di sini mencapai 1,3–1,9 TMAC/s. Jadi sisa 4–6× itu ada di tensor core, bukan di
+jalur memori atau di pengaturan tile.
+
+Empat percobaan yang **tidak** menolong, dicatat supaya tidak diulang: memecah
+rantai 8 `dp4a` menjadi 16 akumulator independen (0%), mengubah granularitas lane
+dari 16 ke 32 byte (0%), mengganti staging sinkron menjadi `cp.async` dua tahap
+(0%). Yang menolong: salinan tile per 16 byte, bukan per 1 byte (1,4×; satu byte
+per instruksi hanya memberi warp 32 byte berguna per transaksi, dan pembacaan
+bobot jatuh ke 25 GB/s).
 
 ### Attention decode: posisi dipecah antar blok
 
@@ -226,10 +257,10 @@ sama diulang lima kali):
 
 | Prompt | Metrik | llm GPU | llama.cpp GPU | llm CPU | llama.cpp CPU |
 |---|---|---:|---:|---:|---:|
-| 215 token | Prompt | 235 tok/s | 3.703–4.073 tok/s | 24,5 tok/s | 64,3 tok/s |
-| 215 token | Generation | 62,1 tok/s | 68,4–68,6 tok/s | 14,5 tok/s | 19,2 tok/s |
-| 1071 token | Prompt | 239 tok/s | 5.013–5.183 tok/s | 18,7 tok/s | 70,8 tok/s |
-| 1071 token | Generation | 59,2 tok/s | 67,4–67,5 tok/s | 7,4 tok/s | 19,3 tok/s |
+| 215 token | Prompt | 824 tok/s | 3.743–4.263 tok/s | 31,0 tok/s | 78,3 tok/s |
+| 215 token | Generation | 62,2 tok/s | 69,0 tok/s | 16,4 tok/s | 22,7 tok/s |
+| 1071 token | Prompt | 664 tok/s | 5.346–5.401 tok/s | 24,8 tok/s | 74,5 tok/s |
+| 1071 token | Generation | 59,3 tok/s | 67,9 tok/s | 6,4 tok/s | 20,4 tok/s |
 
 Bacaan jujurnya:
 

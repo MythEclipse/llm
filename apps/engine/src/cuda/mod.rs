@@ -70,7 +70,8 @@ impl Drop for DeviceBuffer {
 /// A kernel handle, looked up by name once at open time.
 struct Kernels {
     matmul: Function,
-    matmul_batch: Function,
+    matmul_dp4a: Function,
+    quantize_rows: Function,
     rmsnorm: Function,
     silu_mul: Function,
     residual_add: Function,
@@ -101,6 +102,7 @@ pub struct Gpu {
     total_bytes: usize,
     weights: Mutex<HashMap<(usize, usize), Resident>>,
     workspace: Mutex<Option<DeviceBuffer>>,
+    activation: Mutex<Option<DeviceBuffer>>,
 }
 
 impl Gpu {
@@ -144,7 +146,8 @@ impl Gpu {
 
             let kernels = Kernels {
                 matmul: function(module, "q8_matmul")?,
-                matmul_batch: function(module, "q8_matmul_batch")?,
+                matmul_dp4a: function(module, "q8_matmul_dp4a")?,
+                quantize_rows: function(module, "quantize_rows")?,
                 rmsnorm: function(module, "rmsnorm_rows")?,
                 silu_mul: function(module, "silu_mul")?,
                 residual_add: function(module, "residual_add")?,
@@ -163,6 +166,7 @@ impl Gpu {
                 total_bytes,
                 weights: Mutex::new(HashMap::new()),
                 workspace: Mutex::new(None),
+                activation: Mutex::new(None),
             })
         }
     }
@@ -281,13 +285,14 @@ impl Gpu {
             Arg::Int(n as i32),
         ];
         if n >= WARPS as usize {
-            // Prompt path: four rows per block, eight tokens per warp, k chunked.
-            return self.launch(
-                self.kernels.matmul_batch,
-                (out.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
-                (LANES, WARPS, 1),
-                0,
-                &mut args,
+            return self.matmul_dp4a(
+                &scales,
+                &quants,
+                &shifted(x.pointer, x_offset),
+                n,
+                k,
+                out,
+                &shifted(y.pointer, y_offset),
             );
         }
         // Decode path keeps the row in registers, so it needs no shared memory —
@@ -537,6 +542,78 @@ impl Gpu {
             0,
             &mut combine_args,
         )
+    }
+
+    /// int8 against int8: activations are quantized once per matmul, then the
+    /// prompt kernel multiplies with dp4a and applies the per-block scales.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_dp4a(
+        &self,
+        weight_scales: &DevicePtr,
+        weight_quants: &DevicePtr,
+        x: &DevicePtr,
+        n: usize,
+        k: usize,
+        out: usize,
+        y: &DevicePtr,
+    ) -> Result<(), EngineError> {
+        let blocks = k / 32;
+        let quants_bytes = n * k;
+        let buffer = self.activation_workspace(quants_bytes, n * blocks)?;
+        let act_quants = buffer;
+        let act_scales = shifted(buffer, quants_bytes / 4);
+
+        let mut quantize_args = [
+            Arg::Pointer(*x),
+            Arg::Pointer(act_quants),
+            Arg::Pointer(act_scales),
+            Arg::Int(k as i32),
+        ];
+        self.launch(
+            self.kernels.quantize_rows,
+            (blocks as u32, n as u32, 1),
+            (32, 1, 1),
+            0,
+            &mut quantize_args,
+        )?;
+
+        let mut args = [
+            Arg::Pointer(*weight_scales),
+            Arg::Pointer(*weight_quants),
+            Arg::Pointer(act_scales),
+            Arg::Pointer(act_quants),
+            Arg::Pointer(*y),
+            Arg::Int(k as i32),
+            Arg::Int(out as i32),
+            Arg::Int(n as i32),
+        ];
+        self.launch(
+            self.kernels.matmul_dp4a,
+            (out.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+            (LANES, WARPS, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Space for the quantized activations: `quants_bytes` for the int8 side and
+    /// `scale_floats` for the per-block scales, in one cached allocation.
+    fn activation_workspace(
+        &self,
+        quants_bytes: usize,
+        scale_floats: usize,
+    ) -> Result<DevicePtr, EngineError> {
+        let floats = quants_bytes.div_ceil(4) + scale_floats;
+        let mut slot = self.activation.lock().expect("activation lock");
+        if let Some(buffer) = slot.as_ref()
+            && buffer.len() >= floats
+        {
+            return Ok(buffer.pointer);
+        }
+        let buffer = self.alloc(floats)?;
+        let pointer = buffer.pointer;
+        *slot = Some(buffer);
+        Ok(pointer)
     }
 
     /// Scratch that survives between launches, so a per-layer call does not

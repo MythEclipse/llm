@@ -9,7 +9,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use crate::gguf::DType;
-use crate::quant::{dequant_q8_0, dot_q8_0};
+use crate::quant::{Q8_0_BLOCK_ELEMS, dequant_q8_0, dot_q8_0, dot_q8_0_q8_0, quantize_q8_0};
 
 /// A weight matrix `out × k` still in its quantized form.
 pub struct Weight<'a> {
@@ -51,6 +51,27 @@ impl<'a> Weight<'a> {
     }
 
     /// Dot product of output row `o` against one activation vector.
+    /// Dot of a Q8_0 row against a pre-quantized activation, so both sides stay
+    /// int8. Non-quantized weights fall back to the f32 path.
+    fn dot_row_quantized(&self, o: usize, quants: &[i8], scales: &[f32]) -> f32 {
+        match self.dtype {
+            DType::Q8_0 => dot_q8_0_q8_0(self.row(o), quants, scales),
+            _ => {
+                let mut dequantized = vec![0.0f32; self.k];
+                for (slot, (value, scale)) in dequantized.iter_mut().zip(
+                    quants.iter().zip(
+                        scales
+                            .iter()
+                            .flat_map(|scale| std::iter::repeat_n(*scale, 32)),
+                    ),
+                ) {
+                    *slot = *value as f32 * scale;
+                }
+                self.dot_row(o, &dequantized)
+            }
+        }
+    }
+
     fn dot_row(&self, o: usize, x: &[f32]) -> f32 {
         let row = self.row(o);
         match self.dtype {
@@ -80,6 +101,20 @@ pub fn matmul(weight: &Weight<'_>, x: &[f32], n: usize, y: &mut [f32]) {
         return;
     }
 
+    // Quantize each token's activation once, then every output row dots int8
+    // against int8 — the same trick ggml uses to keep prefill off the
+    // int8-to-f32 widening path.
+    let blocks = weight.k / Q8_0_BLOCK_ELEMS;
+    let mut quants = vec![0i8; n * weight.k];
+    let mut scales = vec![0.0f32; n * blocks];
+    for t in 0..n {
+        quantize_q8_0(
+            &x[t * weight.k..(t + 1) * weight.k],
+            &mut quants[t * weight.k..(t + 1) * weight.k],
+            &mut scales[t * blocks..(t + 1) * blocks],
+        );
+    }
+
     // Transposed scratch so the parallel loop can own one output row at a time.
     let mut scratch = vec![0.0f32; weight.out * n];
     scratch
@@ -87,7 +122,11 @@ pub fn matmul(weight: &Weight<'_>, x: &[f32], n: usize, y: &mut [f32]) {
         .enumerate()
         .for_each(|(o, row_out)| {
             for (t, slot) in row_out.iter_mut().enumerate() {
-                *slot = weight.dot_row(o, &x[t * weight.k..(t + 1) * weight.k]);
+                *slot = weight.dot_row_quantized(
+                    o,
+                    &quants[t * weight.k..(t + 1) * weight.k],
+                    &scales[t * blocks..(t + 1) * blocks],
+                );
             }
         });
 

@@ -125,93 +125,6 @@ extern "C" __global__ void q8_matmul(const float* __restrict__ scales,
         }
     }
 }
-
-// Prompt path: four output rows and eight tokens per block, so one shared read
-// of a weight feeds 32 multiply-adds. The k loop is chunked because four rows of
-// 6144 floats would not fit in shared memory.
-#define ROWS_PER_BLOCK 4
-#define K_CHUNK 1024
-#define TOKENS_PER_WARP 8
-
-extern "C" __global__ void q8_matmul_batch(const float* __restrict__ scales,
-                                          const signed char* __restrict__ quants,
-                                          const float* __restrict__ x,
-                                          float* __restrict__ y,
-                                          int k, int out, int n) {
-    __shared__ float tile[ROWS_PER_BLOCK][K_CHUNK];
-    const int lane = threadIdx.x;
-    const int warp = threadIdx.y;
-    const int threads = blockDim.x * blockDim.y;
-    const int tid = warp * blockDim.x + lane;
-    const int first_row = blockIdx.x * ROWS_PER_BLOCK;
-
-    // Every warp runs the same number of group iterations: the __syncthreads in
-    // the chunk loop would deadlock if a warp with no tokens skipped out early.
-    const int group_stride = blockDim.y * TOKENS_PER_WARP;
-    for (int base = 0; base < n; base += group_stride) {
-        const int group = base + warp * TOKENS_PER_WARP;
-        float sums[ROWS_PER_BLOCK][TOKENS_PER_WARP];
-        #pragma unroll
-        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-            #pragma unroll
-            for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
-                sums[row][slot] = 0.0f;
-            }
-        }
-
-        for (int chunk = 0; chunk < k; chunk += K_CHUNK) {
-            for (int index = tid; index < ROWS_PER_BLOCK * K_CHUNK; index += threads) {
-                const int row = index / K_CHUNK;
-                const int element = index % K_CHUNK;
-                const int position = chunk + element;
-                const int target = first_row + row;
-                float value = 0.0f;
-                if (position < k && target < out) {
-                    const float scale =
-                        scales[(size_t)target * (k / Q8_BLOCK_ELEMS) + (position >> 5)];
-                    value = scale * (float)quants[(size_t)target * k + position];
-                }
-                tile[row][element] = value;
-            }
-            __syncthreads();
-
-            for (int element = lane; element < K_CHUNK; element += 32) {
-                if (chunk + element < k) {
-                    #pragma unroll
-                    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-                        const float weight = tile[row][element];
-                        #pragma unroll
-                        for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
-                            if (group + slot < n) {
-                                sums[row][slot] +=
-                                    weight * x[(size_t)(group + slot) * k + chunk + element];
-                            }
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        #pragma unroll
-        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
-            #pragma unroll
-            for (int slot = 0; slot < TOKENS_PER_WARP; ++slot) {
-                if (group + slot < n && first_row + row < out) {
-                    float total = sums[row][slot];
-                    for (int offset = 16; offset > 0; offset >>= 1) {
-                        total += __shfl_down_sync(0xffffffffu, total, offset);
-                    }
-                    if (lane == 0) {
-                        y[(size_t)(group + slot) * out + first_row + row] = total;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// dst[row * n + i] = weight[i] * src[row * n + i] / sqrt(mean(src^2) + eps)
 extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
                                        float* __restrict__ dst,
                                        const float* __restrict__ weight,
@@ -477,6 +390,247 @@ extern "C" __global__ void attention_combine(const float* __restrict__ partial_a
         numerator += partial_acc[index * head_dim + threadIdx.x] * factor;
     }
     out[(size_t)head * head_dim + threadIdx.x] = numerator / denominator;
+}
+
+// Quantize activations to Q8_0, one warp per 32-element block. Doing this once
+// per matmul is what lets the prompt kernel multiply int8 by int8 with dp4a
+// instead of widening every weight to f32 first.
+extern "C" __global__ void quantize_rows(const float* __restrict__ x,
+                                        signed char* __restrict__ quants,
+                                        float* __restrict__ scales,
+                                        int k) {
+    const int row = blockIdx.y;
+    const int block = blockIdx.x;
+    const int lane = threadIdx.x;
+    const size_t offset = (size_t)row * k + block * 32 + lane;
+
+    const float value = x[offset];
+    float peak = fabsf(value);
+    #pragma unroll
+    for (int step = 16; step > 0; step >>= 1) {
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, step));
+    }
+    const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
+    if (lane == 0) {
+        scales[(size_t)row * (k >> 5) + block] = peak / 127.0f;
+    }
+    quants[offset] = (signed char)roundf(value * inverse);
+}
+
+#define ROWS_PER_BLOCK 4
+#define K_CHUNK 1024
+#define TOKENS_PER_WARP 4
+#define TOKEN_GROUPS 2
+#define STAGES 2
+
+__device__ __forceinline__ void copy_async(void* destination, const void* source) {
+    const unsigned address = (unsigned)__cvta_generic_to_shared(destination);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(address), "l"(source));
+}
+
+__device__ __forceinline__ void copy_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int Pending>
+__device__ __forceinline__ void copy_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(Pending));
+}
+
+// Prompt matmul on int8 pairs. Four output rows are staged into shared memory as
+// int8 — a quarter of the bytes the f32 version had to copy — and each warp runs
+// eight tokens (two groups of four) against that staged tile with dp4a.
+//
+// Two things decide the speed here, and neither is the arithmetic:
+//
+//  * the copy is asynchronous and double buffered, so the next tile is already in
+//    flight while the current one is being multiplied. Staging synchronously and
+//    then computing left the card waiting on one 4 KB burst per tile and the
+//    weight read ran at a fifth of its bandwidth;
+//  * each lane owns a whole 32-element block, so its eight dp4a land in one int32
+//    accumulator and the block scale is applied once.
+extern "C" __global__ void q8_matmul_dp4a(const float* __restrict__ weight_scales,
+                                         const signed char* __restrict__ weight_quants,
+                                         const float* __restrict__ act_scales,
+                                         const signed char* __restrict__ act_quants,
+                                         float* __restrict__ y,
+                                         int k, int out, int n) {
+    __shared__ signed char tile[STAGES][ROWS_PER_BLOCK][K_CHUNK];
+    __shared__ float tile_scales[STAGES][ROWS_PER_BLOCK][K_CHUNK / 32];
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int warps = blockDim.y;
+    const int threads = blockDim.x * blockDim.y;
+    const int tid = warp * blockDim.x + lane;
+    const int first_row = blockIdx.x * ROWS_PER_BLOCK;
+    const int blocks = k >> 5;
+    const int chunks = (k + K_CHUNK - 1) / K_CHUNK;
+
+    // Every warp runs the same number of group iterations, so the __syncthreads
+    // in the tile loop stays reachable for all of them.
+    const int stride = warps * TOKENS_PER_WARP * TOKEN_GROUPS;
+    for (int base = 0; base < n; base += stride) {
+        const int group = base + warp * TOKENS_PER_WARP * TOKEN_GROUPS;
+        float sums[ROWS_PER_BLOCK][TOKENS_PER_WARP * TOKEN_GROUPS];
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            #pragma unroll
+            for (int token = 0; token < TOKENS_PER_WARP * TOKEN_GROUPS; ++token) {
+                sums[row][token] = 0.0f;
+            }
+        }
+
+        // Prefetch the first two tiles before any arithmetic happens.
+        for (int stage = 0; stage < STAGES && stage < chunks; ++stage) {
+            const int chunk = stage * K_CHUNK;
+            for (int index = tid * 16; index < ROWS_PER_BLOCK * K_CHUNK; index += threads * 16) {
+                const int row = index / K_CHUNK;
+                const int element = index % K_CHUNK;
+                const int position = chunk + element;
+                const int target = first_row + row;
+                if (position + 16 <= k && target < out) {
+                    copy_async(&tile[stage][row][element],
+                               weight_quants + (size_t)target * k + position);
+                } else {
+                    *reinterpret_cast<int4*>(&tile[stage][row][element]) = make_int4(0, 0, 0, 0);
+                }
+            }
+            copy_async_commit();
+        }
+
+        for (int chunk = 0; chunk < k; chunk += K_CHUNK) {
+            const int stage = (chunk / K_CHUNK) % STAGES;
+            const int ahead = chunk + K_CHUNK;
+            if (ahead < k) {
+                const int target_stage = (stage + 1) % STAGES;
+                for (int index = tid * 16; index < ROWS_PER_BLOCK * K_CHUNK; index += threads * 16) {
+                    const int row = index / K_CHUNK;
+                    const int element = index % K_CHUNK;
+                    const int position = ahead + element;
+                    const int target = first_row + row;
+                    if (position + 16 <= k && target < out) {
+                        copy_async(&tile[target_stage][row][element],
+                                   weight_quants + (size_t)target * k + position);
+                    }
+                }
+            }
+            copy_async_commit();
+
+            // The tile being computed is one group behind the one just queued, so
+            // waiting for all but one group leaves the prefetch in flight.
+            copy_async_wait<1>();
+            __syncthreads();
+
+            for (int index = tid; index < ROWS_PER_BLOCK * (K_CHUNK / 32); index += threads) {
+                const int row = index / (K_CHUNK / 32);
+                const int block = index % (K_CHUNK / 32);
+                const int position = chunk + block * 32;
+                const int target = first_row + row;
+                tile_scales[stage][row][block] = (position < k && target < out)
+                    ? weight_scales[(size_t)target * blocks + (position >> 5)]
+                    : 0.0f;
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int half = 0; half < TOKEN_GROUPS; ++half) {
+                const int first_token = group + half * TOKENS_PER_WARP;
+                for (int block = lane; block < K_CHUNK / 32; block += blockDim.x) {
+                    const int position = chunk + block * 32;
+                    if (position < k) {
+                        int act_value[TOKENS_PER_WARP][8];
+                        float act_scale[TOKENS_PER_WARP];
+                        #pragma unroll
+                        for (int token = 0; token < TOKENS_PER_WARP; ++token) {
+                            int4 low = make_int4(0, 0, 0, 0);
+                            int4 high = make_int4(0, 0, 0, 0);
+                            float scale = 0.0f;
+                            if (first_token + token < n) {
+                                const size_t offset = (size_t)(first_token + token) * k + position;
+                                low = *reinterpret_cast<const int4*>(act_quants + offset);
+                                high = *reinterpret_cast<const int4*>(act_quants + offset + 16);
+                                scale = act_scales[(size_t)(first_token + token) * blocks + (position >> 5)];
+                            }
+                            act_value[token][0] = low.x;
+                            act_value[token][1] = low.y;
+                            act_value[token][2] = low.z;
+                            act_value[token][3] = low.w;
+                            act_value[token][4] = high.x;
+                            act_value[token][5] = high.y;
+                            act_value[token][6] = high.z;
+                            act_value[token][7] = high.w;
+                            act_scale[token] = scale;
+                        }
+
+                        int weight_value[ROWS_PER_BLOCK][8];
+                        #pragma unroll
+                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+                            const signed char* staged = &tile[stage][row][block * 32];
+                            const int4 low = *reinterpret_cast<const int4*>(staged);
+                            const int4 high = *reinterpret_cast<const int4*>(staged + 16);
+                            weight_value[row][0] = low.x;
+                            weight_value[row][1] = low.y;
+                            weight_value[row][2] = low.z;
+                            weight_value[row][3] = low.w;
+                            weight_value[row][4] = high.x;
+                            weight_value[row][5] = high.y;
+                            weight_value[row][6] = high.z;
+                            weight_value[row][7] = high.w;
+                        }
+
+                        int acc[ROWS_PER_BLOCK][TOKENS_PER_WARP];
+                        #pragma unroll
+                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+                            #pragma unroll
+                            for (int token = 0; token < TOKENS_PER_WARP; ++token) {
+                                acc[row][token] = 0;
+                            }
+                        }
+                        #pragma unroll
+                        for (int step = 0; step < 8; ++step) {
+                            #pragma unroll
+                            for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+                                #pragma unroll
+                                for (int token = 0; token < TOKENS_PER_WARP; ++token) {
+                                    acc[row][token] = __dp4a(weight_value[row][step],
+                                                             act_value[token][step],
+                                                             acc[row][token]);
+                                }
+                            }
+                        }
+
+                        #pragma unroll
+                        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+                            const float weight_scale = tile_scales[stage][row][block];
+                            #pragma unroll
+                            for (int token = 0; token < TOKENS_PER_WARP; ++token) {
+                                sums[row][half * TOKENS_PER_WARP + token] +=
+                                    weight_scale * act_scale[token] * (float)acc[row][token];
+                            }
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int target = first_row + row;
+            if (target < out) {
+                #pragma unroll
+                for (int token = 0; token < TOKENS_PER_WARP * TOKEN_GROUPS; ++token) {
+                    if (group + token < n) {
+                        const float total = warp_sum(sums[row][token]);
+                        if (lane == 0) {
+                            y[(size_t)(group + token) * out + target] = total;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 extern "C" __global__ void attention(const float* __restrict__ query,
