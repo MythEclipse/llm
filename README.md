@@ -128,9 +128,9 @@ VRAM terpakai ±3,1 GiB, median 9 langkah decode per titik, gateway dimatikan:
 | Konteks | Decode GPU | Decode CPU | Prefill GPU | Prefill CPU |
 |---|---:|---:|---:|---:|
 | 0 token | **64,4 tok/s** (15,5 ms) | 21,7 tok/s (46,0 ms) | 16 ms | 50 ms |
-| 128 token | **63,5 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 818 tok/s (0,16 s) | 35 tok/s (3,63 s) |
-| 512 token | **62,7 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 735 tok/s (0,70 s) | 30 tok/s (16,7 s) |
-| 1024 token | **60,2 tok/s** (16,6 ms) | 11,1 tok/s (90,3 ms) | 634 tok/s (1,62 s) | 27 tok/s (36,8 s) |
+| 128 token | **63,3 tok/s** (15,8 ms) | 19,5 tok/s (51,4 ms) | 1.829 tok/s (0,07 s) | 35 tok/s (3,63 s) |
+| 512 token | **62,6 tok/s** (16,0 ms) | 15,6 tok/s (64,1 ms) | 1.437 tok/s (0,36 s) | 30 tok/s (16,7 s) |
+| 1024 token | **59,5 tok/s** (16,8 ms) | 11,1 tok/s (90,3 ms) | 1.071 tok/s (0,96 s) | 27 tok/s (36,8 s) |
 | 2048 token | 56,2 tok/s (17,8 ms) | — | — | — |
 | 4090 token | 49,3 tok/s (20,3 ms) | — | — | — |
 
@@ -183,38 +183,47 @@ dengan int8. Yang diport dari llama.cpp:
 Hasilnya prefill GPU 275 → 534 tok/s pada konteks 128 (dan 235 → 824 tok/s lewat
 CLI pada prompt 215 token), CPU 28 → 35 tok/s. Decode tidak tersentuh.
 
-Lalu jalur prompt dipindah ke tensor core — `mma.sync.aligned.m16n8k32` dengan
-akumulasi `s32`, instruksi yang sama yang dipakai ggml untuk Q8_0 di sm_80+:
+Lalu jalur prompt dipindah ke tensor core, dan kali ini geometrinya diambil dari
+llama.cpp, bukan dikira-kira:
 
-- satu warp memegang 16 baris keluaran dan menyusuri token delapan sekaligus,
-  jadi fragmen bobot yang sudah di-stage dipakai ulang oleh semua tile token;
-- skala per blok 32 diterapkan setelah `mma` (skala bobot × skala aktivasi),
-  karena akumulasi int32 tidak bisa mencampur blok yang skalanya beda;
-- tata letak fragmen A/B/D diambil dari PTX ISA, dan itu yang paling mudah salah:
-  fragmen B dimiliki kolom `lane/4`, sedangkan D dikembalikan ke kolom
-  `2*(lane%4)` dan `+1` — thread yang berbeda memegang masukan dan keluaran
-  kolom yang sama, jadi skala dan penyimpanan memakai indeks token yang berbeda
-  dari pemuatan.
+| Parameter | Nilai di llama.cpp | Berkas |
+|---|---|---|
+| thread per blok | 256 (8 warp) | `mmq-config-ampere.cuh:104` |
+| blok resident per SM | 1 | sama |
+| baris keluaran per blok (I) | 128 | sama |
+| token per blok (J) | 8–128 | sama |
+| baris per warp | 32 saat J ≥ 48 | `mmq.cuh:180` |
+| k per iterasi | 256, tile 32 | `mmq.cuh:9,116` |
+| fragmen A | `ldmatrix.x4` | `mma.cuh:855` |
+| fragmen B | `load_generic` ("faster than ldmatrix") | `mmq-vec-dot.cuh:250` |
+| akumulasi skala | `sum += C*dA*dB`, satu fma per elemen | `mmq-vec-dot.cuh:195` |
 
-Prefill 534 → 818 tok/s (ctx 128), 491 → 735 (ctx 512), 444 → 634 (ctx 1024).
-Decode tidak berubah.
+Yang berubah di kernel ini: satu blok 128 baris × 64 token dengan 8 warp, satu
+warp 32 baris (dua minitile m16) sehingga satu fragmen B dipakai dua `mma`,
+kedua operan di shared memory, A lewat `ldmatrix.x4`, dan skala per blok menjadi
+satu fma per elemen akumulator. Kapasitas 64 token itu terikat pada
+`PREFILL_CHUNK` di `session.rs`; kalau chunk dinaikkan tanpa menaikkan tile,
+matmul mengembalikan `Unsupported` alih-alih diam-diam membuang token.
 
-Sisa selisihnya sekarang 5,4× pada prefill. Yang saya ukur dan belum tertutup:
-matmul sendirian berjalan 2,1 TMAC/s, sedangkan prefill llama.cpp setara
-≈ 7,5 TMAC/s. Penyebab yang paling mungkin bukan lagi jenis instruksi
-(keduanya `mma.sync`) melainkan jumlah warp: dengan 16 baris per warp dan 2048
-baris keluaran hanya ada 128 warp untuk 20 SM, sekitar 6 warp per SM, dan
-pengukuran menunjukkan pembacaan bobot berhenti di 33–90 GB/s. Memecah token
-antar blok sudah dicoba (tidak menolong, biaya baca bobot dua kali lipat);
-memecah k antar blok belum dicoba dan itu cara menambah warp tanpa menambah
-trafik.
+Hasilnya matmul sendirian **5,5 TMAC/s** (dari 2,1), dan prefill 818 → 1.829
+tok/s pada konteks 128. Sebagai pembanding, prefill llama.cpp 4.431 tok/s setara
+≈7,5 TMAC/s — jadi matmul-nya kini di 73% jalur llama.cpp.
 
-Empat percobaan yang **tidak** menolong, dicatat supaya tidak diulang: memecah
-rantai 8 `dp4a` menjadi 16 akumulator independen (0%), mengubah granularitas lane
-dari 16 ke 32 byte (0%), mengganti staging sinkron menjadi `cp.async` dua tahap
-(0%). Yang menolong: salinan tile per 16 byte, bukan per 1 byte (1,4×; satu byte
-per instruksi hanya memberi warp 32 byte berguna per transaksi, dan pembacaan
-bobot jatuh ke 25 GB/s).
+Dua jebakan yang mahal, dicatat karena keduanya tidak terlihat dari kode:
+
+- `ldmatrix` menerima **alamat generik 64-bit** (`"l"`), bukan alamat shared
+  32-bit hasil `__cvta_generic_to_shared` seperti `cp.async`. Memberinya alamat
+  shared membuat ptxas membacanya sebagai alamat global dan seluruh launch
+  kena illegal memory access;
+- pengukuran sempat menyesatkan berkali-kali karena satu proses uji lain masih
+  memegang 2,8 GB VRAM: `Compute::auto` lalu turun ke CPU tanpa suara, dan yang
+  terlihat seperti "kernel lebih lambat" sebenarnya mesin yang berbeda.
+
+Sisa selisih prefill sekarang tumbuh dengan konteks: 1.829 tok/s (ctx 128) turun
+ke 1.071 tok/s (ctx 1024), sedangkan llama.cpp tetap datar. Penyebabnya terukur —
+pada ctx 1024 kira-kira 47% waktu prefill ada di attention, dan jalur prefill
+masih memakai kernel `attention` serial per head (yang dipecah antar blok baru
+jalur decode). Tiling attention untuk prefill adalah pekerjaan berikutnya.
 
 ### Attention decode: posisi dipecah antar blok
 

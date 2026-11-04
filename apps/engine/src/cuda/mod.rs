@@ -43,7 +43,10 @@ fn split_count(visible: usize) -> usize {
 
 /// Tensor-core tile on the prompt path: sixteen rows per warp, four warps.
 const MMA_ROWS: usize = 16;
-const MMA_WARPS: usize = 4;
+const MMA_WARPS: usize = 8;
+/// Tokens one prompt block can hold, matching `MMA_BLOCK_TOKENS` in the kernel
+/// and the engine's prefill chunk.
+const MMA_TOKENS: usize = 64;
 
 /// A device allocation of `len` f32 values, freed on drop.
 pub struct DeviceBuffer {
@@ -559,6 +562,11 @@ impl Gpu {
         out: usize,
         y: &DevicePtr,
     ) -> Result<(), EngineError> {
+        if n > MMA_TOKENS {
+            return Err(EngineError::Unsupported(format!(
+                "prompt matmul holds {MMA_TOKENS} tokens, got {n}"
+            )));
+        }
         let blocks = k / 32;
         let quants_bytes = n * k;
         let buffer = self.activation_workspace(quants_bytes, n * blocks)?;

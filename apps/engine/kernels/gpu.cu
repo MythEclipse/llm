@@ -418,9 +418,16 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
 }
 
 #define MMA_ROWS 16
-#define MMA_WARPS 4
-#define MMA_K_CHUNK 512
-#define MMA_TOKEN_TILES 8
+#define MMA_WARPS 8
+#define MMA_BLOCK_ROWS 128
+#define MMA_ROWS_PER_WARP 32
+#define MMA_MINI_TILES (MMA_ROWS_PER_WARP / MMA_ROWS)
+#define MMA_BLOCK_TOKENS 64
+#define MMA_TOKEN_GROUPS 4
+#define MMA_TOKENS_PER_GROUP 16
+#define MMA_CHUNK 128
+#define MMA_CHUNK_BLOCKS (MMA_CHUNK / 32)
+#define MMA_PAD 16
 
 __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3,
                                       int a0, int a1, int a2, int a3,
@@ -432,131 +439,174 @@ __device__ __forceinline__ void mma_s8(int& d0, int& d1, int& d2, int& d3,
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// Prompt matmul on the int8 tensor cores: mma.sync.m16n8k32, the instruction ggml
-// uses for Q8_0 on sm_80+. One warp owns sixteen output rows and walks the tokens
-// eight at a time, so a weight fragment staged once feeds every token tile.
+// Loads a 16x32 int8 A fragment the way ggml does it: one ldmatrix.x4 per
+// fragment instead of four scalar shared loads, with lanes 0-15 feeding the rows
+// at byte 0 and lanes 16-31 the rows at byte 16.
+__device__ __forceinline__ void load_a_fragment(int* fragment, const signed char* base,
+                                               int stride, int lane) {
+    // ldmatrix takes a generic address, not the 32-bit shared offset that cp.async
+    // wants; handing it a converted offset makes ptxas read global memory at that
+    // address instead, which faults.
+    const signed char* address = base + (lane % MMA_ROWS) * stride + (lane / MMA_ROWS) * 16;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
+                 : "l"(address));
+}
+
+// Prompt matmul on the int8 tensor cores, following the geometry ggml picks for
+// Q8_0 on Ampere (mmq-config-ampere.cuh, mmq-vec-dot.cuh):
 //
-// Fragment layout, from the PTX ISA: for A, thread t holds the words at byte
-// (t%4)*4 and (t%4)*4+16 of rows t/4 and t/4+8; for B, column t/4 holds the words
-// at (t%4)*4 and 16+(t%4)*4; for D, thread t owns rows {t/4, t/4+8} crossed with
-// columns {2*(t%4), 2*(t%4)+1}. The scale and the store therefore use a different
-// token index than the load — different threads own the input and the output of
-// the same column.
+//   * one block owns 128 output rows and up to 64 tokens, with 8 warps and one
+//     block resident per SM;
+//   * a warp covers 32 rows (two m16 minitiles) and 8 tokens per mma, so a single
+//     B fragment feeds two mma and the activation read is halved;
+//   * both operands sit in shared memory — A is read with ldmatrix.x4, B with the
+//     two-word-per-lane layout — and the per-block scales collapse into one fma
+//     per accumulator element: sum += C * dA * dB.
 extern "C" __global__ void q8_matmul_mma(const float* __restrict__ weight_scales,
                                         const signed char* __restrict__ weight_quants,
                                         const float* __restrict__ act_scales,
                                         const signed char* __restrict__ act_quants,
                                         float* __restrict__ y,
                                         int k, int out, int n) {
-    __shared__ signed char tile[MMA_WARPS * MMA_ROWS][MMA_K_CHUNK];
-    __shared__ float tile_scales[MMA_WARPS * MMA_ROWS][MMA_K_CHUNK / 32];
+    // ldmatrix needs sixteen-byte-aligned shared addresses, and a plain char array
+    // is only guaranteed one-byte alignment.
+    __shared__ __align__(16) signed char a_tile[MMA_BLOCK_ROWS][MMA_CHUNK + MMA_PAD];
+    __shared__ float a_scales[MMA_BLOCK_ROWS][MMA_CHUNK_BLOCKS];
+    __shared__ __align__(16) signed char b_tile[MMA_BLOCK_TOKENS][MMA_CHUNK + MMA_PAD];
+    __shared__ float b_scales[MMA_BLOCK_TOKENS][MMA_CHUNK_BLOCKS];
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
-    const int warps = blockDim.y;
     const int threads = blockDim.x * blockDim.y;
     const int tid = warp * blockDim.x + lane;
-    const int blocks = k >> 5;
-    const int rows = warps * MMA_ROWS;
-    const int first_row = blockIdx.x * rows + warp * MMA_ROWS;
+    const int k_blocks = k >> 5;
+    const int row_base = blockIdx.x * MMA_BLOCK_ROWS;
     const int group = lane >> 2;
     const int lane4 = lane & 3;
 
-    const int token_tiles = (n + 7) / 8;
-    for (int tile_base = 0; tile_base < token_tiles; tile_base += MMA_TOKEN_TILES) {
-        float acc[MMA_TOKEN_TILES][4];
+    const int row_group = (warp / 2) * MMA_ROWS_PER_WARP;
+    const int token_offset = (warp % 2) * 8;
+
+    float sums[MMA_TOKEN_GROUPS][MMA_MINI_TILES][4];
+    #pragma unroll
+    for (int j = 0; j < MMA_TOKEN_GROUPS; ++j) {
         #pragma unroll
-        for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
+        for (int t = 0; t < MMA_MINI_TILES; ++t) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                acc[t][e] = 0.0f;
+                sums[j][t][e] = 0.0f;
             }
         }
+    }
 
-        for (int chunk = 0; chunk < k; chunk += MMA_K_CHUNK) {
-            for (int index = tid * 16; index < rows * MMA_K_CHUNK; index += threads * 16) {
-                const int row = index / MMA_K_CHUNK;
-                const int element = index % MMA_K_CHUNK;
-                const int position = chunk + element;
-                const int target = blockIdx.x * rows + row;
-                if (position + 16 <= k && target < out) {
-                    *reinterpret_cast<int4*>(&tile[row][element]) =
-                        *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position);
-                } else {
-                    *reinterpret_cast<int4*>(&tile[row][element]) = make_int4(0, 0, 0, 0);
-                }
+    for (int chunk = 0; chunk < k; chunk += MMA_CHUNK) {
+        for (int index = tid * 16; index < MMA_BLOCK_ROWS * MMA_CHUNK; index += threads * 16) {
+            const int row = index / MMA_CHUNK;
+            const int element = index % MMA_CHUNK;
+            const int position = chunk + element;
+            const int target = row_base + row;
+            int4* destination = reinterpret_cast<int4*>(&a_tile[row][element]);
+            if (position + 16 <= k && target < out) {
+                *destination =
+                    *reinterpret_cast<const int4*>(weight_quants + (size_t)target * k + position);
+            } else {
+                *destination = make_int4(0, 0, 0, 0);
             }
-            for (int index = tid; index < rows * (MMA_K_CHUNK / 32); index += threads) {
-                const int row = index / (MMA_K_CHUNK / 32);
-                const int block = index % (MMA_K_CHUNK / 32);
-                const int position = chunk + block * 32;
-                const int target = blockIdx.x * rows + row;
-                tile_scales[row][block] = (position < k && target < out)
-                    ? weight_scales[(size_t)target * blocks + (position >> 5)]
-                    : 0.0f;
+        }
+        for (int index = tid * 16; index < MMA_BLOCK_TOKENS * MMA_CHUNK; index += threads * 16) {
+            const int token = index / MMA_CHUNK;
+            const int element = index % MMA_CHUNK;
+            const int position = chunk + element;
+            int4* destination = reinterpret_cast<int4*>(&b_tile[token][element]);
+            if (position + 16 <= k && token < n) {
+                *destination =
+                    *reinterpret_cast<const int4*>(act_quants + (size_t)token * k + position);
+            } else {
+                *destination = make_int4(0, 0, 0, 0);
             }
-            __syncthreads();
+        }
+        for (int index = tid; index < MMA_BLOCK_ROWS * MMA_CHUNK_BLOCKS; index += threads) {
+            const int row = index / MMA_CHUNK_BLOCKS;
+            const int block = index % MMA_CHUNK_BLOCKS;
+            const int position = chunk + block * 32;
+            const int target = row_base + row;
+            a_scales[row][block] = (position < k && target < out)
+                ? weight_scales[(size_t)target * k_blocks + (position >> 5)]
+                : 0.0f;
+        }
+        for (int index = tid; index < MMA_BLOCK_TOKENS * MMA_CHUNK_BLOCKS; index += threads) {
+            const int token = index / MMA_CHUNK_BLOCKS;
+            const int block = index % MMA_CHUNK_BLOCKS;
+            const int position = chunk + block * 32;
+            b_scales[token][block] = (position < k && token < n)
+                ? act_scales[(size_t)token * k_blocks + (position >> 5)]
+                : 0.0f;
+        }
+        __syncthreads();
 
-            const int warp_row = warp * MMA_ROWS;
-            for (int block = 0; block < MMA_K_CHUNK / 32; ++block) {
-                const int kblk = (chunk >> 5) + block;
-                if (kblk >= blocks) {
-                    break;
-                }
-                const int byte = block * 32 + lane4 * 4;
-                const int* low = reinterpret_cast<const int*>(&tile[warp_row + group][byte]);
-                const int* high = reinterpret_cast<const int*>(&tile[warp_row + group + 8][byte]);
-                const int a0 = low[0];
-                const int a1 = high[0];
-                const int a2 = low[4];
-                const int a3 = high[4];
-                const float weight_low = tile_scales[warp_row + group][block];
-                const float weight_high = tile_scales[warp_row + group + 8][block];
-
-                #pragma unroll
-                for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
-                    const int fragment_token = (tile_base + t) * 8 + group;
-                    if (fragment_token < n) {
-                        const int* activations = reinterpret_cast<const int*>(
-                            act_quants + (size_t)fragment_token * k + (kblk << 5) + lane4 * 4);
-                        const int b0 = activations[0];
-                        const int b1 = activations[4];
-                        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-                        mma_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
-                        const int column = (tile_base + t) * 8 + lane4 * 2;
-                        const float act_low = act_scales[(size_t)column * blocks + kblk];
-                        const float act_high = column + 1 < n
-                            ? act_scales[(size_t)(column + 1) * blocks + kblk]
-                            : 0.0f;
-                        acc[t][0] += weight_low * act_low * (float)d0;
-                        acc[t][1] += weight_low * act_high * (float)d1;
-                        acc[t][2] += weight_high * act_low * (float)d2;
-                        acc[t][3] += weight_high * act_high * (float)d3;
-                    }
-                }
+        int fragments[MMA_MINI_TILES][MMA_CHUNK_BLOCKS][4];
+        #pragma unroll
+        for (int t = 0; t < MMA_MINI_TILES; ++t) {
+            #pragma unroll
+            for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
+                load_a_fragment(fragments[t][block],
+                                &a_tile[row_group + t * MMA_ROWS][block * 32],
+                                MMA_CHUNK + MMA_PAD, lane);
             }
-            __syncthreads();
         }
 
         #pragma unroll
-        for (int t = 0; t < MMA_TOKEN_TILES; ++t) {
-            const int column_low = (tile_base + t) * 8 + lane4 * 2;
-            const int column_high = column_low + 1;
-            if (column_low < n) {
-                if (first_row + group < out) {
-                    y[(size_t)column_low * out + first_row + group] = acc[t][0];
-                }
-                if (first_row + group + 8 < out) {
-                    y[(size_t)column_low * out + first_row + group + 8] = acc[t][2];
+        for (int j = 0; j < MMA_TOKEN_GROUPS; ++j) {
+            const int first_token = j * MMA_TOKENS_PER_GROUP + token_offset;
+            #pragma unroll
+            for (int block = 0; block < MMA_CHUNK_BLOCKS; ++block) {
+                const int fragment_token = first_token + group;
+                const int* activations =
+                    reinterpret_cast<const int*>(&b_tile[fragment_token][block * 32 + lane4 * 4]);
+                const int b0 = activations[0];
+                const int b1 = activations[4];
+                const int column = first_token + lane4 * 2;
+                const float act_low = b_scales[column][block];
+                const float act_high = b_scales[column + 1][block];
+
+                #pragma unroll
+                for (int t = 0; t < MMA_MINI_TILES; ++t) {
+                    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    mma_s8(d0, d1, d2, d3, fragments[t][block][0], fragments[t][block][1],
+                           fragments[t][block][2], fragments[t][block][3], b0, b1);
+                    const int row = row_group + t * MMA_ROWS;
+                    const float weight_low = a_scales[row + group][block];
+                    const float weight_high = a_scales[row + group + 8][block];
+                    sums[j][t][0] += (float)d0 * (weight_low * act_low);
+                    sums[j][t][1] += (float)d1 * (weight_low * act_high);
+                    sums[j][t][2] += (float)d2 * (weight_high * act_low);
+                    sums[j][t][3] += (float)d3 * (weight_high * act_high);
                 }
             }
-            if (column_high < n) {
-                if (first_row + group < out) {
-                    y[(size_t)column_high * out + first_row + group] = acc[t][1];
-                }
-                if (first_row + group + 8 < out) {
-                    y[(size_t)column_high * out + first_row + group + 8] = acc[t][3];
-                }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < MMA_TOKEN_GROUPS; ++j) {
+        const int first_token = j * MMA_TOKENS_PER_GROUP + token_offset;
+        const int column_low = first_token + lane4 * 2;
+        const int column_high = column_low + 1;
+        #pragma unroll
+        for (int t = 0; t < MMA_MINI_TILES; ++t) {
+            const int row = row_base + row_group + t * MMA_ROWS + group;
+            if (column_low < n && row < out) {
+                y[(size_t)column_low * out + row] = sums[j][t][0];
+            }
+            if (column_high < n && row < out) {
+                y[(size_t)column_high * out + row] = sums[j][t][1];
+            }
+            if (column_low < n && row + 8 < out) {
+                y[(size_t)column_low * out + row + 8] = sums[j][t][2];
+            }
+            if (column_high < n && row + 8 < out) {
+                y[(size_t)column_high * out + row + 8] = sums[j][t][3];
             }
         }
     }
