@@ -399,22 +399,36 @@ extern "C" __global__ void quantize_rows(const float* __restrict__ x,
                                         signed char* __restrict__ quants,
                                         float* __restrict__ scales,
                                         int k) {
-    const int row = blockIdx.y;
-    const int block = blockIdx.x;
-    const int lane = threadIdx.x;
-    const size_t offset = (size_t)row * k + block * 32 + lane;
+    // One thread per thirty-two-element block. The warp version moved four bytes
+    // per lane and needed a five-step butterfly for the block peak, which left the
+    // kernel at half the bandwidth it should reach; a thread that reads its own
+    // thirty-two floats pulls a hundred and twenty-eight contiguous bytes per
+    // access and keeps the peak in registers.
+    const int blocks_per_row = k >> 5;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = index / blocks_per_row;
+    const int block = index % blocks_per_row;
+    const size_t offset = (size_t)row * k + block * 32;
 
-    const float value = x[offset];
-    float peak = fabsf(value);
+    float4 values[8];
+    float peak = 0.0f;
     #pragma unroll
-    for (int step = 16; step > 0; step >>= 1) {
-        peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, step));
+    for (int step = 0; step < 8; ++step) {
+        values[step] = *reinterpret_cast<const float4*>(x + offset + step * 4);
+        peak = fmaxf(peak, fmaxf(fmaxf(fabsf(values[step].x), fabsf(values[step].y)),
+                                 fmaxf(fabsf(values[step].z), fabsf(values[step].w))));
     }
     const float inverse = peak > 0.0f ? 127.0f / peak : 0.0f;
-    if (lane == 0) {
-        scales[(size_t)row * (k >> 5) + block] = peak / 127.0f;
+    scales[(size_t)row * blocks_per_row + block] = peak / 127.0f;
+    #pragma unroll
+    for (int step = 0; step < 8; ++step) {
+        char4 quantized;
+        quantized.x = (signed char)__float2int_rn(values[step].x * inverse);
+        quantized.y = (signed char)__float2int_rn(values[step].y * inverse);
+        quantized.z = (signed char)__float2int_rn(values[step].z * inverse);
+        quantized.w = (signed char)__float2int_rn(values[step].w * inverse);
+        *reinterpret_cast<char4*>(quants + offset + step * 4) = quantized;
     }
-    quants[offset] = (signed char)roundf(value * inverse);
 }
 
 #define MMA_ROWS 16

@@ -660,10 +660,14 @@ impl Gpu {
             Arg::Pointer(shifted(buffer, quants_bytes / 4)),
             Arg::Int(k as i32),
         ];
+        // One thread per thirty-two-element block, so the grid is the whole
+        // activation and each thread streams its own hundred and twenty-eight
+        // bytes contiguously.
+        let total = (blocks * n) as u32;
         self.launch(
             self.kernels.quantize_rows,
-            (blocks as u32, n as u32, 1),
-            (32, 1, 1),
+            (total.div_ceil(128), 1, 1),
+            (128, 1, 1),
             0,
             &mut quantize_args,
         )?;
