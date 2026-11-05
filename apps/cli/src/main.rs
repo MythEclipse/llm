@@ -6,12 +6,13 @@
 //! ```
 
 mod bench;
+mod inspect;
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use llm_engine::chat::{Role, Turn, render};
+use llm_engine::chat::{ChatFormat, Role, Turn};
 use llm_engine::{
     Event, GenerationRequest, GgufFile, Model, SamplingParams, Session, Tokenizer, generate,
 };
@@ -44,6 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if command.as_deref() == Some("inspect") {
+        let path = arguments
+            .next()
+            .ok_or("inspect needs a path to a gguf file")?;
+        return inspect::run(&PathBuf::from(path));
+    }
+
     let mut model_path = PathBuf::from(DEFAULT_MODEL);
     let mut context = DEFAULT_CONTEXT;
     let mut max_tokens = DEFAULT_MAX_TOKENS;
@@ -68,19 +76,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(&model_path)?;
     let model = Model::load(&gguf)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let chat = ChatFormat::from_gguf(&gguf, &tokenizer)?;
     let params = SamplingParams {
         temperature,
         ..SamplingParams::default()
     };
-    let stop_tokens: Vec<u32> = ["<|im_end|>", "</s>"]
-        .iter()
-        .filter_map(|token| tokenizer.id_of(token))
+    // The file names its own end of turn; `<|im_end|>` stays because ChatML
+    // models mark it that way even when it is not the declared eos.
+    let stop_tokens: Vec<u32> = tokenizer
+        .eos_id()
+        .into_iter()
+        .chain(
+            ["<|im_end|>", "<|eot_id|>", "[/INST]"]
+                .iter()
+                .filter_map(|token| tokenizer.id_of(token)),
+        )
         .collect();
 
     if prompt_parts.is_empty() {
         chat_loop(
             &model,
             &tokenizer,
+            &chat,
             context,
             max_tokens,
             params,
@@ -124,6 +141,7 @@ fn complete(
 fn chat_loop(
     model: &Model<'_>,
     tokenizer: &Tokenizer,
+    chat: &ChatFormat,
     context: usize,
     max_tokens: usize,
     params: SamplingParams,
@@ -148,7 +166,7 @@ fn chat_loop(
                 content,
             })
             .collect();
-        let prompt = tokenizer.encode(&render(&turns, false));
+        let prompt = tokenizer.encode(&chat.render(&turns, false));
 
         let mut session = Session::new(model, context)?;
         let answer = run(

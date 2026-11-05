@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use llm_engine::chat::{Role as EngineRole, Turn, render};
+use llm_engine::chat::{ChatFormat, Role as EngineRole, Turn};
 use llm_engine::manifest::BuildManifest;
 use llm_engine::{
     Event, GenerationRequest as CoreRequest, GgufFile, Model, SamplingParams, Session, Tokenizer,
@@ -24,6 +24,7 @@ const STOP_TOKENS: [&str; 2] = ["<|im_end|>", "</s>"];
 pub struct LocalChatEngine {
     model: &'static Model<'static>,
     tokenizer: Arc<Tokenizer>,
+    chat: ChatFormat,
     stop_tokens: Vec<u32>,
     info: ModelInfo,
     build_hash: String,
@@ -40,6 +41,15 @@ impl LocalChatEngine {
         let model = Model::load(gguf).map_err(internal)?;
         let model: &'static Model<'static> = Box::leak(Box::new(model));
         let tokenizer = Tokenizer::from_gguf(gguf).map_err(internal)?;
+        // The prompt shape comes from the file, not from a constant: a model
+        // trained on another template answers badly when handed ChatML.
+        let chat = ChatFormat::from_gguf(gguf, &tokenizer).map_err(internal)?;
+        tracing::info!(
+            template = chat.template().name(),
+            bos = chat.bos(),
+            vocabulary = tokenizer.family(),
+            "chat format read from the file"
+        );
         let stop_tokens = STOP_TOKENS
             .iter()
             .filter_map(|token| tokenizer.id_of(token))
@@ -85,6 +95,7 @@ impl LocalChatEngine {
         Ok(Self {
             model,
             tokenizer: Arc::new(tokenizer),
+            chat,
             stop_tokens,
             build_hash: info.build.identity.clone(),
             info,
@@ -106,7 +117,7 @@ impl LocalChatEngine {
                 content: &turn.content,
             })
             .collect();
-        render(&turns, false)
+        self.chat.render(&turns, false)
     }
 }
 

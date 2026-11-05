@@ -277,6 +277,28 @@ impl GgufFile {
         Ok(values)
     }
 
+    /// Decode a float array (SentencePiece scores) straight out of the map.
+    pub fn meta_f32_array(&self, key: &str) -> Result<Vec<f32>, EngineError> {
+        let (len, data_offset) = match self.meta.get(key) {
+            Some(MetaValue::Array {
+                elem_type: 6,
+                len,
+                data_offset,
+            }) => (*len, *data_offset),
+            Some(MetaValue::Array { .. }) => {
+                return Err(EngineError::Format(format!("{key} is not a float array")));
+            }
+            Some(_) => return Err(EngineError::Format(format!("{key} is not an array"))),
+            None => return Err(EngineError::MissingMetadata(key.to_string())),
+        };
+        let mut reader = Reader::at(&self.map, data_offset as usize);
+        let mut values = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            values.push(f32::from_bits(reader.u32()?));
+        }
+        Ok(values)
+    }
+
     /// Decode a string array (tokens, merges) straight out of the map.
     pub fn meta_str_array(&self, key: &str) -> Result<Vec<&str>, EngineError> {
         let (len, data_offset) = match self.meta.get(key) {

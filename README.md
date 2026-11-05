@@ -689,6 +689,45 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
   token. Angka prefill sempat terlihat 25% lebih tinggi karenanya; angka di tabel
   atas adalah yang menghitung semua token.
 
+## Loader: apa pun yang file-nya deklarasikan
+
+Pemisahan yang penting: **loader** bisa umum untuk semua GGUF, **forward pass**
+tidak. Loader membaca apa yang file katakan; forward pass hanya tahu blok yang
+sudah diimplementasikan.
+
+Yang dibaca loader, tanpa nama arsitektur di dalam kode:
+
+- **header dan metadata** — kunci dibaca di bawah `general.architecture`
+  (`qwen2.block_count`, `llama.block_count`, …), dengan `llama.` sebagai
+  fallback, dan field opsional (kv head, key length, rope, epsilon, vocab)
+  memakai default yang sama dengan llama.cpp;
+- **tokenizer** — dua keluarga sesuai `tokenizer.ggml.model`: `gpt2` (BPE byte-level,
+  pre-tokenizer dipilih dari `tokenizer.ggml.pre`: minicpm5, qwen2, gpt2,
+  llama-bpe) dan `llama`/`spm` (SentencePiece: pieces + skor, merge naik per skor,
+  byte fallback `<0xNN>`); `bos_token_id`/`eos_token_id` diambil dari metadata,
+  bukan dari konstanta;
+- **chat template** — `tokenizer.chat_template` diklasifikasi dari penandanya
+  menjadi `chatml`, `llama3`, atau `mistral`, lalu dirender native. Template yang
+  tidak dikenali ditolak dengan namanya, bukan diam-diam dirender sebagai ChatML.
+
+`llm-cli inspect <file.gguf>` menjawab untuk file apa pun, termasuk yang tidak
+bisa dijalankan: arsitektur, geometri, histogram tipe tensor, keluarga tokenizer,
+bentuk template, lalu vonis `runnable` yang diambil dari percobaan load yang
+sebenarnya — jadi tidak bisa melenceng dari perilaku engine.
+
+Batasnya dinyatakan, bukan disembunyikan: model dengan blok yang belum ada
+(state-space, head_dim > 128) gagal saat load dengan alasan spesifik. Contoh
+nyata di repo ini:
+
+```
+$ llm-cli inspect models/moe-expert-coder-4b-Q8_0.gguf
+architecture  qwen35
+tokenizer     vocab 248320, pre-tokenizer qwen35 (belum didukung)
+chat template chatml
+runnable      no — architecture qwen35 interleaves state-space blocks with
+              attention; this engine implements dense attention blocks only
+```
+
 ## Mixture of experts
 
 Blok feed-forward bisa berupa router atas tumpukan pakar, dibaca dari GGUF
