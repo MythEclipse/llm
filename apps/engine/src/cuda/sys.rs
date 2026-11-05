@@ -36,6 +36,10 @@ pub const STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
 
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` from the driver API.
 pub const FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED: i32 = 8;
+/// `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`, `SHARED_SIZE_BYTES`, `NUM_REGS`.
+pub const FUNC_ATTRIBUTE_MAX_THREADS: i32 = 0;
+pub const FUNC_ATTRIBUTE_SHARED_SIZE: i32 = 1;
+pub const FUNC_ATTRIBUTE_NUM_REGS: i32 = 4;
 
 /// A device pointer, passed to kernels by value.
 #[repr(transparent)]
@@ -117,6 +121,19 @@ unsafe extern "C" {
     pub fn cuGraphLaunch(exec: GraphExec, stream: Stream) -> i32;
     pub fn cuGraphExecDestroy(exec: GraphExec) -> i32;
     pub fn cuGraphDestroy(graph: Graph) -> i32;
+    /// What a loaded kernel actually needs: threads, registers, static shared.
+    pub fn cuFuncGetAttribute(value: *mut i32, attribute: i32, function: Function) -> i32;
+    /// How many parameters the kernel declares, so a launch can be checked
+    /// against it instead of trusting that the call site still matches. The count
+    /// comes back through a pointer, like every other driver out-parameter.
+    pub fn cuFuncGetParamCount(function: Function, count: *mut usize) -> i32;
+    /// How many blocks of this shape fit on one multiprocessor.
+    pub fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        blocks: *mut i32,
+        function: Function,
+        block_size: i32,
+        dynamic_shared: usize,
+    ) -> i32;
 }
 
 /// Human-readable name for a driver error code.

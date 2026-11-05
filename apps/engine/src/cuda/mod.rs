@@ -18,18 +18,20 @@ use half::f16;
 
 use sys::{
     ATTRIBUTE_MULTIPROCESSORS, Context, Device, DevicePtr, Event,
-    FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, GraphExec, Module, STREAM_CAPTURE_THREAD_LOCAL,
-    SUCCESS, Stream, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet,
-    cuDeviceGetAttribute, cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy,
-    cuEventElapsedTime, cuEventRecord, cuEventSynchronize, cuFuncSetAttribute, cuGraphDestroy,
-    cuGraphExecDestroy, cuGraphInstantiate_v2, cuGraphLaunch, cuInit, cuLaunchKernel,
-    cuMemAlloc_v2, cuMemFree_v2, cuMemGetInfo_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
-    cuModuleGetFunction, cuModuleLoadData, cuStreamBeginCapture, cuStreamCreate,
+    FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, FUNC_ATTRIBUTE_MAX_THREADS, FUNC_ATTRIBUTE_NUM_REGS,
+    FUNC_ATTRIBUTE_SHARED_SIZE, Function, GraphExec, Module, STREAM_CAPTURE_THREAD_LOCAL, SUCCESS,
+    Stream, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet, cuDeviceGetAttribute,
+    cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy, cuEventElapsedTime,
+    cuEventRecord, cuEventSynchronize, cuFuncGetAttribute, cuFuncGetParamCount, cuFuncSetAttribute,
+    cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiate_v2, cuGraphLaunch, cuInit,
+    cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2, cuMemGetInfo_v2, cuMemcpyDtoHAsync_v2,
+    cuMemcpyHtoDAsync_v2, cuModuleGetFunction, cuModuleLoadData,
+    cuOccupancyMaxActiveBlocksPerMultiprocessor, cuStreamBeginCapture, cuStreamCreate,
     cuStreamDestroy_v2, cuStreamEndCapture, cuStreamSynchronize, error_message,
 };
 
 use crate::error::EngineError;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// Bytes the engine holds on the device, and the high-water mark of that.
 /// Process-wide, because every buffer is born in `Gpu::alloc` and frees itself on
@@ -182,9 +184,13 @@ pub fn view(arena: &Arc<Arena>, offset: usize, len: usize) -> DeviceBuffer {
 /// `[position, visible]` on the device. A captured decode graph bakes kernel
 /// arguments, so the values that change per token live in memory the kernels
 /// read instead.
+///
+/// `cuStreamWriteValue32` would write it without a host copy, but this device
+/// reports `CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1 = 0`, so the words go
+/// over as one eight-byte asynchronous copy instead.
 struct StateBuffer {
     buffer: DeviceBuffer,
-    /// Host mirror the asynchronous copy reads from; it has to outlive the copy.
+    /// Host mirror the copy reads from; it has to outlive the copy.
     values: Box<[i32; 2]>,
 }
 
@@ -201,6 +207,79 @@ impl Drop for Graph {
             let _ = cuGraphExecDestroy(self.exec);
         }
     }
+}
+
+/// What one kernel actually costs on this device, read from the driver instead
+/// of assumed: registers, static shared memory, the largest legal block, and how
+/// many blocks of the launched shape fit on one multiprocessor.
+///
+/// The wave plan and the shared-memory ceilings used to be numbers someone had
+/// to keep true by hand. They are now read once, at load, and the launch shapes
+/// are checked against them there — the launch path assumes nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelResources {
+    pub name: &'static str,
+    pub registers: i32,
+    pub static_shared: i32,
+    pub max_threads: i32,
+    pub block_threads: u32,
+    pub dynamic_shared: u32,
+    pub blocks_per_sm: i32,
+}
+
+/// Reads one kernel's cost and rejects a launch shape it cannot take.
+fn inspect(
+    function: Function,
+    name: &'static str,
+    block: (u32, u32, u32),
+    dynamic_shared: u32,
+) -> Result<KernelResources, EngineError> {
+    let threads = block.0 * block.1 * block.2;
+    let mut max_threads = 0i32;
+    let mut static_shared = 0i32;
+    let mut registers = 0i32;
+    // SAFETY: `function` is a live handle and each call writes one `i32`.
+    unsafe {
+        check(
+            cuFuncGetAttribute(&raw mut max_threads, FUNC_ATTRIBUTE_MAX_THREADS, function),
+            "cuFuncGetAttribute(max threads)",
+        )?;
+        check(
+            cuFuncGetAttribute(&raw mut static_shared, FUNC_ATTRIBUTE_SHARED_SIZE, function),
+            "cuFuncGetAttribute(shared)",
+        )?;
+        check(
+            cuFuncGetAttribute(&raw mut registers, FUNC_ATTRIBUTE_NUM_REGS, function),
+            "cuFuncGetAttribute(registers)",
+        )?;
+    }
+    if threads as i32 > max_threads {
+        return Err(EngineError::Unsupported(format!(
+            "cuda: {name} launches {threads} threads, its maximum is {max_threads}"
+        )));
+    }
+    let mut blocks = 0i32;
+    // SAFETY: the handle is live and the driver writes one `i32`.
+    unsafe {
+        check(
+            cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &raw mut blocks,
+                function,
+                threads as i32,
+                dynamic_shared as usize,
+            ),
+            "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+        )?;
+    }
+    Ok(KernelResources {
+        name,
+        registers,
+        static_shared,
+        max_threads,
+        block_threads: threads,
+        dynamic_shared,
+        blocks_per_sm: blocks.max(1),
+    })
 }
 
 /// A kernel handle, looked up by name once at open time.
@@ -255,8 +334,10 @@ pub struct Gpu {
     kernels: Kernels,
     name: String,
     total_bytes: usize,
-    /// Streaming multiprocessors, which is how many blocks one wave holds.
+    /// Streaming multiprocessors.
     multiprocessors: usize,
+    /// Blocks the prompt matmul puts on one multiprocessor, read from the driver.
+    prompt_blocks_per_sm: usize,
     /// One stream for every launch and copy, so the order is the one written
     /// here and a decode step can be captured.
     stream: Stream,
@@ -269,6 +350,9 @@ pub struct Gpu {
     /// captured with.
     state: Mutex<Option<StateBuffer>>,
     names: Vec<(Function, &'static str)>,
+    /// Parameters each kernel declares. A launch that passes a different number
+    /// would be handing the driver a buffer it will read past.
+    params: Vec<(Function, i32)>,
     profile_enabled: bool,
     profile: Mutex<Option<HashMap<&'static str, (f64, u64)>>>,
 }
@@ -362,8 +446,59 @@ impl Gpu {
                 embedding_rows: load("embedding_rows")?,
             };
 
+            // What the kernels cost, and whether the shapes they are launched
+            // with are legal for this device. Three of them decide the rest:
+            // the prompt matmul (77 KB of shared, sixteen warps), the tiled
+            // prefill attention (48 KB, eight warps) and the decode matmul
+            // (no shared, four rows per block).
+            let resources = [
+                inspect(
+                    kernels.matmul_mma,
+                    "q8_matmul_mma",
+                    (LANES, MMA_WARPS as u32, 1),
+                    MMA_SHARED_BYTES,
+                )?,
+                inspect(
+                    kernels.attention_prefill_mma,
+                    "attention_prefill_mma",
+                    (LANES, 8, 1),
+                    PREFILL_SHARED_BYTES,
+                )?,
+                inspect(
+                    kernels.matmul_decode,
+                    "q8_matmul_decode",
+                    ((DECODE_ROWS_PER_BLOCK as u32) * LANES, 1, 1),
+                    0,
+                )?,
+            ];
+            for resource in &resources {
+                info!(
+                    kernel = resource.name,
+                    registers = resource.registers,
+                    static_shared = resource.static_shared,
+                    dynamic_shared = resource.dynamic_shared,
+                    threads = resource.block_threads,
+                    max_threads = resource.max_threads,
+                    blocks_per_sm = resource.blocks_per_sm,
+                    "kernel resources"
+                );
+            }
+            let prompt_blocks_per_sm = resources[0].blocks_per_sm as usize;
+            let mut params: Vec<(Function, i32)> = Vec::with_capacity(names.len());
+            for (function, name) in &names {
+                let mut count = 0usize;
+                // SAFETY: the handle is live and the driver writes one `usize`.
+                check(
+                    cuFuncGetParamCount(*function, &raw mut count),
+                    "cuFuncGetParamCount",
+                )?;
+                trace!(kernel = name, parameters = count, "kernel signature");
+                params.push((*function, count as i32));
+            }
+
             Ok(Self {
                 names,
+                params,
                 profile_enabled: std::env::var("LLM_PROFILE").is_ok(),
                 profile: Mutex::new(std::env::var("LLM_PROFILE").ok().map(|_| HashMap::new())),
                 context,
@@ -371,6 +506,7 @@ impl Gpu {
                 name,
                 total_bytes,
                 multiprocessors: multiprocessors.max(1) as usize,
+                prompt_blocks_per_sm,
                 weights: Mutex::new(HashMap::new()),
                 stream,
                 workspace: Mutex::new(None),
@@ -427,8 +563,10 @@ impl Gpu {
     }
 
     /// Blocks that run concurrently: one wave.
-    pub fn multiprocessors(&self) -> usize {
-        self.multiprocessors
+    /// Blocks one wave holds for the prompt matmul: multiprocessors times what
+    /// the driver says fits on each. The wave plan used to assume one.
+    pub fn blocks_per_wave(&self) -> usize {
+        self.multiprocessors * self.prompt_blocks_per_sm
     }
 
     /// Free device memory right now, used to decide whether a model fits.
@@ -499,7 +637,7 @@ impl Gpu {
         state.values[1] = visible as i32;
         // Asynchronous on purpose: the stream orders this copy before the
         // launches that read it, so a decode step does not wait on the host. The
-        // source is owned by the same struct, so it outlives the copy.
+        // source lives in this struct, so it outlives the copy.
         // SAFETY: both pointers are valid for the copied length.
         let status = unsafe {
             cuMemcpyHtoDAsync_v2(
@@ -1394,7 +1532,7 @@ impl Gpu {
             resolved.push((resolved[0].0, resolved[0].1, 0, resolved[0].3));
         }
         let token_tiles = n.div_ceil(MMA_BLOCK_TOKENS);
-        let plan = wave_plan(row_tiles, token_tiles, self.multiprocessors());
+        let plan = wave_plan(row_tiles, token_tiles, self.blocks_per_wave());
         let mut args = [
             Arg::Pointer(resolved[0].0),
             Arg::Pointer(resolved[0].1),
@@ -1639,6 +1777,22 @@ impl Gpu {
             .iter()
             .find(|(handle, _)| handle.0 == function.0)
             .map_or("unknown", |(_, name)| *name);
+        // The launch and the kernel signature are two places that have to agree,
+        // and nothing in the driver checks it: `cuLaunchKernel` reads as many
+        // parameters as the kernel declares, whatever the caller passed. Checked
+        // where it costs nothing, which is every test run.
+        if cfg!(debug_assertions) {
+            let declared = self
+                .params
+                .iter()
+                .find(|(handle, _)| handle.0 == function.0)
+                .map_or(-1, |(_, count)| *count);
+            debug_assert!(
+                declared == args.len() as i32,
+                "{kernel} declares {declared} parameters, the launch passes {}",
+                args.len()
+            );
+        }
         trace!(
             kernel,
             grid = ?grid,
