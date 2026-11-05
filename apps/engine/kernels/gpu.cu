@@ -1433,13 +1433,21 @@ extern "C" __global__ __launch_bounds__(256, 2) void attention_prefill_mma(
         return;
     }
 
-    for (int index = tid; index < FA8_HEADS * queries * head_dim; index += threads) {
+    // Query rows are contiguous in memory. Load four f32 values at a time and
+    // convert them into two half2 stores; this cuts the staging instruction
+    // count without changing the tensor-core input layout.
+    for (int index = tid * 4; index < FA8_HEADS * queries * head_dim; index += threads * 4) {
         const int slot = index / (queries * head_dim);
         const int rest = index % (queries * head_dim);
         const int row = rest / head_dim;
         const int dim = rest % head_dim;
-        q_tile[(slot * FA8_QUERY_TILE + row) * FA8_HEAD_DIM + dim] =
-            __float2half(query[((size_t)(first_query + row) * n_head + group * FA8_HEADS + slot) * head_dim + dim]);
+        const float* source = query +
+            ((size_t)(first_query + row) * n_head + group * FA8_HEADS + slot) * head_dim + dim;
+        const float4 values = *reinterpret_cast<const float4*>(source);
+        __half2* destination = reinterpret_cast<__half2*>(
+            q_tile + (slot * FA8_QUERY_TILE + row) * FA8_HEAD_DIM + dim);
+        destination[0] = __floats2half2_rn(values.x, values.y);
+        destination[1] = __floats2half2_rn(values.z, values.w);
     }
 
     // Each lane owns query rows row_low and row_low + 8, and the two score
@@ -1464,18 +1472,26 @@ extern "C" __global__ __launch_bounds__(256, 2) void attention_prefill_mma(
     const int max_visible = start + min(first_query + queries, tokens);
     for (int base = 0; base < max_visible; base += FA8_KEY_TILE) {
         const int keys_here = min(FA8_KEY_TILE, max_visible - base);
-        for (int index = tid; index < FA8_KEY_TILE * head_dim; index += threads) {
+        // The source K/V rows are contiguous half values. Keep K's dim-major
+        // shared layout, but stage both operands in half2 pairs to reduce
+        // global load and conversion overhead.
+        for (int index = tid * 2; index < FA8_KEY_TILE * head_dim; index += threads * 2) {
             const int row = index / head_dim;
             const int dim = index % head_dim;
             if (row < keys_here) {
                 const size_t source = (size_t)(base + row) * kv_dim + kv_head * head_dim + dim;
                 // K is staged dim-major so the K^T fragments load untransposed;
                 // V stays row-major for the PV fragments.
-                k_tile[dim * FA8_KEY_TILE + row] = keys[source];
-                v_tile[row * FA8_HEAD_DIM + dim] = values[source];
+                const __half2 key_values = *reinterpret_cast<const __half2*>(keys + source);
+                const __half2 value_values = *reinterpret_cast<const __half2*>(values + source);
+                k_tile[dim * FA8_KEY_TILE + row] = key_values.x;
+                k_tile[(dim + 1) * FA8_KEY_TILE + row] = key_values.y;
+                *reinterpret_cast<__half2*>(v_tile + row * FA8_HEAD_DIM + dim) = value_values;
             } else {
                 k_tile[dim * FA8_KEY_TILE + row] = __float2half(0.0f);
-                v_tile[row * FA8_HEAD_DIM + dim] = __float2half(0.0f);
+                k_tile[(dim + 1) * FA8_KEY_TILE + row] = __float2half(0.0f);
+                *reinterpret_cast<__half2*>(v_tile + row * FA8_HEAD_DIM + dim) =
+                    __floats2half2_rn(0.0f, 0.0f);
             }
         }
         __syncthreads();
