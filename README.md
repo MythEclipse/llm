@@ -722,11 +722,51 @@ nyata di repo ini:
 ```
 $ llm-cli inspect models/moe-expert-coder-4b-Q8_0.gguf
 architecture  qwen35
-tokenizer     vocab 248320, pre-tokenizer qwen35 (belum didukung)
+geometry      layers 32, embedding 2560, head dim 256, experts 128
+tokenizer     family gpt2, vocab 248320, pre-tokenizer qwen35
 chat template chatml
-runnable      no — architecture qwen35 interleaves state-space blocks with
-              attention; this engine implements dense attention blocks only
+verdict       runnable — yes, on the cpu path
 ```
+
+## Blok state-space: gated delta net
+
+Model `qwen35` menyelang blok attention penuh dengan blok recurrent: tiap blok
+ke-4 attention, sisanya gated delta net. Yang dibaca dari header:
+`{arch}.full_attention_interval`, `ssm.conv_kernel`, `ssm.state_size`,
+`ssm.inner_size`, `ssm.time_step_rank`, `ssm.group_count`. Tensor per blok
+recurrent: `attn_qkv`, `attn_gate`, `ssm_conv1d`, `ssm_a`, `ssm_dt.bias`,
+`ssm_alpha`, `ssm_beta`, `ssm_norm`, `ssm_out`; blok attention-nya memakai
+`attn_q_norm`/`attn_k_norm` dan proyeksi q yang dua kali lebar (query + gerbang
+sigmoid di sebelahnya).
+
+Alurnya ada di `apps/engine/src/deltanet.rs`, spesifikasinya di
+`docs/research/qwen35-deltanet.md`: konvolusi kausal per kanal atas `q|k|v` yang
+dipadatkan, L2-normalisasi q/k per head, delta rule per head nilai
+(`S *= exp(g)`, `delta = (v - S·k)·beta`, `S += k·delta`, `out = S·q/√d`), lalu
+gated RMSNorm dengan gerbang `silu(z)` dan proyeksi `ssm_out`.
+
+Blok ini berjalan di host, jadi model yang memakainya (atau yang head-nya lebih
+dari 128, atau yang menormalkan q/k per head) tidak ditawari jalur GPU: satu
+sumber kebenaran lebih baik daripada jalur cepat yang diam-diam salah. Model
+yang seluruhnya dense tetap memakai GPU seperti sebelumnya.
+
+Verifikasi: `llama-eval-callback` dari llama.cpp `d812350493` (build yang
+menjalankan file ini 10,5 t/s) membuang nilai tiap tensor, dan
+`scripts/compare_reference.py` membandingkannya dengan dump engine
+(`LLM_DUMP_LAYERS=<dir> llm-cli ...` menulis tiap blok sebagai f32 mentah).
+Hasilnya: embedding dan normalisasi identik sampai galat cetak (4e-5),
+proyeksi `attn_qkv` 3e-4, keluaran delta rule 5e-5, keluaran blok 0 ~1e-3 —
+tingkat derau kuantisasi aktivasi Q8_0. Keluaran greedy untuk prompt uji sama
+dengan llama.cpp ("The capital of France is" → " Paris." lalu EOS).
+
+Dua hal yang mudah salah dan sudah diperbaiki di sini: bobot `ssm_conv1d`
+tersimpan `[kanal, tap]` (tap tercepat), bukan `[tap, kanal]`; dan bias
+`ssm_dt` harus ditambahkan sebelum softplus. Salah satunya menghasilkan model
+yang tetap jalan dan mengeluarkan teks yang meyakinkan tapi salah.
+
+Kecepatan sekarang: 7 t/s decode di CPU untuk 4,2B Q8_0 (llama.cpp 10 t/s).
+Prefill memproses blok recurrent token demi token; bentuk chunked-parallel dan
+kernel GPU adalah pekerjaan berikutnya, bukan syarat kebenaran.
 
 ## Mixture of experts
 

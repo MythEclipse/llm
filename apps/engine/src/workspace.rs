@@ -146,6 +146,20 @@ impl BufferPlan {
     }
 }
 
+/// The three widths the delta net buffers are sized from.
+#[derive(Clone, Copy)]
+struct SsmShapes {
+    key_dim: usize,
+    inner: usize,
+    v_heads: usize,
+}
+
+impl SsmShapes {
+    fn conv_dim(&self) -> usize {
+        2 * self.key_dim + self.inner
+    }
+}
+
 fn align_up(offset: usize) -> usize {
     offset.div_ceil(ALIGN) * ALIGN
 }
@@ -162,6 +176,11 @@ pub fn scratch_requests(
 ) -> Vec<BufferRequest> {
     let embd = tokens * config.n_embd;
     let kv = tokens * config.kv_dim();
+    let ssm = config.ssm.map(|ssm| SsmShapes {
+        key_dim: ssm.state_size * ssm.k_heads,
+        inner: ssm.inner,
+        v_heads: ssm.v_heads,
+    });
     // One buffer set serves both block types, so it is sized for the wider one.
     let ffn = tokens * config.n_ff.max(config.expert_ff);
     vec![
@@ -191,9 +210,11 @@ pub fn scratch_requests(
             first_use: NORM_ATTN,
             last_use: QKV,
         },
+        // The query is `n_head × head_dim` wide, which is not `n_embd` when the
+        // model's heads are wider than its embedding divided by its head count.
         BufferRequest {
             name: "q",
-            floats: embd,
+            floats: tokens * config.n_head * config.head_dim,
             first_use: QKV,
             last_use: ROPE,
         },
@@ -211,7 +232,7 @@ pub fn scratch_requests(
         },
         BufferRequest {
             name: "attn",
-            floats: embd,
+            floats: tokens * config.n_head * config.head_dim,
             first_use: ATTEND,
             last_use: OUT,
         },
@@ -262,6 +283,60 @@ pub fn scratch_requests(
             floats: config.expert_count,
             first_use: FFN_UP,
             last_use: ACT,
+        },
+        // A gated attention block projects query and gate together, then splits
+        // them; a plain block leaves both empty.
+        BufferRequest {
+            name: "q_full",
+            floats: if config.q_gate {
+                tokens * config.n_head * config.head_dim * 2
+            } else {
+                0
+            },
+            first_use: QKV,
+            last_use: QKV,
+        },
+        BufferRequest {
+            name: "attn_gate",
+            floats: if config.q_gate {
+                tokens * config.n_head * config.head_dim
+            } else {
+                0
+            },
+            first_use: QKV,
+            last_use: ATTEND,
+        },
+        // Delta net projections, sized from the header. Zero when the model has
+        // no recurrent blocks.
+        BufferRequest {
+            name: "recurrent_qkv",
+            floats: ssm.map_or(0, |ssm| tokens * ssm.conv_dim()),
+            first_use: QKV,
+            last_use: ROPE,
+        },
+        BufferRequest {
+            name: "recurrent_z",
+            floats: ssm.map_or(0, |ssm| tokens * ssm.inner),
+            first_use: QKV,
+            last_use: OUT,
+        },
+        BufferRequest {
+            name: "recurrent_alpha",
+            floats: ssm.map_or(0, |ssm| tokens * ssm.v_heads),
+            first_use: QKV,
+            last_use: ROPE,
+        },
+        BufferRequest {
+            name: "recurrent_beta",
+            floats: ssm.map_or(0, |ssm| tokens * ssm.v_heads),
+            first_use: QKV,
+            last_use: ROPE,
+        },
+        BufferRequest {
+            name: "recurrent_out",
+            floats: ssm.map_or(0, |ssm| tokens * ssm.inner),
+            first_use: ROPE,
+            last_use: OUT,
         },
     ]
 }

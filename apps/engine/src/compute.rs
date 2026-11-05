@@ -31,6 +31,24 @@ impl Activation {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The values, when this activation lives in host memory.
+    ///
+    /// The host-only block math (the delta net) uses this to avoid a copy that
+    /// would exist only to satisfy the device interface.
+    pub fn host(&self) -> Option<&[f32]> {
+        match self {
+            Self::Host(values) => Some(values),
+            Self::Device(_) => None,
+        }
+    }
+
+    pub fn host_mut(&mut self) -> Option<&mut [f32]> {
+        match self {
+            Self::Host(values) => Some(values),
+            Self::Device(_) => None,
+        }
+    }
 }
 
 /// Activations already quantised for the matmuls that read them. `buffer` is
@@ -139,7 +157,7 @@ impl Compute {
         Self::with_note(None, None, config)
     }
 
-    fn with_note(gpu: Option<Gpu>, note: Option<String>, config: &Config) -> Self {
+    pub fn with_note(gpu: Option<Gpu>, note: Option<String>, config: &Config) -> Self {
         let plan = KernelPlan::for_model(config, gpu.as_ref().map(Gpu::name));
         Self { gpu, note, plan }
     }

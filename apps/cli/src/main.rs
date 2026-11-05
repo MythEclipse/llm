@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_tokens = DEFAULT_MAX_TOKENS;
     let mut temperature = 0.7f32;
     let mut prompt_parts = Vec::new();
+    let mut chat_mode = false;
 
     let mut args = command.into_iter().chain(arguments);
     while let Some(argument) = args.next() {
@@ -66,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-tokens" => {
                 max_tokens = args.next().ok_or("--max-tokens needs a number")?.parse()?
             }
+            "--chat" => chat_mode = true,
             "--temperature" => {
                 temperature = args.next().ok_or("--temperature needs a number")?.parse()?
             }
@@ -104,7 +106,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &stop_tokens,
         )
     } else {
-        let prompt = tokenizer.encode(&prompt_parts.join(" "));
+        if chat_mode {
+            // One user turn, rendered with the template the file declares — the
+            // shape a chat front end would send.
+            let content = prompt_parts.join(" ");
+            let turns = [Turn {
+                role: Role::User,
+                content: &content,
+            }];
+            let prompt = tokenizer.encode(&chat.render(&turns, false));
+            return complete(
+                &model,
+                &tokenizer,
+                prompt,
+                context,
+                max_tokens,
+                params,
+                &stop_tokens,
+            );
+        }
+        // A completion prompt starts with the file's own beginning of sequence,
+        // the way llama.cpp's prompt mode does; the chat path gets it from the
+        // template instead.
+        let mut prompt = Vec::new();
+        prompt.extend(tokenizer.bos_id());
+        prompt.extend(tokenizer.encode(&prompt_parts.join(" ")));
         complete(
             &model,
             &tokenizer,

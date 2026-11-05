@@ -99,6 +99,10 @@ fn tiled_matches_host() {
         expert_count: 0,
         expert_used: 0,
         expert_ff: 6144,
+        full_attention_interval: 0,
+        ssm: None,
+        qk_norm: false,
+        q_gate: false,
     };
     let compute = Compute::auto(&config, 0);
     assert_eq!(

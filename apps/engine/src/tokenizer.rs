@@ -34,6 +34,15 @@ const PRE_QWEN2: [&str; 2] = [
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^ \t\n\x0b\f\r\p{L}\p{N}]+[\r\n]*|[ \t\n\x0b\f\r]*[\r\n]+|[ \t\n\x0b\f\r]+(?![^ \t\n\x0b\f\r])|[ \t\n\x0b\f\r]+",
 ];
 
+/// llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN35`: a letter run also takes the Unicode
+/// combining marks that follow it, and digits are cut one at a time. The
+/// reference implements this as a hand-written scanner; the expression in its
+/// comment is what the scanner decides, and it is applied here as a regex the
+/// way the other pre-tokenizers are.
+const PRE_QWEN35: [&str; 1] = [
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^ \t\n\x0b\f\r\p{L}\p{M}\p{N}]+[\r\n]*|[ \t\n\x0b\f\r]*[\r\n]+|[ \t\n\x0b\f\r]+(?![^ \t\n\x0b\f\r])|[ \t\n\x0b\f\r]+",
+];
+
 /// llama.cpp `LLAMA_VOCAB_PRE_TYPE_GPT2`, also used by `llama-bpe` models.
 const PRE_GPT2: [&str; 1] = [
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^ \t\n\x0b\f\r\p{L}\p{N}]+|[ \t\n\x0b\f\r]+(?![^ \t\n\x0b\f\r])|[ \t\n\x0b\f\r]+",
@@ -458,11 +467,12 @@ fn pre_tokenizer(name: &str) -> Result<Vec<Regex>, EngineError> {
     let patterns: &[&str] = match name {
         "minicpm5" => &PRE_MINICPM5,
         "qwen2" => &PRE_QWEN2,
+        "qwen35" => &PRE_QWEN35,
         "gpt2" | "llama-bpe" | "default" | "" => &PRE_GPT2,
         other => {
             return Err(EngineError::Unsupported(format!(
                 "tokenizer.ggml.pre = {other:?}; this engine implements the minicpm5, \
-                 qwen2, gpt2 and llama-bpe pre-tokenizers"
+                 qwen2, qwen35, gpt2 and llama-bpe pre-tokenizers"
             )));
         }
     };

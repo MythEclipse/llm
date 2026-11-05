@@ -89,6 +89,10 @@ impl Template {
 pub struct ChatFormat {
     template: Template,
     bos: String,
+    /// Whether the declared template wraps answers in a reasoning block. Only
+    /// the models that were trained with one declare `<think>`; emitting it for
+    /// every ChatML model would prepend two tokens the model never saw.
+    thinking: bool,
 }
 
 impl ChatFormat {
@@ -97,6 +101,7 @@ impl ChatFormat {
         Self {
             template: Template::ChatMl,
             bos: BOS.to_string(),
+            thinking: true,
         }
     }
 
@@ -111,6 +116,7 @@ impl ChatFormat {
         Ok(Self {
             template: Template::detect(declared)?,
             bos,
+            thinking: declared.contains("<think>"),
         })
     }
 
@@ -147,17 +153,19 @@ impl ChatFormat {
             prompt.push_str("<|im_start|>");
             prompt.push_str(turn.role.as_str());
             prompt.push('\n');
-            if turn.role == Role::Assistant && !turn.content.contains("</think>") {
+            if self.thinking && turn.role == Role::Assistant && !turn.content.contains("</think>") {
                 prompt.push_str("<think>\n\n</think>\n\n");
             }
             prompt.push_str(turn.content);
             prompt.push_str("<|im_end|>\n");
         }
         prompt.push_str("<|im_start|>assistant\n");
-        if thinking {
-            prompt.push_str("<think>\n");
-        } else {
-            prompt.push_str("<think>\n\n</think>\n\n");
+        if self.thinking {
+            if thinking {
+                prompt.push_str("<think>\n");
+            } else {
+                prompt.push_str("<think>\n\n</think>\n\n");
+            }
         }
         prompt
     }

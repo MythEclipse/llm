@@ -1,7 +1,7 @@
 //! One conversation's inference state: KV cache, rope table, position, scratch.
 
 use crate::error::EngineError;
-use crate::model::{DecodeGraphs, KvCache, Model, Scratch};
+use crate::model::{DecodeGraphs, KvCache, Model, RecurrentCache, Scratch};
 use crate::ops::RopeTable;
 use tracing::{debug, instrument};
 
@@ -12,6 +12,8 @@ pub const PREFILL_CHUNK: usize = 1024;
 pub struct Session<'a> {
     model: &'a Model<'a>,
     kv: KvCache,
+    /// Convolution and delta rule state, one entry per recurrent block.
+    recurrent: RecurrentCache,
     rope: RopeTable,
     /// One token's buffers, allocated when the session opens: a chat spends
     /// almost all of its time here.
@@ -31,6 +33,7 @@ impl<'a> Session<'a> {
         }
         Ok(Self {
             kv: KvCache::new(model.compute(), &model.config, capacity)?,
+            recurrent: RecurrentCache::new(&model.config),
             rope: model.rope_table(capacity),
             decode: Scratch::new(model.compute(), &model.config, 1, capacity)?,
             prefill: None,
@@ -55,6 +58,11 @@ impl<'a> Session<'a> {
         self.kv.bytes()
     }
 
+    /// Bytes the recurrent blocks' state holds.
+    pub fn recurrent_bytes(&self) -> usize {
+        self.recurrent.bytes()
+    }
+
     /// Bytes the scratch plans hold: one token's, plus a chunk's once a prompt
     /// has been processed.
     pub fn scratch_bytes(&self) -> usize {
@@ -65,6 +73,7 @@ impl<'a> Session<'a> {
     pub fn reset(&mut self) {
         debug!(position = self.position(), "resetting session");
         self.kv.reset();
+        self.recurrent.reset();
     }
 
     /// Process a whole prompt and return the logits for its last token.
@@ -80,12 +89,13 @@ impl<'a> Session<'a> {
             let Self {
                 model,
                 kv,
+                recurrent,
                 rope,
                 prefill,
                 ..
             } = self;
             let scratch = prefill.as_mut().expect("reserved just above");
-            logits = model.forward(chunk, kv, rope, scratch)?;
+            logits = model.forward(chunk, kv, recurrent, rope, scratch)?;
         }
         Ok(logits)
     }
@@ -96,12 +106,13 @@ impl<'a> Session<'a> {
         let Self {
             model,
             kv,
+            recurrent,
             rope,
             decode,
             graphs,
             ..
         } = self;
-        model.forward_decode(token, kv, rope, decode, graphs)
+        model.forward_decode(token, kv, recurrent, rope, decode, graphs)
     }
 
     /// How many decode steps this session is replaying from a graph.

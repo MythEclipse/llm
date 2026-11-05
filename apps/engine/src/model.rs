@@ -1,7 +1,12 @@
-//! The MiniCPM5 transformer: embeddings → 42 decoder layers → logits.
+//! The transformer: embeddings → decoder blocks → logits.
+//!
+//! Two block types share the loop. A dense block is attention; a `qwen35` block
+//! is either attention (with a gate and per-head q/k norms) or a gated delta net,
+//! decided per layer from the header. The feed-forward half is the same for both.
 
 use crate::compute::{Activation, AttentionSpec, Compute, GroupMember, Workspace};
 use crate::cuda::Graph;
+use crate::deltanet;
 use crate::error::EngineError;
 use crate::gguf::{DType, GgufFile};
 use crate::ops::RopeTable;
@@ -28,6 +33,29 @@ pub struct Config {
     pub expert_used: usize,
     /// Hidden width inside one expert. Equal to `n_ff` when dense.
     pub expert_ff: usize,
+    /// `full_attention_interval`: every Nth block is a full attention layer and
+    /// the rest are recurrent. Zero means every block is attention.
+    pub full_attention_interval: usize,
+    /// Shapes of the gated delta net blocks, when the model has any.
+    pub ssm: Option<SsmConfig>,
+    /// Whether attention layers normalise q and k per head before rope.
+    pub qk_norm: bool,
+    /// Whether the query projection packs a sigmoid gate beside each query.
+    pub q_gate: bool,
+}
+
+/// The shapes a gated delta net block works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsmConfig {
+    pub conv_kernel: usize,
+    /// Width of one key and one value head.
+    pub state_size: usize,
+    /// Total width of all value heads.
+    pub inner: usize,
+    /// Value heads (`ssm.time_step_rank`).
+    pub v_heads: usize,
+    /// Key heads (`ssm.group_count`).
+    pub k_heads: usize,
 }
 
 impl Config {
@@ -83,16 +111,53 @@ impl Config {
             )));
         }
 
+        // A model that interleaves two block types says how often attention
+        // appears; the rest of the blocks are recurrent. llama.cpp derives the
+        // same way when the file carries no explicit per-layer array.
+        let full_attention_interval = read("full_attention_interval").unwrap_or(0) as usize;
+        let ssm = if gguf.has_key_prefix(&format!("{architecture}.ssm.")) {
+            Some(SsmConfig {
+                conv_kernel: required("ssm.conv_kernel")? as usize,
+                state_size: required("ssm.state_size")? as usize,
+                inner: required("ssm.inner_size")? as usize,
+                v_heads: required("ssm.time_step_rank")? as usize,
+                k_heads: required("ssm.group_count")? as usize,
+            })
+        } else {
+            None
+        };
+        if ssm.is_some() && full_attention_interval == 0 {
+            return Err(EngineError::Format(
+                "state-space blocks without full_attention_interval: cannot tell which \
+                 layers are recurrent"
+                    .into(),
+            ));
+        }
+
         if !n_head.is_multiple_of(n_head_kv.max(1)) {
             return Err(EngineError::Format(
                 "query head count is not a multiple of kv head count".into(),
             ));
         }
-        check_supported(
-            architecture,
-            head_dim,
-            gguf.has_key_prefix(&format!("{architecture}.ssm.")),
-        )?;
+        check_supported(architecture, head_dim)?;
+        // Per-head q/k norms are host code, so their presence decides the path
+        // before any layer is loaded.
+        let first_attention = (0..n_layers)
+            .find(|index| {
+                !(ssm.is_some()
+                    && full_attention_interval > 0
+                    && !(index + 1).is_multiple_of(full_attention_interval))
+            })
+            .unwrap_or(0);
+        let qk_norm = gguf
+            .data(&format!("blk.{first_attention}.attn_q_norm.weight"))
+            .is_ok();
+        // A query projection twice as wide as the heads it serves carries a gate
+        // beside each query.
+        let q_gate = gguf
+            .tensor(&format!("blk.{first_attention}.attn_q.weight"))
+            .map(|tensor| tensor.dims[1] as usize == 2 * n_head * head_dim)
+            .unwrap_or(false);
 
         Ok(Self {
             n_layers,
@@ -108,7 +173,32 @@ impl Config {
             expert_count,
             expert_used,
             expert_ff,
+            full_attention_interval,
+            ssm,
+            qk_norm,
+            q_gate,
         })
+    }
+
+    /// Whether block `index` runs a gated delta net instead of attention.
+    pub fn is_recurrent(&self, index: usize) -> bool {
+        self.ssm.is_some()
+            && self.full_attention_interval > 0
+            && !(index + 1).is_multiple_of(self.full_attention_interval)
+    }
+
+    /// How many blocks keep keys and values.
+    pub fn attention_layers(&self) -> usize {
+        (0..self.n_layers)
+            .filter(|index| !self.is_recurrent(*index))
+            .count()
+    }
+
+    /// Whether this model needs the host code paths: the delta net runs on the
+    /// host, and the attention kernels are written for a head dimension of at
+    /// most 128.
+    pub fn needs_host_path(&self) -> bool {
+        self.ssm.is_some() || self.head_dim > 128 || self.qk_norm
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -123,22 +213,12 @@ impl Config {
 
 /// Whether this engine can run the model at all, decided from its header.
 ///
-/// Every kernel here is written for a dense attention block with a head
-/// dimension of at most 128. A model that interleaves another block type (a
-/// state-space layer, for instance) needs a forward pass this engine does not
-/// have, and saying so at load is better than half-loading it.
-fn check_supported(
-    architecture: &str,
-    head_dim: usize,
-    has_state_space: bool,
-) -> Result<(), EngineError> {
-    if has_state_space {
-        return Err(EngineError::Unsupported(format!(
-            "architecture {architecture} interleaves state-space blocks with attention; \
-             this engine implements dense attention blocks only"
-        )));
-    }
-    if head_dim > 128 {
+/// Two block types are implemented: attention and the gated delta net. The
+/// device kernels are written for a head dimension of at most 128; wider heads
+/// run on the host, which [`Config::needs_host_path`] reports.
+fn check_supported(architecture: &str, head_dim: usize) -> Result<(), EngineError> {
+    let _ = architecture;
+    if head_dim > 256 {
         return Err(EngineError::Unsupported(format!(
             "head_dim {head_dim} exceeds the 128 the attention kernels are written for"
         )));
@@ -156,12 +236,43 @@ pub struct ModelDescription {
 
 struct Layer<'a> {
     attn_norm: &'a [f32],
+    /// The norm the feed-forward reads. A model with a post-attention norm uses
+    /// that one, and its residual is the value before the norm; a llama-shaped
+    /// model uses `ffn_norm`. The block arithmetic is the same either way.
     ffn_norm: &'a [f32],
-    wq: Weight<'a>,
-    wk: Weight<'a>,
-    wv: Weight<'a>,
-    wo: Weight<'a>,
+    attn: Attention<'a>,
     feed_forward: FeedForward<'a>,
+}
+
+/// The mixing half of a block: attention, or a gated delta net.
+enum Attention<'a> {
+    Dense(DenseAttention<'a>),
+    Recurrent(RecurrentAttention<'a>),
+}
+
+struct DenseAttention<'a> {
+    q: Weight<'a>,
+    k: Weight<'a>,
+    v: Weight<'a>,
+    out: Weight<'a>,
+    /// Per-head RMS norms over the head dimension, applied before rope.
+    q_norm: Option<&'a [f32]>,
+    k_norm: Option<&'a [f32]>,
+    /// The query projection packs a sigmoid gate beside every query, which is
+    /// multiplied into the attention output before the output projection.
+    gated: bool,
+}
+
+struct RecurrentAttention<'a> {
+    qkv: Weight<'a>,
+    gate: Weight<'a>,
+    alpha: Weight<'a>,
+    beta: Weight<'a>,
+    out: Weight<'a>,
+    conv: &'a [f32],
+    decay: &'a [f32],
+    dt: &'a [f32],
+    norm: &'a [f32],
 }
 
 /// The feed-forward half of a layer: one dense block, or a router over a stack
@@ -236,6 +347,9 @@ pub struct KvCache {
     kv_dim: usize,
     keys: Vec<Activation>,
     values: Vec<Activation>,
+    /// Which slot each block keeps its keys in. A recurrent block keeps none,
+    /// and holding a cache for it would be dead memory at context length.
+    slots: Vec<Option<usize>>,
     len: usize,
     entries_f16: bool,
 }
@@ -253,9 +367,15 @@ impl KvCache {
         } else {
             per_layer
         };
-        let mut keys = Vec::with_capacity(config.n_layers);
-        let mut values = Vec::with_capacity(config.n_layers);
-        for _ in 0..config.n_layers {
+        let mut keys = Vec::with_capacity(config.attention_layers());
+        let mut values = Vec::with_capacity(config.attention_layers());
+        let mut layer_slots = Vec::with_capacity(config.n_layers);
+        for index in 0..config.n_layers {
+            if config.is_recurrent(index) {
+                layer_slots.push(None);
+                continue;
+            }
+            layer_slots.push(Some(keys.len()));
             keys.push(compute.alloc(slots)?);
             values.push(compute.alloc(slots)?);
         }
@@ -264,9 +384,15 @@ impl KvCache {
             kv_dim: config.kv_dim(),
             keys,
             values,
+            slots: layer_slots,
             len: 0,
             entries_f16: device,
         })
+    }
+
+    /// The cache slot block `layer` writes to, or `None` when it keeps no keys.
+    pub fn slot(&self, layer: usize) -> Option<usize> {
+        self.slots.get(layer).copied().flatten()
     }
 
     pub fn len(&self) -> usize {
@@ -291,10 +417,62 @@ impl KvCache {
         self.len = 0;
     }
 
+    pub fn keys_mut(&mut self, layer: usize) -> Option<(&mut Activation, &mut Activation)> {
+        let slot = self.slot(layer)?;
+        Some((&mut self.keys[slot], &mut self.values[slot]))
+    }
+
     /// Moves the position forward without a pass. A replayed graph has already
     /// written the keys and values; the counter still has to follow.
     pub fn advance(&mut self, tokens: usize) {
         self.len += tokens;
+    }
+}
+
+/// The state the recurrent blocks carry between tokens.
+///
+/// It lives with the session, not with the model: two conversations have
+/// different histories, and this is history. Held on the host because the delta
+/// rule runs there — see `deltanet`.
+pub struct RecurrentCache {
+    /// One entry per block; empty for the attention blocks.
+    layers: Vec<Vec<f32>>,
+    geometry: Option<deltanet::Geometry>,
+}
+
+impl RecurrentCache {
+    pub fn new(config: &Config) -> Self {
+        let geometry = deltanet::Geometry::from_config(config);
+        let layers = (0..config.n_layers)
+            .map(|index| match geometry {
+                Some(geometry) if config.is_recurrent(index) => {
+                    vec![0.0; geometry.conv_state_len() + geometry.ssm_state_len()]
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        Self { layers, geometry }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().map(Vec::len).sum::<usize>() * std::mem::size_of::<f32>()
+    }
+
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            layer.fill(0.0);
+        }
+    }
+
+    fn layer_mut(&mut self, index: usize) -> Option<(&mut [f32], &mut [f32])> {
+        let geometry = self.geometry?;
+        let (conv_len, ssm_len) = (geometry.conv_state_len(), geometry.ssm_state_len());
+        let layer = self.layers.get_mut(index)?;
+        if layer.len() != conv_len + ssm_len {
+            return None;
+        }
+        let (conv, ssm) = layer.split_at_mut(conv_len);
+        Some((conv, ssm))
     }
 }
 
@@ -330,93 +508,27 @@ impl<'a> Model<'a> {
             .sum();
         let mut layers = Vec::with_capacity(config.n_layers);
         for index in 0..config.n_layers {
-            let prefix = format!("blk.{index}");
-            layers.push(Layer {
-                attn_norm: as_f32(gguf.data(&format!("{prefix}.attn_norm.weight"))?),
-                ffn_norm: as_f32(gguf.data(&format!("{prefix}.ffn_norm.weight"))?),
-                wq: weight(
-                    gguf,
-                    &format!("{prefix}.attn_q.weight"),
-                    config.n_embd,
-                    config.n_embd,
-                )?,
-                wk: weight(
-                    gguf,
-                    &format!("{prefix}.attn_k.weight"),
-                    config.n_embd,
-                    config.kv_dim(),
-                )?,
-                wv: weight(
-                    gguf,
-                    &format!("{prefix}.attn_v.weight"),
-                    config.n_embd,
-                    config.kv_dim(),
-                )?,
-                wo: weight(
-                    gguf,
-                    &format!("{prefix}.attn_output.weight"),
-                    config.n_embd,
-                    config.n_embd,
-                )?,
-                feed_forward: if config.expert_count == 0 {
-                    FeedForward::Dense {
-                        gate: weight(
-                            gguf,
-                            &format!("{prefix}.ffn_gate.weight"),
-                            config.n_embd,
-                            config.n_ff,
-                        )?,
-                        up: weight(
-                            gguf,
-                            &format!("{prefix}.ffn_up.weight"),
-                            config.n_embd,
-                            config.n_ff,
-                        )?,
-                        down: weight(
-                            gguf,
-                            &format!("{prefix}.ffn_down.weight"),
-                            config.n_ff,
-                            config.n_embd,
-                        )?,
-                    }
-                } else {
-                    FeedForward::Sparse {
-                        router: weight(
-                            gguf,
-                            &format!("{prefix}.ffn_gate_inp.weight"),
-                            config.n_embd,
-                            config.expert_count,
-                        )?,
-                        gate: experts(
-                            gguf,
-                            &format!("{prefix}.ffn_gate_exps.weight"),
-                            config.n_embd,
-                            config.expert_ff,
-                            config.expert_count,
-                        )?,
-                        up: experts(
-                            gguf,
-                            &format!("{prefix}.ffn_up_exps.weight"),
-                            config.n_embd,
-                            config.expert_ff,
-                            config.expert_count,
-                        )?,
-                        down: experts(
-                            gguf,
-                            &format!("{prefix}.ffn_down_exps.weight"),
-                            config.expert_ff,
-                            config.n_embd,
-                            config.expert_count,
-                        )?,
-                    }
-                },
-            });
+            layers.push(load_layer(gguf, &config, index)?);
         }
         let token_embd = weight(gguf, "token_embd.weight", config.n_embd, config.n_vocab)?;
-        let output = weight(gguf, "output.weight", config.n_embd, config.n_vocab)?;
+        // A file may tie the output head to the token embedding, in which case
+        // there is no `output.weight` and the embedding matrix is the head.
+        let output = match gguf.tensor("output.weight") {
+            Ok(_) => weight(gguf, "output.weight", config.n_embd, config.n_vocab)?,
+            Err(_) => weight(gguf, "token_embd.weight", config.n_embd, config.n_vocab)?,
+        };
 
-        let compute = if use_gpu {
+        // The delta net and a head dimension above 128 run on the host, so a
+        // model that needs either is not offered the device at all rather than
+        // being half-accelerated and quietly wrong.
+        let compute = if use_gpu && !config.needs_host_path() {
             Compute::auto(&config, weight_bytes)
+        } else if config.needs_host_path() {
+            Compute::with_note(
+                None,
+                Some("this model's blocks run on the host path".to_string()),
+                &config,
+            )
         } else {
             Compute::cpu(&config)
         };
@@ -427,7 +539,14 @@ impl<'a> Model<'a> {
         // a dense layer reserves its three matrices.
         let mut expert_views: Vec<Vec<Weight<'a>>> = Vec::with_capacity(layers.len());
         for layer in &layers {
-            all_weights.extend([&layer.wq, &layer.wk, &layer.wv, &layer.wo]);
+            match &layer.attn {
+                Attention::Dense(attn) => {
+                    all_weights.extend([&attn.q, &attn.k, &attn.v, &attn.out])
+                }
+                Attention::Recurrent(attn) => {
+                    all_weights.extend([&attn.qkv, &attn.gate, &attn.alpha, &attn.beta, &attn.out])
+                }
+            }
             match &layer.feed_forward {
                 FeedForward::Dense { gate, up, down } => all_weights.extend([gate, up, down]),
                 FeedForward::Sparse { gate, up, down, .. } => {
@@ -528,12 +647,21 @@ impl<'a> Model<'a> {
         &self,
         tokens: &[u32],
         kv: &mut KvCache,
+        recurrent: &mut RecurrentCache,
         rope: &RopeTable,
         scratch: &mut Scratch,
     ) -> Result<Vec<f32>, EngineError> {
         self.set_position(kv, tokens.len())?;
         self.embed(tokens, scratch)?;
-        self.body(tokens, kv, rope, scratch)?;
+        if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
+            dump_activation(
+                &dir,
+                "inp_embd",
+                &scratch.x,
+                tokens.len() * self.config.n_embd,
+            );
+        }
+        self.body(tokens, kv, recurrent, rope, scratch)?;
         self.read_logits(scratch)
     }
 
@@ -548,6 +676,7 @@ impl<'a> Model<'a> {
         &self,
         token: u32,
         kv: &mut KvCache,
+        recurrent: &mut RecurrentCache,
         rope: &RopeTable,
         scratch: &mut Scratch,
         graphs: &mut DecodeGraphs,
@@ -566,12 +695,15 @@ impl<'a> Model<'a> {
             kv.advance(1);
             return self.read_logits(scratch);
         }
-        let capture =
-            graphs.steps >= self.compute.plan().graph_after_steps && self.compute.can_capture();
+        // A host block (the delta net) touches memory the graph cannot see, so
+        // only a model that runs entirely on the device is captured.
+        let capture = graphs.steps >= self.compute.plan().graph_after_steps
+            && self.compute.can_capture()
+            && !self.config.needs_host_path();
         if capture {
             self.compute.begin_capture()?;
         }
-        let outcome = self.body(&[token], kv, rope, scratch);
+        let outcome = self.body(&[token], kv, recurrent, rope, scratch);
         if capture {
             match outcome {
                 Ok(()) => {
@@ -617,6 +749,7 @@ impl<'a> Model<'a> {
         &self,
         tokens: &[u32],
         kv: &mut KvCache,
+        recurrent: &mut RecurrentCache,
         rope: &RopeTable,
         scratch: &mut Scratch,
     ) -> Result<(), EngineError> {
@@ -643,11 +776,20 @@ impl<'a> Model<'a> {
             )));
         }
 
+        let dump = std::env::var("LLM_DUMP_LAYERS").ok();
         for (index, layer) in self.layers.iter().enumerate() {
             let _layer_span =
                 tracing::debug_span!("transformer_layer", layer = index, tokens = n, start)
                     .entered();
-            self.layer_forward(layer, index, n, start, kv, rope, scratch, capacity)?;
+            self.layer_forward(layer, index, n, start, kv, recurrent, rope, scratch, capacity)?;
+            if let Some(dir) = &dump {
+                dump_activation(
+                    dir,
+                    &format!("l_out-{index}-at{start}"),
+                    &scratch.x,
+                    n * config.n_embd,
+                );
+            }
         }
         kv.len = start + n;
 
@@ -687,13 +829,39 @@ impl<'a> Model<'a> {
         n: usize,
         start: usize,
         kv: &mut KvCache,
+        recurrent: &mut RecurrentCache,
+        rope: &RopeTable,
+        scratch: &mut Scratch,
+        capacity: usize,
+    ) -> Result<(), EngineError> {
+        match &layer.attn {
+            Attention::Dense(attn) => {
+                self.dense_attention(attn, layer.attn_norm, index, n, start, kv, rope, scratch, capacity)?
+            }
+            Attention::Recurrent(attn) => {
+                self.recurrent_attention(attn, layer.attn_norm, index, n, recurrent, scratch)?
+            }
+        }
+        self.feed_forward(layer, n, scratch)
+    }
+
+    /// Attention, including the two things a `qwen35` block adds: a gate packed
+    /// beside every query, and per-head norms on q and k before rope.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_attention(
+        &self,
+        attn: &DenseAttention<'a>,
+        attn_norm: &[f32],
+        index: usize,
+        n: usize,
+        start: usize,
+        kv: &mut KvCache,
         rope: &RopeTable,
         scratch: &mut Scratch,
         capacity: usize,
     ) -> Result<(), EngineError> {
         let config = &self.config;
         let kv_dim = config.kv_dim();
-        let ffn = config.n_ff;
 
         // q, k and v read the same normalised rows, so the norm is quantised
         // straight from the hidden state — one kernel instead of a write-out,
@@ -701,45 +869,87 @@ impl<'a> Model<'a> {
         let normed = self.compute.norm_prepare(
             &scratch.x,
             0,
-            layer.attn_norm,
+            attn_norm,
             config.eps,
             n,
             &mut scratch.normed_attn,
             0,
         )?;
-        self.compute.matmul_prepared_group(
-            &mut [
-                GroupMember {
-                    weight: &layer.wq,
-                    out: &mut scratch.q,
-                    out_offset: 0,
-                },
-                GroupMember {
-                    weight: &layer.wk,
-                    out: &mut scratch.k,
-                    out_offset: 0,
-                },
-                GroupMember {
-                    weight: &layer.wv,
-                    out: &mut scratch.v,
-                    out_offset: 0,
-                },
-            ],
-            &scratch.normed_attn,
-            0,
-            &normed,
-            n,
-        )?;
+        let query = if attn.gated {
+            self.compute.matmul_prepared_group(
+                &mut [
+                    GroupMember {
+                        weight: &attn.q,
+                        out: &mut scratch.q_full,
+                        out_offset: 0,
+                    },
+                    GroupMember {
+                        weight: &attn.k,
+                        out: &mut scratch.k,
+                        out_offset: 0,
+                    },
+                    GroupMember {
+                        weight: &attn.v,
+                        out: &mut scratch.v,
+                        out_offset: 0,
+                    },
+                ],
+                &scratch.normed_attn,
+                0,
+                &normed,
+                n,
+            )?;
+            split_query_gate(scratch, n, config.n_head, config.head_dim)?;
+            &mut scratch.q
+        } else {
+            self.compute.matmul_prepared_group(
+                &mut [
+                    GroupMember {
+                        weight: &attn.q,
+                        out: &mut scratch.q,
+                        out_offset: 0,
+                    },
+                    GroupMember {
+                        weight: &attn.k,
+                        out: &mut scratch.k,
+                        out_offset: 0,
+                    },
+                    GroupMember {
+                        weight: &attn.v,
+                        out: &mut scratch.v,
+                        out_offset: 0,
+                    },
+                ],
+                &scratch.normed_attn,
+                0,
+                &normed,
+                n,
+            )?;
+            &mut scratch.q
+        };
+        if let Some(weight) = attn.q_norm {
+            normalise_heads(query, weight, config.eps, config.n_head, config.head_dim, n)?;
+        }
+        if let Some(weight) = attn.k_norm {
+            normalise_heads(
+                &mut scratch.k,
+                weight,
+                config.eps,
+                config.n_head_kv,
+                config.head_dim,
+                n,
+            )?;
+        }
 
-        // q, k and v leave the projections together: the query is rotated in
-        // place, the key is rotated into the cache, and the value is copied
-        // beside it, all in one launch.
+        let slot = kv
+            .slot(index)
+            .ok_or_else(|| EngineError::Format(format!("block {index} has no key cache")))?;
         self.compute.rope_append(
-            &mut scratch.q,
+            query,
             &mut scratch.k,
             &scratch.v,
-            &mut kv.keys[index],
-            &mut kv.values[index],
+            &mut kv.keys[slot],
+            &mut kv.values[slot],
             rope,
             n,
             config.n_head,
@@ -759,17 +969,29 @@ impl<'a> Model<'a> {
         };
         self.compute.attend(
             &scratch.q,
-            &kv.keys[index],
-            &kv.values[index],
+            &kv.keys[slot],
+            &kv.values[slot],
             &mut scratch.attn,
             &mut scratch.scores,
             &spec,
             start,
             n,
         )?;
+        if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
+            let width = n * config.n_head * config.head_dim;
+            dump_activation(&dir, &format!("a_pregate-{index}-n{n}"), &scratch.attn, width);
+            dump_activation(&dir, &format!("a_query-{index}-n{n}"), &scratch.q, width);
+        }
+        if attn.gated {
+            apply_gate(&mut scratch.attn, &scratch.attn_gate)?;
+            if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
+                let width = n * config.n_head * config.head_dim;
+                dump_activation(&dir, &format!("a_gated-{index}-n{n}"), &scratch.attn, width);
+            }
+        }
 
         self.compute.matmul_add(
-            &layer.wo,
+            &attn.out,
             &scratch.attn,
             0,
             None,
@@ -777,8 +999,133 @@ impl<'a> Model<'a> {
             &mut scratch.x,
             0,
             &mut scratch.projected,
+        )
+    }
+
+    /// A gated delta net block: four projections, then the recurrent arithmetic
+    /// on the host, then the output projection.
+    fn recurrent_attention(
+        &self,
+        attn: &RecurrentAttention<'a>,
+        attn_norm: &[f32],
+        index: usize,
+        n: usize,
+        recurrent: &mut RecurrentCache,
+        scratch: &mut Scratch,
+    ) -> Result<(), EngineError> {
+        let config = &self.config;
+        let geometry = deltanet::Geometry::from_config(config).ok_or_else(|| {
+            EngineError::Format("recurrent block without state-space shapes".into())
+        })?;
+
+        let normed = self.compute.norm_prepare(
+            &scratch.x,
+            0,
+            attn_norm,
+            config.eps,
+            n,
+            &mut scratch.normed_attn,
+            0,
+        )?;
+        self.compute.matmul_prepared_group(
+            &mut [
+                GroupMember {
+                    weight: &attn.qkv,
+                    out: &mut scratch.recurrent_qkv,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &attn.gate,
+                    out: &mut scratch.recurrent_z,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &attn.alpha,
+                    out: &mut scratch.recurrent_alpha,
+                    out_offset: 0,
+                },
+                GroupMember {
+                    weight: &attn.beta,
+                    out: &mut scratch.recurrent_beta,
+                    out_offset: 0,
+                },
+            ],
+            &scratch.normed_attn,
+            0,
+            &normed,
+            n,
         )?;
 
+        let buffers = scratch.deltanet.as_mut().ok_or_else(|| {
+            EngineError::Format("recurrent scratch missing from the workspace".into())
+        })?;
+        copy_to_host(&scratch.recurrent_qkv, &mut buffers.qkv)?;
+        copy_to_host(&scratch.recurrent_z, &mut buffers.z)?;
+        copy_to_host(&scratch.recurrent_alpha, &mut buffers.alpha)?;
+        copy_to_host(&scratch.recurrent_beta, &mut buffers.beta)?;
+        // Both gates are elementwise, so they belong with the projection that
+        // produced them rather than with the state update.
+        deltanet::activate_alpha(&mut buffers.alpha, attn.dt, geometry.v_heads);
+        deltanet::activate_beta(&mut buffers.beta);
+
+        let weights = deltanet::Weights {
+            conv: attn.conv,
+            decay: attn.decay,
+            dt: attn.dt,
+            norm: attn.norm,
+            eps: config.eps,
+        };
+        let (conv, ssm) = recurrent
+            .layer_mut(index)
+            .ok_or_else(|| EngineError::Format(format!("block {index} has no recurrent state")))?;
+        deltanet::block(
+            &geometry,
+            &weights,
+            &mut deltanet::LayerState { conv, ssm },
+            buffers,
+            n,
+        );
+
+        let produced = &buffers.out;
+        if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
+            for (name, values) in [
+                ("r_norm", scratch.normed_attn.host()),
+                ("r_qkv", scratch.recurrent_qkv.host()),
+                ("r_z", scratch.recurrent_z.host()),
+                ("r_alpha", scratch.recurrent_alpha.host()),
+                ("r_beta", scratch.recurrent_beta.host()),
+            ] {
+                if let Some(values) = values {
+                    dump_slice(&dir, &format!("{name}-{index}-n{n}"), values);
+                }
+            }
+            dump_slice(&dir, &format!("r_raw-{index}-n{n}"), &buffers.raw);
+            dump_slice(&dir, &format!("r_conv-{index}-last"), &buffers.conv);
+            dump_slice(&dir, &format!("r_out-{index}-n{n}"), produced);
+        }
+        self.compute
+            .upload(&mut scratch.recurrent_out, produced)?;
+        self.compute.matmul_add(
+            &attn.out,
+            &scratch.recurrent_out,
+            0,
+            None,
+            n,
+            &mut scratch.x,
+            0,
+            &mut scratch.projected,
+        )
+    }
+
+    /// The feed-forward half of a block, which both block types share.
+    fn feed_forward(
+        &self,
+        layer: &Layer<'a>,
+        n: usize,
+        scratch: &mut Scratch,
+    ) -> Result<(), EngineError> {
+        let config = &self.config;
+        let ffn = config.n_ff;
         let normed = self.compute.norm_prepare(
             &scratch.x,
             0,
@@ -963,6 +1310,18 @@ pub struct Scratch {
     /// Router logits, one per expert. Empty when the model is dense.
     router: Activation,
     scores: Activation,
+    /// The packed query of a gated attention block, before its gate is split off.
+    q_full: Activation,
+    /// That block's gate, applied to the attention output.
+    attn_gate: Activation,
+    /// Delta net projection outputs, one buffer per projection.
+    recurrent_qkv: Activation,
+    recurrent_z: Activation,
+    recurrent_alpha: Activation,
+    recurrent_beta: Activation,
+    recurrent_out: Activation,
+    /// Host scratch for the delta net's convolution and state update.
+    deltanet: Option<deltanet::Buffers>,
 }
 
 impl Scratch {
@@ -992,6 +1351,15 @@ impl Scratch {
         let activated = workspace.view("activated");
         let router = workspace.view("router");
         let scores = workspace.view("scores");
+        let q_full = workspace.view("q_full");
+        let attn_gate = workspace.view("attn_gate");
+        let recurrent_qkv = workspace.view("recurrent_qkv");
+        let recurrent_z = workspace.view("recurrent_z");
+        let recurrent_alpha = workspace.view("recurrent_alpha");
+        let recurrent_beta = workspace.view("recurrent_beta");
+        let recurrent_out = workspace.view("recurrent_out");
+        let deltanet = deltanet::Geometry::from_config(config)
+            .map(|geometry| deltanet::Buffers::new(&geometry, tokens));
         Ok(Self {
             workspace,
             tokens,
@@ -1010,6 +1378,14 @@ impl Scratch {
             activated,
             router,
             scores,
+            q_full,
+            attn_gate,
+            recurrent_qkv,
+            recurrent_z,
+            recurrent_alpha,
+            recurrent_beta,
+            recurrent_out,
+            deltanet,
         })
     }
 
@@ -1022,6 +1398,284 @@ impl Scratch {
     pub fn bytes(&self) -> usize {
         self.workspace.bytes()
     }
+}
+
+/// Write a plain slice as raw little-endian f32.
+fn dump_slice(dir: &str, name: &str, values: &[f32]) {
+    use std::io::Write;
+    let path = std::path::Path::new(dir).join(format!("{name}.f32"));
+    if let Ok(mut file) = std::fs::File::create(path) {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let _ = file.write_all(&bytes);
+    }
+}
+
+/// Write an activation as raw little-endian f32, so a reference implementation's
+/// dump can be compared value by value. Set `LLM_DUMP_LAYERS` to a directory.
+fn dump_activation(dir: &str, name: &str, values: &Activation, len: usize) {
+    use std::io::Write;
+    let Some(values) = values.host() else {
+        return;
+    };
+    let path = std::path::Path::new(dir).join(format!("{name}.f32"));
+    if let Ok(mut file) = std::fs::File::create(path) {
+        let mut bytes = Vec::with_capacity(len * 4);
+        for value in &values[..len.min(values.len())] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let _ = file.write_all(&bytes);
+    }
+}
+
+/// Pull a query projection that packs a gate beside each query apart.
+///
+/// The file stores, per head, `head_dim` query values followed by `head_dim`
+/// gate values; the attention kernel wants the queries alone, and the gate is
+/// applied to its output.
+fn split_query_gate(
+    scratch: &mut Scratch,
+    tokens: usize,
+    n_head: usize,
+    head_dim: usize,
+) -> Result<(), EngineError> {
+    let packed = scratch.q_full.host().ok_or_else(|| {
+        EngineError::Format("packed query needs the host path".into())
+    })?;
+    let queries = scratch
+        .q
+        .host_mut()
+        .ok_or_else(|| EngineError::Format("query buffer needs the host path".into()))?;
+    let gates = scratch
+        .attn_gate
+        .host_mut()
+        .ok_or_else(|| EngineError::Format("gate buffer needs the host path".into()))?;
+    for token in 0..tokens {
+        for head in 0..n_head {
+            let source = (token * n_head + head) * head_dim * 2;
+            let destination = (token * n_head + head) * head_dim;
+            queries[destination..destination + head_dim]
+                .copy_from_slice(&packed[source..source + head_dim]);
+            gates[destination..destination + head_dim]
+                .copy_from_slice(&packed[source + head_dim..source + head_dim * 2]);
+        }
+    }
+    Ok(())
+}
+
+/// RMS-normalise every head of a q or k projection, in place.
+fn normalise_heads(
+    values: &mut Activation,
+    weight: &[f32],
+    eps: f32,
+    heads: usize,
+    head_dim: usize,
+    tokens: usize,
+) -> Result<(), EngineError> {
+    let values = values
+        .host_mut()
+        .ok_or_else(|| EngineError::Format("per-head norm needs the host path".into()))?;
+    for token in 0..tokens {
+        for head in 0..heads {
+            let start = (token * heads + head) * head_dim;
+            let head_values = &mut values[start..start + head_dim];
+            let variance =
+                head_values.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
+            let denom = (variance + eps).sqrt();
+            for (index, value) in head_values.iter_mut().enumerate() {
+                *value = *value / denom * weight[index];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Multiply attention output by `sigmoid(gate)`, elementwise.
+fn apply_gate(values: &mut Activation, gate: &Activation) -> Result<(), EngineError> {
+    let values = values
+        .host_mut()
+        .ok_or_else(|| EngineError::Format("gated attention needs the host path".into()))?;
+    let gate = gate
+        .host()
+        .ok_or_else(|| EngineError::Format("gated attention needs the host path".into()))?;
+    for (value, gate) in values.iter_mut().zip(gate) {
+        *value *= 1.0 / (1.0 + (-gate).exp());
+    }
+    Ok(())
+}
+
+/// Copy an activation into a host buffer the block math owns.
+fn copy_to_host(activation: &Activation, destination: &mut [f32]) -> Result<(), EngineError> {
+    let source = activation
+        .host()
+        .ok_or_else(|| EngineError::Format("recurrent blocks run on the host path".into()))?;
+    destination.copy_from_slice(source);
+    Ok(())
+}
+
+/// Read one block's tensors, in whichever shape the file declares.
+///
+/// Which half is recurrent comes from the header's `full_attention_interval`, and
+/// whether the query projection carries a gate comes from its own width — a
+/// `2 × n_head × head_dim` output is query-then-gate per head. Nothing here
+/// checks the architecture's name.
+fn load_layer<'a>(
+    gguf: &'a GgufFile,
+    config: &Config,
+    index: usize,
+) -> Result<Layer<'a>, EngineError> {
+    let prefix = format!("blk.{index}");
+    let attn_norm = as_f32(gguf.data(&format!("{prefix}.attn_norm.weight"))?);
+    let ffn_norm = match gguf.data(&format!("{prefix}.post_attention_norm.weight")) {
+        Ok(data) => as_f32(data),
+        Err(_) => as_f32(gguf.data(&format!("{prefix}.ffn_norm.weight"))?),
+    };
+    let attn = if config.is_recurrent(index) {
+        let ssm = config
+            .ssm
+            .ok_or_else(|| EngineError::Format("recurrent block without ssm keys".into()))?;
+        let key_dim = ssm.state_size * ssm.k_heads;
+        let value_dim = ssm.inner;
+        Attention::Recurrent(RecurrentAttention {
+            qkv: weight(
+                gguf,
+                &format!("{prefix}.attn_qkv.weight"),
+                config.n_embd,
+                2 * key_dim + value_dim,
+            )?,
+            gate: weight(
+                gguf,
+                &format!("{prefix}.attn_gate.weight"),
+                config.n_embd,
+                value_dim,
+            )?,
+            alpha: weight(
+                gguf,
+                &format!("{prefix}.ssm_alpha.weight"),
+                config.n_embd,
+                ssm.v_heads,
+            )?,
+            beta: weight(
+                gguf,
+                &format!("{prefix}.ssm_beta.weight"),
+                config.n_embd,
+                ssm.v_heads,
+            )?,
+            out: weight(
+                gguf,
+                &format!("{prefix}.ssm_out.weight"),
+                value_dim,
+                config.n_embd,
+            )?,
+            conv: as_f32(gguf.data(&format!("{prefix}.ssm_conv1d.weight"))?),
+            decay: as_f32(gguf.data(&format!("{prefix}.ssm_a"))?),
+            dt: as_f32(gguf.data(&format!("{prefix}.ssm_dt.bias"))?),
+            norm: as_f32(gguf.data(&format!("{prefix}.ssm_norm.weight"))?),
+        })
+    } else {
+        let plain = config.n_head * config.head_dim;
+        let q_width = gguf.tensor(&format!("{prefix}.attn_q.weight"))?.dims[1] as usize;
+        let gated = q_width == plain * 2;
+        if q_width != plain && !gated {
+            return Err(EngineError::Format(format!(
+                "{prefix}.attn_q has width {q_width}, expected {plain} or {}",
+                plain * 2
+            )));
+        }
+        Attention::Dense(DenseAttention {
+            q: weight(
+                gguf,
+                &format!("{prefix}.attn_q.weight"),
+                config.n_embd,
+                q_width,
+            )?,
+            k: weight(
+                gguf,
+                &format!("{prefix}.attn_k.weight"),
+                config.n_embd,
+                config.kv_dim(),
+            )?,
+            v: weight(
+                gguf,
+                &format!("{prefix}.attn_v.weight"),
+                config.n_embd,
+                config.kv_dim(),
+            )?,
+            out: weight(
+                gguf,
+                &format!("{prefix}.attn_output.weight"),
+                plain,
+                config.n_embd,
+            )?,
+            q_norm: optional_f32(gguf, &format!("{prefix}.attn_q_norm.weight")),
+            k_norm: optional_f32(gguf, &format!("{prefix}.attn_k_norm.weight")),
+            gated,
+        })
+    };
+    let feed_forward = if config.expert_count == 0 {
+        FeedForward::Dense {
+            gate: weight(
+                gguf,
+                &format!("{prefix}.ffn_gate.weight"),
+                config.n_embd,
+                config.n_ff,
+            )?,
+            up: weight(
+                gguf,
+                &format!("{prefix}.ffn_up.weight"),
+                config.n_embd,
+                config.n_ff,
+            )?,
+            down: weight(
+                gguf,
+                &format!("{prefix}.ffn_down.weight"),
+                config.n_ff,
+                config.n_embd,
+            )?,
+        }
+    } else {
+        FeedForward::Sparse {
+            router: weight(
+                gguf,
+                &format!("{prefix}.ffn_gate_inp.weight"),
+                config.n_embd,
+                config.expert_count,
+            )?,
+            gate: experts(
+                gguf,
+                &format!("{prefix}.ffn_gate_exps.weight"),
+                config.n_embd,
+                config.expert_ff,
+                config.expert_count,
+            )?,
+            up: experts(
+                gguf,
+                &format!("{prefix}.ffn_up_exps.weight"),
+                config.n_embd,
+                config.expert_ff,
+                config.expert_count,
+            )?,
+            down: experts(
+                gguf,
+                &format!("{prefix}.ffn_down_exps.weight"),
+                config.expert_ff,
+                config.n_embd,
+                config.expert_count,
+            )?,
+        }
+    };
+    Ok(Layer {
+        attn_norm,
+        ffn_norm,
+        attn,
+        feed_forward,
+    })
+}
+
+fn optional_f32<'a>(gguf: &'a GgufFile, name: &str) -> Option<&'a [f32]> {
+    gguf.data(name).ok().map(as_f32)
 }
 
 /// A stacked expert tensor: `[k, out, n_expert]`, validated against the header.
@@ -1100,30 +1754,47 @@ pub mod tests {
 
     #[test]
     fn a_dense_attention_block_is_supported() {
-        assert!(check_supported("qwen2", 128, false).is_ok());
-        assert!(check_supported("llama", 64, false).is_ok());
+        assert!(check_supported("qwen2", 128).is_ok());
+        assert!(check_supported("llama", 64).is_ok());
     }
 
     #[test]
-    fn a_head_dimension_no_kernel_covers_is_refused_by_name() {
-        let error = check_supported("qwen35", 256, false).unwrap_err();
+    fn a_head_dimension_beyond_what_the_engine_handles_is_refused_by_name() {
+        // 256 is a `qwen35` head and runs on the host; 512 is past what any
+        // kernel or host path here is written for.
+        assert!(check_supported("qwen35", 256).is_ok());
+        let error = check_supported("qwen35", 512).unwrap_err();
         match error {
             EngineError::Unsupported(message) => {
-                assert!(message.contains("head_dim 256"), "{message}");
+                assert!(message.contains("head_dim 512"), "{message}");
             }
             other => panic!("expected an unsupported error, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_state_space_block_is_refused_with_the_reason() {
-        let error = check_supported("qwen35", 128, true).unwrap_err();
-        match error {
-            EngineError::Unsupported(message) => {
-                assert!(message.contains("state-space"), "{message}");
-            }
-            other => panic!("expected an unsupported error, got {other:?}"),
-        }
+    fn a_state_space_model_keeps_attention_every_nth_block() {
+        let config = Config {
+            n_layers: 8,
+            full_attention_interval: 4,
+            ssm: Some(super::SsmConfig {
+                conv_kernel: 4,
+                state_size: 128,
+                inner: 4096,
+                v_heads: 32,
+                k_heads: 16,
+            }),
+            ..minicpm()
+        };
+        let recurrent: Vec<usize> = (0..config.n_layers).filter(|i| config.is_recurrent(*i)).collect();
+        assert_eq!(recurrent, vec![0, 1, 2, 4, 5, 6]);
+        assert_eq!(config.attention_layers(), 2);
+        assert!(config.needs_host_path());
+    }
+
+    #[test]
+    fn a_dense_model_needs_no_host_path() {
+        assert!(!minicpm().needs_host_path());
     }
 
     /// The geometry of the model this engine ships with: 42 layers, 16 query
@@ -1143,6 +1814,10 @@ pub mod tests {
             expert_count: 0,
             expert_used: 0,
             expert_ff: 6144,
+            full_attention_interval: 0,
+            ssm: None,
+            qk_norm: false,
+            q_gate: false,
         }
     }
 }
