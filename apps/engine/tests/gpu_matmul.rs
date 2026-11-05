@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use llm_engine::tensor::Weight;
-use llm_engine::{Compute, DType, GgufFile, Model, Session};
+use llm_engine::{Compute, Config, DType, GgufFile, Model, Session};
 
 fn model_path() -> PathBuf {
     std::env::var_os("LLM_MODEL").map_or_else(
@@ -33,15 +33,16 @@ fn activations(len: usize, seed: f32) -> Vec<f32> {
 #[ignore = "requires the model and a CUDA device"]
 fn gpu_matmul_matches_the_cpu_kernel() {
     let gguf = GgufFile::open(&model_path()).expect("model opens");
+    let config = Config::from_gguf(&gguf).expect("config");
     // One weight matrix is enough to exercise the kernels.
-    let gpu = Compute::auto(64 << 20);
+    let gpu = Compute::auto(&config, 64 << 20);
     let Some(device) = gpu.device_name() else {
         println!("skipped: no CUDA device (LLM_GPU=0 or no driver)");
         return;
     };
     println!("device: {device}");
 
-    let cpu = Compute::cpu();
+    let cpu = Compute::cpu(&config);
     for name in ["blk.0.attn_q.weight", "blk.0.ffn_down.weight"] {
         let weight = weight(&gguf, name);
         // 65 and 129 are one token past a full block: they are what the

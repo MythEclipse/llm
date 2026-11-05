@@ -10,6 +10,10 @@ rayon = "1"
 half = "2"
 fancy-regex = "0.16"
 tracing = { workspace = true }
+sha2 = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

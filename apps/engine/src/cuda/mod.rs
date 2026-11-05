@@ -52,7 +52,7 @@ fn note_release(bytes: usize) {
     DEVICE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
-include!(concat!(env!("OUT_DIR"), "/gpu_ptx.rs"));
+use crate::manifest::PTX;
 
 const LANES: u32 = 32;
 /// Matrices one prompt matmul launch carries, matching `MMA_GROUP_MAX`.

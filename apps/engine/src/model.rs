@@ -220,9 +220,9 @@ impl<'a> Model<'a> {
         let output = weight(gguf, "output.weight", config.n_embd, config.n_vocab)?;
 
         let compute = if use_gpu {
-            Compute::auto(weight_bytes)
+            Compute::auto(&config, weight_bytes)
         } else {
-            Compute::cpu()
+            Compute::cpu(&config)
         };
         let mut all_weights: Vec<&Weight<'a>> = Vec::with_capacity(layers.len() * 7 + 2);
         all_weights.push(&token_embd);
@@ -242,7 +242,7 @@ impl<'a> Model<'a> {
         // rather than failing halfway through the first reply.
         let compute = match compute.preload(&all_weights) {
             Ok(()) => compute,
-            Err(error) => Compute::with_fallback(error),
+            Err(error) => Compute::with_fallback(error, &config),
         };
         info!(
             layers = config.n_layers,

@@ -8,7 +8,9 @@
 use crate::cuda::{AttentionGeometry, DeviceBuffer, Gpu};
 use crate::error::EngineError;
 use crate::gguf::DType;
+use crate::model::Config;
 use crate::ops::{self, RopeTable};
+use crate::tactics::{AttentionPath, KernelPlan};
 use crate::tensor::{Weight, dequant_row, matmul};
 
 /// A tensor the forward pass reads or writes.
@@ -30,10 +32,6 @@ impl Activation {
     }
 }
 
-/// Tokens at which the prompt kernels take over from the row-at-a-time ones,
-/// matching the device's warp count.
-const PREPARE_MIN_TOKENS: usize = 8;
-
 /// Activations already quantised for the matmuls that read them. `buffer` is
 /// `None` on the CPU, where the dot product quantises per row and there is nothing
 /// to prepare.
@@ -41,51 +39,11 @@ pub struct Prepared {
     buffer: Option<crate::cuda::Prepared>,
 }
 
-/// Tokens past which the two feed-forward projections are launched separately.
-///
-/// Grouping the projections concatenates their row tiles, which is what fills the
-/// device when a single projection cannot: q, k and v together are one wave's
-/// worth of work at 128 tokens where q alone leaves four SMs idle. The feed-forward
-/// pair already fills ten waves at 512 tokens, and past that point the wider tile
-/// set only costs: at 1024 tokens the grouped launch measured 2,40 ms against
-/// 2 × 0,70 ms for the separate ones.
-const GROUP_FFN_MAX_TOKENS: usize = 512;
-
-/// Whether a group of this many matmuls should share a launch.
-fn group_worth_it(members: usize, n: usize) -> bool {
-    members == 3 || n <= GROUP_FFN_MAX_TOKENS
-}
-
 /// One matmul of a group that shares its activations with its neighbours.
 pub struct GroupMember<'a> {
     pub weight: &'a Weight<'a>,
     pub out: &'a mut Activation,
     pub out_offset: usize,
-}
-
-/// Attention geometry for one launch.
-/// Head dimension the tiled prefill attention kernel is written for.
-const PREFILL_HEAD_DIM: usize = 128;
-/// Heads one prefill attention block serves; they must all share one KV head.
-const PREFILL_HEADS: usize = 2;
-/// Query heads sharing one KV head in the tensor-core prefill kernel — the
-/// whole block serves exactly one KV head then.
-const PREFILL_HEADS_PER_KV: usize = 8;
-
-/// Which attention kernel the backend will run, and therefore whether a score
-/// grid has to exist at all.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AttentionPath {
-    /// Decode: positions spread over blocks, probabilities never leave registers.
-    DecodeSplit,
-    /// Prefill with keys and values staged, softmax kept online.
-    PrefillTiled,
-    /// Prefill on the f16 tensor cores.
-    PrefillMma,
-    /// One block per (head, query token), writing a full score grid.
-    Serial,
-    /// The host backend, which also writes a full grid.
-    Host,
 }
 
 pub struct AttentionSpec {
@@ -97,29 +55,33 @@ pub struct AttentionSpec {
     pub scale: f32,
 }
 
-/// The device used for the whole forward pass.
+/// The device used for the whole forward pass, and the kernel plan resolved for
+/// it once, when the model loaded.
 pub struct Compute {
     gpu: Option<Gpu>,
     note: Option<String>,
+    plan: KernelPlan,
 }
 
 impl Compute {
     /// GPU when one is present, not disabled by `LLM_GPU=0`, and has room for
     /// `required_bytes` of weights; otherwise the CPU.
-    pub fn auto(required_bytes: usize) -> Self {
+    pub fn auto(config: &Config, required_bytes: usize) -> Self {
         if std::env::var("LLM_GPU").is_ok_and(|value| value == "0") {
-            return Self::with_note(None, Some("LLM_GPU=0".to_string()));
+            return Self::with_note(None, Some("LLM_GPU=0".to_string()), config);
         }
         let gpu = match Gpu::open() {
             Ok(gpu) => gpu,
             Err(error) => {
-                return Self::with_note(None, Some(format!("no CUDA device ({error})")));
+                return Self::with_note(None, Some(format!("no CUDA device ({error})")), config);
             }
         };
         // Leave room for the KV cache and activation scratch on top of the weights.
         let headroom = 512 << 20;
         match gpu.free_bytes() {
-            Ok(free) if free >= required_bytes + headroom => Self::with_note(Some(gpu), None),
+            Ok(free) if free >= required_bytes + headroom => {
+                Self::with_note(Some(gpu), None, config)
+            }
             Ok(free) => Self::with_note(
                 None,
                 Some(format!(
@@ -127,25 +89,33 @@ impl Compute {
                     free >> 20,
                     (required_bytes + headroom) >> 20
                 )),
+                config,
             ),
-            Err(error) => Self::with_note(None, Some(format!("device memory unknown ({error})"))),
+            Err(error) => Self::with_note(
+                None,
+                Some(format!("device memory unknown ({error})")),
+                config,
+            ),
         }
     }
 
-    pub fn cpu() -> Self {
-        Self {
-            gpu: None,
-            note: None,
-        }
+    pub fn cpu(config: &Config) -> Self {
+        Self::with_note(None, None, config)
     }
 
-    fn with_note(gpu: Option<Gpu>, note: Option<String>) -> Self {
-        Self { gpu, note }
+    fn with_note(gpu: Option<Gpu>, note: Option<String>, config: &Config) -> Self {
+        let plan = KernelPlan::for_model(config, gpu.as_ref().map(Gpu::name));
+        Self { gpu, note, plan }
     }
 
     /// CPU backend that remembers why the device was abandoned mid-load.
-    pub fn with_fallback(error: EngineError) -> Self {
-        Self::with_note(None, Some(error.to_string()))
+    pub fn with_fallback(error: EngineError, config: &Config) -> Self {
+        Self::with_note(None, Some(error.to_string()), config)
+    }
+
+    /// The kernels this model resolved to, and why.
+    pub fn plan(&self) -> &KernelPlan {
+        &self.plan
     }
 
     /// Why the CPU backend is in use, when it was not a free choice.
@@ -298,7 +268,7 @@ impl Compute {
         // Below the prompt threshold the matmul takes the row-at-a-time kernel,
         // which quantises as it goes and never reads the buffer, so preparing one
         // would be a launch per matmul for nothing.
-        if n < PREPARE_MIN_TOKENS {
+        if n < self.plan.prepare_min_tokens {
             return Ok(Prepared { buffer: None });
         }
         match (&self.gpu, x) {
@@ -357,7 +327,7 @@ impl Compute {
         prepared: &Prepared,
         n: usize,
     ) -> Result<(), EngineError> {
-        let grouped = group_worth_it(members.len(), n);
+        let grouped = self.plan.group_matmul(members.len(), n);
         if let (true, Some(gpu), Activation::Device(source)) = (grouped, &self.gpu, x) {
             let mut entries = Vec::with_capacity(members.len());
             for member in members.iter() {
@@ -678,39 +648,14 @@ impl Compute {
     /// of `n_head × tokens × scores_stride`. Sizing the scratch from this instead
     /// of from the grid leaves the largest buffer in the engine unallocated.
     pub fn attention_scores(&self, spec: &AttentionSpec, tokens: usize) -> usize {
-        match self.attention_path(spec, tokens) {
-            AttentionPath::Serial | AttentionPath::Host => {
-                spec.n_head * tokens * spec.scores_stride
-            }
-            AttentionPath::DecodeSplit
-            | AttentionPath::PrefillTiled
-            | AttentionPath::PrefillMma => 0,
-        }
+        self.plan
+            .score_floats(spec.n_head, tokens, spec.scores_stride)
     }
 
-    /// Which attention kernel the live backend runs, decided once so the launch
-    /// and the scratch sizing cannot disagree.
-    fn attention_path(&self, spec: &AttentionSpec, tokens: usize) -> AttentionPath {
-        if self.gpu.is_none() {
-            return AttentionPath::Host;
-        }
-        if tokens == 1 {
-            return AttentionPath::DecodeSplit;
-        }
-        let tiled_shape = spec.head_dim == PREFILL_HEAD_DIM
-            && spec.n_head.is_multiple_of(PREFILL_HEADS)
-            && (spec.n_head / spec.n_head_kv).is_multiple_of(PREFILL_HEADS);
-        if std::env::var("LLM_ATTN_OLD").is_ok() && tiled_shape {
-            return AttentionPath::PrefillTiled;
-        }
-        if spec.head_dim == PREFILL_HEAD_DIM && spec.n_head / spec.n_head_kv == PREFILL_HEADS_PER_KV
-        {
-            return AttentionPath::PrefillMma;
-        }
-        if tiled_shape {
-            return AttentionPath::PrefillTiled;
-        }
-        AttentionPath::Serial
+    /// Which attention kernel this call runs. The decision was made at load;
+    /// this only picks the regime.
+    fn attention_path(&self, tokens: usize) -> AttentionPath {
+        self.plan.attention(tokens)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -741,13 +686,12 @@ impl Compute {
                     scores_stride: spec.scores_stride,
                     scale: spec.scale,
                 };
-                match self.attention_path(spec, tokens) {
+                match self.attention_path(tokens) {
                     // Decode: one token has no batch to hide latency behind, so
                     // the positions are spread over blocks instead.
                     AttentionPath::DecodeSplit => {
                         gpu.attention_split(q, k, v, target, geometry, start + tokens)
                     }
-                    // A/B switch: the fp32 tiled kernel for comparing numerics.
                     // Prefill: sixteen queries per block, keys and values staged
                     // in shared memory, softmax kept online.
                     AttentionPath::PrefillTiled => {
@@ -820,7 +764,7 @@ impl Compute {
         out_offset: usize,
     ) -> Result<Prepared, EngineError> {
         let n = weight.len();
-        if rows < PREPARE_MIN_TOKENS {
+        if rows < self.plan.prepare_min_tokens {
             self.rmsnorm(x, x_offset, weight, eps, rows, out, out_offset)?;
             return Ok(Prepared { buffer: None });
         }
@@ -851,7 +795,7 @@ impl Compute {
         n: usize,
         k: usize,
     ) -> Result<Prepared, EngineError> {
-        if n < PREPARE_MIN_TOKENS {
+        if n < self.plan.prepare_min_tokens {
             self.silu_mul(act, gate, up, n * k)?;
             return Ok(Prepared { buffer: None });
         }

@@ -7,11 +7,13 @@ mod cuda;
 pub mod error;
 pub mod generate;
 pub mod gguf;
+pub mod manifest;
 pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod tactics;
 pub mod tensor;
 pub mod tokenizer;
 

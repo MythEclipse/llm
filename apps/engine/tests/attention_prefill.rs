@@ -6,7 +6,7 @@
 //! way — one query at a time, no tiles, no online softmax — and compares every
 //! element, which is what caught an accumulator index that ran past the end of the
 //! warp's eight slots.
-use llm_engine::{AttentionSpec, Compute};
+use llm_engine::{AttentionSpec, Compute, Config};
 
 /// The shape of one attention call, so the reference reads like the formula.
 struct Shape {
@@ -83,7 +83,26 @@ fn tiled_matches_host() {
     };
     let expected = host(&query, &keys, &values, tokens, start, &shape);
 
-    let compute = Compute::auto(0);
+    // The shape below is the one the tiled tensor-core kernel is written for,
+    // so the plan has to resolve to it.
+    let config = Config {
+        n_layers: 1,
+        n_embd: n_head * head_dim,
+        n_ff: 1,
+        n_head,
+        n_head_kv,
+        head_dim,
+        n_rot: head_dim,
+        rope_base: 5e6,
+        eps: 1e-6,
+        n_vocab: 1,
+    };
+    let compute = Compute::auto(&config, 0);
+    assert_eq!(
+        compute.plan().prefill.tactic,
+        "attention.prefill_mma_f16",
+        "the fixture has to exercise the kernel it was written for"
+    );
     let spec = AttentionSpec {
         n_head,
         n_head_kv,
