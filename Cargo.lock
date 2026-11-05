@@ -1228,6 +1228,7 @@ name = "llm-cli"
 version = "0.1.0"
 dependencies = [
  "llm-engine",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1240,6 +1241,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

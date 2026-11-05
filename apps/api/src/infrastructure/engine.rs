@@ -10,6 +10,7 @@ use llm_engine::{
     generate,
 };
 use tokio::sync::{Semaphore, mpsc};
+use tracing::{debug, info, instrument};
 
 use crate::application::ports::{
     ChatEngine, ChatTurn, EngineError, GenerateRequest, GenerationEvent, GenerationHandle,
@@ -29,6 +30,7 @@ pub struct LocalChatEngine {
 }
 
 impl LocalChatEngine {
+    #[instrument(skip_all, fields(model = %path.display(), context, threads))]
     pub fn load(path: &Path, context: usize, threads: usize) -> Result<Self, EngineError> {
         configure_thread_pool(threads);
         let gguf = GgufFile::open(path).map_err(internal)?;
@@ -86,6 +88,7 @@ impl LocalChatEngine {
         })
     }
 
+    #[instrument(skip_all, fields(turns = turns.len()))]
     fn prompt(&self, turns: &[ChatTurn]) -> String {
         let turns: Vec<Turn<'_>> = turns
             .iter()
@@ -114,6 +117,11 @@ impl ChatEngine for LocalChatEngine {
     ) -> impl Future<Output = Result<GenerationHandle, EngineError>> + Send {
         let prompt = self.prompt(&request.turns);
         let tokens = self.tokenizer.encode(&prompt);
+        debug!(
+            prompt_tokens = tokens.len(),
+            max_tokens = request.max_tokens,
+            "generation request prepared"
+        );
         let context = self.context;
         let model = self.model;
         let tokenizer = Arc::clone(&self.tokenizer);
@@ -172,6 +180,13 @@ impl ChatEngine for LocalChatEngine {
                     &mut sink,
                 ) {
                     Ok(stats) => {
+                        info!(
+                            prompt_tokens = stats.prompt_tokens,
+                            generated_tokens = stats.generated_tokens,
+                            total_ms = stats.total_ms,
+                            tokens_per_second = stats.tokens_per_second,
+                            "generation worker finished"
+                        );
                         let outcome = RunOutcome {
                             prompt_tokens: stats.prompt_tokens as u32,
                             generated_tokens: stats.generated_tokens as u32,

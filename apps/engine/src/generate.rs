@@ -7,6 +7,7 @@ use crate::error::EngineError;
 use crate::sampler::{Sampler, SamplingParams};
 use crate::session::Session;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
+use tracing::{debug, info, instrument};
 
 pub struct GenerationRequest {
     pub prompt: Vec<u32>,
@@ -57,6 +58,11 @@ pub enum Event {
 ///
 /// Returns the stats even when cancelled: a partial run still costs time and
 /// the dashboard should show it.
+#[instrument(skip_all, fields(
+    prompt_tokens = request.prompt.len(),
+    max_tokens = request.max_tokens,
+    temperature = request.params.temperature
+))]
 pub fn generate(
     session: &mut Session<'_>,
     tokenizer: &Tokenizer,
@@ -79,6 +85,7 @@ pub fn generate(
     let mut ttft_ms = 0u64;
     let mut last_emit = Instant::now();
     let mut stop_reason = StopReason::MaxTokens;
+    debug!("generation prefill complete");
 
     while emitted.len() < request.max_tokens {
         if cancel.load(Ordering::Relaxed) {
@@ -91,6 +98,11 @@ pub fn generate(
             break;
         }
         emitted.push(token);
+        tracing::trace!(
+            token_index = emitted.len(),
+            token_id = token,
+            "sampled token"
+        );
         if emitted.len() == 1 {
             ttft_ms = started.elapsed().as_millis() as u64;
         }
@@ -120,6 +132,15 @@ pub fn generate(
         stop_reason,
         token_latencies_ms: latencies,
     };
+    info!(
+        prompt_tokens = stats.prompt_tokens,
+        generated_tokens = stats.generated_tokens,
+        prefill_ms = stats.prefill_ms,
+        decode_ms = stats.decode_ms,
+        tokens_per_second = stats.tokens_per_second,
+        stop_reason = stats.stop_reason.as_str(),
+        "generation complete"
+    );
     sink(Event::Finished(stats.clone()));
     Ok(stats)
 }

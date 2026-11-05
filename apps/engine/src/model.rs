@@ -5,6 +5,7 @@ use crate::error::EngineError;
 use crate::gguf::GgufFile;
 use crate::ops::RopeTable;
 use crate::tensor::{Weight, as_f32};
+use tracing::{debug, info, instrument};
 
 /// Geometry taken from the GGUF header.
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +158,7 @@ impl<'a> Model<'a> {
 
     /// `use_gpu = false` pins the CPU backend, which is what the tests that
     /// compare backends need.
+    #[instrument(skip_all, fields(use_gpu, tensors = gguf.tensors().len()))]
     pub fn load_with_device(gguf: &'a GgufFile, use_gpu: bool) -> Result<Self, EngineError> {
         let config = Config::from_gguf(gguf)?;
         let weight_bytes: usize = gguf
@@ -242,6 +244,14 @@ impl<'a> Model<'a> {
             Ok(()) => compute,
             Err(error) => Compute::with_fallback(error),
         };
+        info!(
+            layers = config.n_layers,
+            embedding = config.n_embd,
+            vocab = config.n_vocab,
+            weight_bytes,
+            device = compute.device_name().unwrap_or("cpu"),
+            "model loaded"
+        );
 
         Ok(Self {
             token_embd,
@@ -291,6 +301,7 @@ impl<'a> Model<'a> {
 
     /// Logits for the last token of `tokens`, with keys/values appended at
     /// `kv.len()`.
+    #[instrument(skip_all, fields(tokens = tokens.len(), position = kv.len()))]
     pub fn forward(
         &self,
         tokens: &[u32],
@@ -310,6 +321,7 @@ impl<'a> Model<'a> {
         let config = &self.config;
         let embd = config.n_embd;
         let start = kv.len();
+        debug!(tokens = n, start, "forward pass started");
 
         let mut x = self.compute.alloc(n * embd)?;
         for token in tokens {
@@ -324,6 +336,9 @@ impl<'a> Model<'a> {
 
         let mut scratch = Scratch::new(&self.compute, config, n)?;
         for (index, layer) in self.layers.iter().enumerate() {
+            let _layer_span =
+                tracing::debug_span!("transformer_layer", layer = index, tokens = n, start)
+                    .entered();
             self.layer_forward(layer, index, &mut x, n, start, kv, rope, &mut scratch)?;
         }
         kv.len = start + n;
@@ -343,6 +358,7 @@ impl<'a> Model<'a> {
 
         let mut values = vec![0.0f32; config.n_vocab];
         self.compute.download(&logits, &mut values)?;
+        debug!(tokens = n, position = start + n, "forward pass complete");
         Ok(values)
     }
 

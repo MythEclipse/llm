@@ -21,6 +21,15 @@ const DEFAULT_CONTEXT: usize = 4096;
 const DEFAULT_MAX_TOKENS: usize = 256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("LLM_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+
     let mut arguments = std::env::args()
         .skip(1)
         .collect::<Vec<String>>()

@@ -27,6 +27,7 @@ use sys::{
 };
 
 use crate::error::EngineError;
+use tracing::{debug, trace};
 
 /// Bytes the engine holds on the device, and the high-water mark of that.
 /// Process-wide, because every buffer is born in `Gpu::alloc` and frees itself on
@@ -1389,6 +1390,19 @@ impl Gpu {
         args: &mut [Arg],
     ) -> Result<(), EngineError> {
         self.bind()?;
+        let kernel = self
+            .names
+            .iter()
+            .find(|(handle, _)| handle.0 == function.0)
+            .map_or("unknown", |(_, name)| *name);
+        trace!(
+            kernel,
+            grid = ?grid,
+            block = ?block,
+            shared_bytes,
+            args = args.len(),
+            "launching CUDA kernel"
+        );
         let start = if self.profile_enabled {
             let event = self.event()?;
             // SAFETY: the event was just created and the stream is the default.
@@ -1429,6 +1443,7 @@ impl Gpu {
                 error_message(status)
             )));
         }
+        debug!(kernel, "CUDA kernel queued");
         if let Some(start) = start {
             self.record(start, function);
         }
@@ -1468,6 +1483,11 @@ impl Gpu {
         if status == 0
             && let Some(table) = self.profile.lock().expect("profile lock").as_mut()
         {
+            trace!(
+                kernel = name,
+                elapsed_ms = milliseconds,
+                "CUDA kernel complete"
+            );
             let slot = table.entry(name).or_insert((0.0, 0));
             slot.0 += f64::from(milliseconds);
             slot.1 += 1;

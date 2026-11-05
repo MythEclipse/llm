@@ -9,6 +9,7 @@ memmap2 = "0.9"
 rayon = "1"
 half = "2"
 fancy-regex = "0.16"
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

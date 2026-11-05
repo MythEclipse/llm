@@ -37,6 +37,18 @@ Variabel lingkungan:
 
 Migrasi SQLite dijalankan otomatis saat start.
 
+Tracing engine dan request HTTP memakai field terstruktur. Gunakan filter
+berdasarkan kebutuhan diagnosis tanpa mengubah output benchmark:
+
+```bash
+LLM_LOG=llm_engine=debug,llm_api=info cargo run --release -p llm-gateway
+LLM_LOG=llm_engine=trace cargo run --release -p llm-cli -- bench -p 128 -n 32
+```
+
+Level `debug` mencatat fase forward, layer, chunk prefill, dan ringkasan
+generation. Level `trace` menambahkan setiap token dan geometri peluncuran
+kernel CUDA; output tracing ditulis ke stderr.
+
 ## API
 
 ```
