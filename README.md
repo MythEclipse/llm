@@ -693,6 +693,14 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
 - **Angka menunjuk artefak.** Setiap keluaran `bench` mencetak identitas build dan
   identitas rencana; tanpa itu sebuah angka tidak bisa dibandingkan dengan angka
   lain.
+- **Bentuk launch divalidasi terhadap device, bukan diasumsikan.** Saat load,
+  `cuFuncGetAttribute` dan `cuOccupancyMaxActiveBlocksPerMultiprocessor` dibaca
+  untuk tiga kernel yang menentukan: matmul prompt 127 register / 77.824 byte
+  shared / 512 thread / 1 blok per SM, attention prefill 122 / 49.152 / 256 / 2,
+  matmul decode 42 / 0 / 128 / 10. Wave plan memakai angka blok-per-SM itu,
+  bukan `1`. Di build debug, `launch()` juga membandingkan jumlah argumen dengan
+  `cuFuncGetParamCount` — `cuLaunchKernel` tidak memeriksa itu, jadi call site
+  yang tertinggal satu argumen akan mengirim sampah tanpa error.
 
 - Bobot tetap terkuantisasi di mmap; dequant dilakukan per baris di dalam
   matmul, tidak pernah seluruh model.

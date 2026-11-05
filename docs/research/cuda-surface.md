@@ -174,6 +174,59 @@ repo ini; membandingkannya juga dengan `cublasGemmEx` akan menutup celah "dua
 implementasi kita sama-sama salah dengan cara yang sama". Itu test, bukan jalur
 runtime, dan menambah satu dev-dependency.
 
+## 7. Status implementasi
+
+Dua yang berguna sudah masuk; sisanya ditolak dengan alasan yang bisa diperiksa,
+bukan karena tidak ada waktu.
+
+### Masuk
+
+| Yang dipakai | Di mana | Hasil |
+|---|---|---|
+| `cuFuncGetAttribute` (registers, static shared, max threads) + `cuOccupancyMaxActiveBlocksPerMultiprocessor` | `cuda::inspect`, dipanggil saat load untuk tiga kernel yang menentukan | bentuk launch divalidasi terhadap device, dan wave plan memakai blok-per-SM yang diukur |
+| `cuFuncGetParamCount` | `Gpu::params`, dibandingkan di `launch()` pada build debug | jumlah argumen tiap launch dicek terhadap tanda tangan kernel; 21 kernel, 0 selisih |
+
+Angka yang dilaporkan driver pada RTX 4050 (log level `info`, saat load):
+
+| Kernel | Register | Shared dinamis | Thread | Blok/SM |
+|---|---:|---:|---:|---:|
+| `q8_matmul_mma` | 127 | 77.824 | 512 | 1 |
+| `attention_prefill_mma` | 122 | 49.152 | 256 | 2 |
+| `q8_matmul_decode` | 42 | 0 | 128 | 10 |
+
+Baris pertama menjawab pertanyaan yang sebelumnya dijawab asumsi: wave plan
+memakai 1 blok per SM untuk matmul prompt, dan itu memang yang muat (512 thread ×
+127 register = 65.024 dari 65.536). Sekarang asumsinya diukur, dan kalau sebuah
+kernel berubah sampai muat 2 blok, `blocks_per_wave()` ikut berubah tanpa ada yang
+perlu ingat.
+
+Kedua panggilan itu juga menutup kelas bug yang tidak terlihat: `cuLaunchKernel`
+membaca sebanyak parameter yang dideklarasikan kernel, berapa pun yang dikirim
+pemanggil — jadi call site yang tertinggal satu argumen tidak gagal, ia
+memberikan sampah. Sekarang `cargo test` (build debug) gagal pada launch pertama
+yang tidak cocok.
+
+### Ditolak, dengan alasannya
+
+| Item | Alasan |
+|---|---|
+| `cuStreamWriteValue32` untuk posisi | device ini melaporkan `CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1 = 0`; panggilan mengembalikan "operation not supported". Yang tersedia hanya API batch v2, dan yang digantikan cuma salinan 8 byte per token |
+| `cuFuncSetCacheConfig(PREFER_L1)` untuk kernel decode | **diukur**: tg128 70,20 → 69,13 tok/s (−1,5%), pp512 tidak berubah. Dibatalkan |
+| `__ldcs`/`__ldlu` untuk KV | di decode tiap byte bobot dibaca sekali per token, jadi tidak ada isi L2 yang perlu dilindungi dari KV; di prefill KV justru dipakai ulang lintas head, sehingga streaming akan merugikan |
+| `__reduce_add_sync` | hanya untuk integer (`unsigned`/`int`); semua reduksi di jalur panas ini f32 |
+| `discard.global.L2` untuk scratch | tidak ada ruang yang bisa dihemat: scratch decode ±600 KB, dan yang mengalir 2,4 GB bobot per token |
+| `cp.async` dua tahap di matmul prompt | prefill hanya 6% dari waktu satu percakapan (108 ms lawan 1,83 s decode); sisa jarak matmul 2–4% dari prefill berarti ±0,2% waktu total |
+| `cuGraphAddKernelNode`/`cuGraphExecUpdate` | capture + cache per bentuk sudah bekerja; API node hanya menggantikannya dengan kode yang sama banyaknya |
+| `cuMemPool*` | tidak ada alokasi per permintaan; arena satu blok per sesi sudah cukup |
+| `cuLaunchKernelEx` (atribut) | yang tersedia di `sm_89` hanya prioritas stream, dan engine ini satu stream |
+| `cuMemcpyBatchAsync` | yang digabung hanya salinan 8 byte per token |
+| cuBLAS sebagai oracle | `logits_golden`/`greedy_golden` sudah berasal dari llama.cpp, jadi sudah ada pendapat ketiga yang independen |
+| `ldmatrix.x4` | sudah dipakai di dua tempat (`q8_matmul_mma`, `attention_prefill_mma`) |
+
+Tidak ada perubahan kecepatan dari bagian ini, dan itu memang hasilnya: yang
+ditambahkan adalah validasi, bukan instruksi baru. `bench` tetap 3.717 / 4.737 /
+4.565 tok/s dan 70,20 tok/s, sama seperti sebelum babak ini.
+
 ## Lampiran A — 555 entry point driver API
 Nama sudah dinormalkan: sufiks `_v2`/`_v3`/`_ptsz`/`_ptds` dilebur, karena
 itu varian ABI dari fungsi yang sama. Yang bertanda **tebal** sudah dipakai
