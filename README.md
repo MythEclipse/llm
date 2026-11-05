@@ -689,6 +689,30 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
   token. Angka prefill sempat terlihat 25% lebih tinggi karenanya; angka di tabel
   atas adalah yang menghitung semua token.
 
+## Mixture of experts
+
+Blok feed-forward bisa berupa router atas tumpukan pakar, dibaca dari GGUF
+seperti model dense lain: `{arch}.expert_count`, `expert_used_count`,
+`expert_feed_forward_length`, dan tensor `ffn_gate_inp.weight` (router) +
+`ffn_{gate,up,down}_exps.weight` (pakar yang ditumpuk sepanjang dimensi terluar,
+jadi tiap pakar adalah irisan yang bersebelahan).
+
+Forward per token: satu matmul router (n_expert logits, dibaca balik ke host
+untuk memilih pakar), lalu untuk tiap pakar terpilih matmul gate/up + silu + matmul
+down yang di-skala bobot routingnya sebelum dijumlahkan ke hidden state. Bobot
+routing dihitung dengan softmax atas top-k yang terpilih, jadi jumlahnya satu.
+
+Diverifikasi dengan empat fixture kecil (`scripts/make_tiny_moe.py`) yang berbagi
+satu set bobot: model dense vs model dengan empat pakar identik — kalau softmax
+routing tidak berjumlah satu, keduanya tidak bisa cocok. Enam tes menutup
+pemilihan, normalisasi, akumulasi berbobot, dan jalur ujung-ke-ujung.
+
+Harga yang diketahui: routing dan pemilihan pakar terjadi per token per layer,
+dengan satu salinan host di antaranya, dan prefill menjalankan pakar per baris
+daripada dikelompokkan per pakar — benar dulu, cepat kemudian. Model yang
+menyelang-selingi blok state-space dengan attention (mis. arsitektur `qwen35.ssm`)
+tetap ditolak saat load: blok itu tidak ada di forward pass ini.
+
 ## Catatan implementasi
 
 - **Tidak ada alokasi di jalur token.** Scratch satu token dan satu chunk

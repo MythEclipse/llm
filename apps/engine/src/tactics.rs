@@ -412,6 +412,9 @@ mod tests {
             rope_base: 5e6,
             eps: 1e-6,
             n_vocab: 130_560,
+            expert_count: 0,
+            expert_used: 0,
+            expert_ff: 6144,
         }
     }
 

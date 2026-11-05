@@ -3,7 +3,7 @@
 use crate::compute::{Activation, AttentionSpec, Compute, GroupMember, Workspace};
 use crate::cuda::Graph;
 use crate::error::EngineError;
-use crate::gguf::GgufFile;
+use crate::gguf::{DType, GgufFile};
 use crate::ops::RopeTable;
 use crate::tensor::{Weight, as_f32};
 use crate::workspace::{self, BufferPlan};
@@ -22,6 +22,12 @@ pub struct Config {
     pub rope_base: f32,
     pub eps: f32,
     pub n_vocab: usize,
+    /// Experts per layer; zero means a dense feed-forward.
+    pub expert_count: usize,
+    /// Experts each token is routed to. Ignored when `expert_count` is zero.
+    pub expert_used: usize,
+    /// Hidden width inside one expert. Equal to `n_ff` when dense.
+    pub expert_ff: usize,
 }
 
 impl Config {
@@ -66,6 +72,17 @@ impl Config {
             None => gguf.meta_i32_array("tokenizer.ggml.token_type")?.len(),
         };
 
+        let expert_count = read("expert_count").unwrap_or(0) as usize;
+        let expert_used = read("expert_used_count").unwrap_or(0) as usize;
+        let expert_ff = read("expert_feed_forward_length")
+            .map(|value| value as usize)
+            .unwrap_or(n_ff);
+        if expert_count > 0 && (expert_used == 0 || expert_used > expert_count) {
+            return Err(EngineError::Format(format!(
+                "expert_count {expert_count} with expert_used_count {expert_used}"
+            )));
+        }
+
         if !n_head.is_multiple_of(n_head_kv.max(1)) {
             return Err(EngineError::Format(
                 "query head count is not a multiple of kv head count".into(),
@@ -88,6 +105,9 @@ impl Config {
             rope_base,
             eps,
             n_vocab,
+            expert_count,
+            expert_used,
+            expert_ff,
         })
     }
 
@@ -141,9 +161,73 @@ struct Layer<'a> {
     wk: Weight<'a>,
     wv: Weight<'a>,
     wo: Weight<'a>,
-    w_gate: Weight<'a>,
-    w_up: Weight<'a>,
-    w_down: Weight<'a>,
+    feed_forward: FeedForward<'a>,
+}
+
+/// The feed-forward half of a layer: one dense block, or a router over a stack
+/// of experts.
+enum FeedForward<'a> {
+    Dense {
+        gate: Weight<'a>,
+        up: Weight<'a>,
+        down: Weight<'a>,
+    },
+    Sparse {
+        /// One row per expert: `expert_count × n_embd`.
+        router: Weight<'a>,
+        gate: Experts<'a>,
+        up: Experts<'a>,
+        down: Experts<'a>,
+    },
+}
+
+/// Experts stored as one tensor, one contiguous block each.
+///
+/// GGUF lists dimensions fastest-first, so a `[k, out, n_expert]` tensor holds
+/// expert `i` as `i * byte_len(k * out) ..`. That makes an expert a plain slice,
+/// which is what the matmul kernels want.
+struct Experts<'a> {
+    dtype: DType,
+    k: usize,
+    out: usize,
+    data: &'a [u8],
+}
+
+impl<'a> Experts<'a> {
+    fn expert(&self, index: usize) -> Weight<'a> {
+        let bytes = self.dtype.byte_len((self.k * self.out) as u64) as usize;
+        let start = index * bytes;
+        Weight::new(
+            self.dtype,
+            self.k,
+            self.out,
+            &self.data[start..start + bytes],
+        )
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() / self.dtype.byte_len((self.k * self.out) as u64) as usize
+    }
+}
+
+/// The experts one token uses, with a softmax over the chosen logits.
+///
+/// The router is trained with a softmax over the top-k, not over every expert,
+/// so the weights of the chosen ones sum to one.
+fn top_experts(logits: &[f32], used: usize) -> Vec<(usize, f32)> {
+    let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.truncate(used.clamp(1, ranked.len()));
+    let peak = ranked[0].1;
+    let mut total = 0.0f32;
+    for (_, value) in ranked.iter_mut() {
+        *value = (*value - peak).exp();
+        total += *value;
+    }
+    for (_, value) in ranked.iter_mut() {
+        *value /= total;
+    }
+    ranked
 }
 
 /// Key/value history for one conversation.
@@ -274,24 +358,58 @@ impl<'a> Model<'a> {
                     config.n_embd,
                     config.n_embd,
                 )?,
-                w_gate: weight(
-                    gguf,
-                    &format!("{prefix}.ffn_gate.weight"),
-                    config.n_embd,
-                    config.n_ff,
-                )?,
-                w_up: weight(
-                    gguf,
-                    &format!("{prefix}.ffn_up.weight"),
-                    config.n_embd,
-                    config.n_ff,
-                )?,
-                w_down: weight(
-                    gguf,
-                    &format!("{prefix}.ffn_down.weight"),
-                    config.n_ff,
-                    config.n_embd,
-                )?,
+                feed_forward: if config.expert_count == 0 {
+                    FeedForward::Dense {
+                        gate: weight(
+                            gguf,
+                            &format!("{prefix}.ffn_gate.weight"),
+                            config.n_embd,
+                            config.n_ff,
+                        )?,
+                        up: weight(
+                            gguf,
+                            &format!("{prefix}.ffn_up.weight"),
+                            config.n_embd,
+                            config.n_ff,
+                        )?,
+                        down: weight(
+                            gguf,
+                            &format!("{prefix}.ffn_down.weight"),
+                            config.n_ff,
+                            config.n_embd,
+                        )?,
+                    }
+                } else {
+                    FeedForward::Sparse {
+                        router: weight(
+                            gguf,
+                            &format!("{prefix}.ffn_gate_inp.weight"),
+                            config.n_embd,
+                            config.expert_count,
+                        )?,
+                        gate: experts(
+                            gguf,
+                            &format!("{prefix}.ffn_gate_exps.weight"),
+                            config.n_embd,
+                            config.expert_ff,
+                            config.expert_count,
+                        )?,
+                        up: experts(
+                            gguf,
+                            &format!("{prefix}.ffn_up_exps.weight"),
+                            config.n_embd,
+                            config.expert_ff,
+                            config.expert_count,
+                        )?,
+                        down: experts(
+                            gguf,
+                            &format!("{prefix}.ffn_down_exps.weight"),
+                            config.expert_ff,
+                            config.n_embd,
+                            config.expert_count,
+                        )?,
+                    }
+                },
             });
         }
         let token_embd = weight(gguf, "token_embd.weight", config.n_embd, config.n_vocab)?;
@@ -305,16 +423,26 @@ impl<'a> Model<'a> {
         let mut all_weights: Vec<&Weight<'a>> = Vec::with_capacity(layers.len() * 7 + 2);
         all_weights.push(&token_embd);
         all_weights.push(&output);
+        // Every expert is a separate slice, so a routed model reserves each one;
+        // a dense layer reserves its three matrices.
+        let mut expert_views: Vec<Vec<Weight<'a>>> = Vec::with_capacity(layers.len());
         for layer in &layers {
-            all_weights.extend([
-                &layer.wq,
-                &layer.wk,
-                &layer.wv,
-                &layer.wo,
-                &layer.w_gate,
-                &layer.w_up,
-                &layer.w_down,
-            ]);
+            all_weights.extend([&layer.wq, &layer.wk, &layer.wv, &layer.wo]);
+            match &layer.feed_forward {
+                FeedForward::Dense { gate, up, down } => all_weights.extend([gate, up, down]),
+                FeedForward::Sparse { gate, up, down, .. } => {
+                    let mut views = Vec::with_capacity(gate.len() * 3);
+                    for index in 0..gate.len() {
+                        views.push(gate.expert(index));
+                        views.push(up.expert(index));
+                        views.push(down.expert(index));
+                    }
+                    expert_views.push(views);
+                }
+            }
+        }
+        for views in &expert_views {
+            all_weights.extend(views.iter());
         }
         // A device that cannot hold every weight falls back to the CPU here
         // rather than failing halfway through the first reply.
@@ -660,41 +788,129 @@ impl<'a> Model<'a> {
             &mut scratch.normed_ffn,
             0,
         )?;
-        self.compute.matmul_prepared_group(
-            &mut [
-                GroupMember {
-                    weight: &layer.w_gate,
-                    out: &mut scratch.gate,
-                    out_offset: 0,
-                },
-                GroupMember {
-                    weight: &layer.w_up,
-                    out: &mut scratch.up,
-                    out_offset: 0,
-                },
-            ],
-            &scratch.normed_ffn,
-            0,
-            &normed,
-            n,
-        )?;
-        let activated = self.compute.silu_mul_prepare(
-            &mut scratch.activated,
-            &scratch.gate,
-            &scratch.up,
-            n,
-            ffn,
-        )?;
-        self.compute.matmul_add(
-            &layer.w_down,
-            &scratch.activated,
-            0,
-            Some(&activated),
-            n,
-            &mut scratch.x,
-            0,
-            &mut scratch.projected,
-        )?;
+        match &layer.feed_forward {
+            FeedForward::Dense { gate, up, down } => {
+                self.compute.matmul_prepared_group(
+                    &mut [
+                        GroupMember {
+                            weight: gate,
+                            out: &mut scratch.gate,
+                            out_offset: 0,
+                        },
+                        GroupMember {
+                            weight: up,
+                            out: &mut scratch.up,
+                            out_offset: 0,
+                        },
+                    ],
+                    &scratch.normed_ffn,
+                    0,
+                    &normed,
+                    n,
+                )?;
+                let activated = self.compute.silu_mul_prepare(
+                    &mut scratch.activated,
+                    &scratch.gate,
+                    &scratch.up,
+                    n,
+                    ffn,
+                )?;
+                self.compute.matmul_add(
+                    down,
+                    &scratch.activated,
+                    0,
+                    Some(&activated),
+                    n,
+                    &mut scratch.x,
+                    0,
+                    &mut scratch.projected,
+                )?;
+            }
+            FeedForward::Sparse {
+                router,
+                gate,
+                up,
+                down,
+            } => {
+                self.expert_forward(router, gate, up, down, n, scratch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One token at a time through the experts it was routed to.
+    ///
+    /// The router is a single matmul per token; its logits go back to the host
+    /// to choose the experts, because which weights to launch cannot be decided
+    /// on the device. Each chosen expert then runs the same three matmuls a dense
+    /// block does, with its output scaled by the routing weight before it is
+    /// accumulated into the hidden state.
+    fn expert_forward(
+        &self,
+        router: &Weight<'a>,
+        gate: &Experts<'a>,
+        up: &Experts<'a>,
+        down: &Experts<'a>,
+        n: usize,
+        scratch: &mut Scratch,
+    ) -> Result<(), EngineError> {
+        let config = &self.config;
+        let embd = config.n_embd;
+        let used = config.expert_used;
+        let mut logits = vec![0.0f32; config.expert_count];
+        for token in 0..n {
+            self.compute.matmul(
+                router,
+                &scratch.normed_ffn,
+                token * embd,
+                1,
+                &mut scratch.router,
+                0,
+            )?;
+            self.compute.download(&scratch.router, &mut logits)?;
+            for (index, weight) in top_experts(&logits, used) {
+                let expert_gate = gate.expert(index);
+                let expert_up = up.expert(index);
+                let expert_down = down.expert(index);
+                self.compute.matmul(
+                    &expert_gate,
+                    &scratch.normed_ffn,
+                    token * embd,
+                    1,
+                    &mut scratch.gate,
+                    0,
+                )?;
+                self.compute.matmul(
+                    &expert_up,
+                    &scratch.normed_ffn,
+                    token * embd,
+                    1,
+                    &mut scratch.up,
+                    0,
+                )?;
+                self.compute.silu_mul(
+                    &mut scratch.activated,
+                    &scratch.gate,
+                    &scratch.up,
+                    config.expert_ff,
+                )?;
+                // Scale before the down projection: the projection is linear, so
+                // this is the same as weighting its output afterwards, without a
+                // second pass over the hidden state.
+                self.compute
+                    .scale(&mut scratch.activated, weight, config.expert_ff)?;
+                self.compute.matmul_add(
+                    &expert_down,
+                    &scratch.activated,
+                    0,
+                    None,
+                    1,
+                    &mut scratch.x,
+                    token * embd,
+                    &mut scratch.projected,
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -744,6 +960,8 @@ pub struct Scratch {
     gate: Activation,
     up: Activation,
     activated: Activation,
+    /// Router logits, one per expert. Empty when the model is dense.
+    router: Activation,
     scores: Activation,
 }
 
@@ -772,6 +990,7 @@ impl Scratch {
         let gate = workspace.view("gate");
         let up = workspace.view("up");
         let activated = workspace.view("activated");
+        let router = workspace.view("router");
         let scores = workspace.view("scores");
         Ok(Self {
             workspace,
@@ -789,6 +1008,7 @@ impl Scratch {
             gate,
             up,
             activated,
+            router,
             scores,
         })
     }
@@ -802,6 +1022,37 @@ impl Scratch {
     pub fn bytes(&self) -> usize {
         self.workspace.bytes()
     }
+}
+
+/// A stacked expert tensor: `[k, out, n_expert]`, validated against the header.
+fn experts<'a>(
+    gguf: &'a GgufFile,
+    name: &str,
+    k: usize,
+    out: usize,
+    count: usize,
+) -> Result<Experts<'a>, EngineError> {
+    let tensor = gguf.tensor(name)?;
+    if tensor.dims != vec![k as u64, out as u64, count as u64] {
+        return Err(EngineError::Format(format!(
+            "{name} has shape {:?}, expected [{k}, {out}, {count}]",
+            tensor.dims
+        )));
+    }
+    let data = gguf.data(name)?;
+    let expected = tensor.dtype.byte_len((k * out * count) as u64) as usize;
+    if data.len() != expected {
+        return Err(EngineError::Format(format!(
+            "{name} holds {} bytes, expected {expected}",
+            data.len()
+        )));
+    }
+    Ok(Experts {
+        dtype: tensor.dtype,
+        k,
+        out,
+        data,
+    })
 }
 
 fn weight<'a>(
@@ -824,6 +1075,28 @@ fn weight<'a>(
 pub mod tests {
     use super::{Config, check_supported};
     use crate::error::EngineError;
+
+    #[test]
+    fn the_router_takes_the_highest_logits_and_normalises_them() {
+        let picks = super::top_experts(&[1.0, 5.0, 3.0, 2.0], 2);
+        assert_eq!(picks.len(), 2);
+        assert_eq!(picks[0].0, 1, "highest logit wins");
+        assert_eq!(picks[1].0, 2, "second highest follows");
+        let total: f32 = picks.iter().map(|(_, weight)| weight).sum();
+        assert!((total - 1.0).abs() < 1e-6, "weights sum to {total}");
+        assert!(
+            picks[0].1 > picks[1].1,
+            "the higher logit carries more weight"
+        );
+    }
+
+    #[test]
+    fn the_router_never_asks_for_more_experts_than_there_are() {
+        let picks = super::top_experts(&[0.0, 0.0], 8);
+        assert_eq!(picks.len(), 2);
+        let total: f32 = picks.iter().map(|(_, weight)| weight).sum();
+        assert!((total - 1.0).abs() < 1e-6);
+    }
 
     #[test]
     fn a_dense_attention_block_is_supported() {
@@ -867,6 +1140,9 @@ pub mod tests {
             rope_base: 5e6,
             eps: 1e-6,
             n_vocab: 130_560,
+            expert_count: 0,
+            expert_used: 0,
+            expert_ff: 6144,
         }
     }
 }

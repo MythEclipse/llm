@@ -162,7 +162,8 @@ pub fn scratch_requests(
 ) -> Vec<BufferRequest> {
     let embd = tokens * config.n_embd;
     let kv = tokens * config.kv_dim();
-    let ffn = tokens * config.n_ff;
+    // One buffer set serves both block types, so it is sized for the wider one.
+    let ffn = tokens * config.n_ff.max(config.expert_ff);
     vec![
         // The hidden state, live from the embedding to the last residual.
         BufferRequest {
@@ -253,6 +254,14 @@ pub fn scratch_requests(
             floats: ffn,
             first_use: ACT,
             last_use: DOWN,
+        },
+        // Router logits for a routed feed-forward: one value per expert, read
+        // back to the host to choose the experts. Zero-length when dense.
+        BufferRequest {
+            name: "router",
+            floats: config.expert_count,
+            first_use: FFN_UP,
+            last_use: ACT,
         },
     ]
 }

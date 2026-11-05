@@ -917,6 +917,23 @@ impl Compute {
         }
     }
 
+    /// `act[..len] *= factor`, used by routed experts to weight their output
+    /// before it is accumulated into the hidden state.
+    pub fn scale(&self, act: &mut Activation, factor: f32, len: usize) -> Result<(), EngineError> {
+        match (&self.gpu, act) {
+            (Some(gpu), Activation::Device(target)) => {
+                gpu.axpby_f32(target, 0, target, 0, factor, 0.0, len)
+            }
+            (None, Activation::Host(values)) => {
+                for value in values[..len].iter_mut() {
+                    *value *= factor;
+                }
+                Ok(())
+            }
+            _ => unreachable!("activation belongs to the other backend"),
+        }
+    }
+
     pub fn residual_add(
         &self,
         x: &mut Activation,

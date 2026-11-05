@@ -96,6 +96,9 @@ fn tiled_matches_host() {
         rope_base: 5e6,
         eps: 1e-6,
         n_vocab: 1,
+        expert_count: 0,
+        expert_used: 0,
+        expert_ff: 6144,
     };
     let compute = Compute::auto(&config, 0);
     assert_eq!(
