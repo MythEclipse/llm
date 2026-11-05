@@ -611,7 +611,8 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 ### Yang datang dari netra-kernel
 
 Empat mekanisme diambil dari compiler AOT Netra (risetnya di
-`docs/research/netra-kernel.md`); yang tidak diambil adalah compilernya sendiri,
+`docs/research/netra-kernel.md`; inventaris permukaan CUDA yang tersedia untuk
+kernel di repo ini ada di `docs/research/cuda-surface.md`); yang tidak diambil adalah compilernya sendiri,
 karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
 
 - **Identitas build.** `build.rs` mencatat sha256 `gpu.cu`, sha256 PTX yang
