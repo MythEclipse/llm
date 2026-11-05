@@ -700,6 +700,16 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
 - **Angka menunjuk artefak.** Setiap keluaran `bench` mencetak identitas build dan
   identitas rencana; tanpa itu sebuah angka tidak bisa dibandingkan dengan angka
   lain.
+- **Batas model 2B ini, dan di mana batasnya.** Pada percakapan yang memuat
+  nama pengguna, model kadang menyebut dirinya dengan nama itu ("namaku Budi" →
+  "Saya Budi!"), dan pada sebagian percakapan ia membeku mengulang jawaban
+  sebelumnya (terukur 1 dari 5 percakapan dua giliran). Ini bukan bug engine:
+  prompt yang sama persis, diberikan ke llama.cpp b11429, menghasilkan
+  kekacauan yang sama ("Saya ingerti kamu mungkin ngisiné saka aplikasi AI
+  seperti ini"). Prompt sistem (9 varian diuji), BOS, dan penyempitan sampling
+  mengurangi gejalanya tetapi tidak menghilangkannya — yang tersisa adalah
+  kemampuan bahasa Indonesia model 2B. Jalur perbaikannya model lain, bukan
+  kode: loader membaca GGUF arsitektur llama apa pun.
 - **Truncation sampling lebih sempit dari default llama.cpp, dan itu diukur.**
   Pada `top_p 0.95` / `min_p 0.05` model ini keluar dari bahasa Indonesia:
   menjawab dengan bahasa Jawa dan menyangkal fakta yang baru saja diberikan.
