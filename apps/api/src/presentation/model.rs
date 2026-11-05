@@ -49,6 +49,9 @@ pub struct PlanInfoResponse {
     pub prefill: String,
     pub identity: String,
     pub fallbacks: Vec<String>,
+    pub scratch_bytes: usize,
+    pub scratch_reused_bytes: usize,
+    pub scratch_identity: String,
 }
 
 impl From<BuildInfo> for BuildInfoResponse {
@@ -71,6 +74,9 @@ impl From<PlanInfo> for PlanInfoResponse {
             prefill: info.prefill,
             identity: info.identity,
             fallbacks: info.fallbacks,
+            scratch_bytes: info.scratch_bytes,
+            scratch_reused_bytes: info.scratch_reused_bytes,
+            scratch_identity: info.scratch_identity,
         }
     }
 }

@@ -10,7 +10,7 @@ mod sys;
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -111,9 +111,27 @@ const MMA_TOKENS: usize = 1024;
 /// Activations already quantised on the device, ready for one or more matmuls.
 pub struct Prepared(DevicePtr);
 
+/// One device allocation several [`DeviceBuffer`]s carve up, freed when the
+/// last view drops. The scratch plan owns one of these per session.
+pub struct Arena {
+    pointer: DevicePtr,
+    bytes: usize,
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `cuMemAlloc_v2` and is freed once.
+        unsafe { cuMemFree_v2(self.pointer) };
+        note_release(self.bytes);
+    }
+}
+
 pub struct DeviceBuffer {
     pointer: DevicePtr,
     len: usize,
+    /// Set when this buffer is a window into an [`Arena`], which owns the
+    /// allocation and frees it when the last view goes.
+    arena: Option<Arc<Arena>>,
 }
 
 impl DeviceBuffer {
@@ -134,9 +152,25 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        if self.arena.is_some() {
+            return;
+        }
         // SAFETY: the pointer came from `cuMemAlloc_v2` and is freed once.
         unsafe { cuMemFree_v2(self.pointer) };
         note_release(allocation_bytes(self.len));
+    }
+}
+
+/// A `len`-float window into `arena`, starting `offset` floats in. The view does
+/// not free: the arena does, once the last view is gone.
+pub fn view(arena: &Arc<Arena>, offset: usize, len: usize) -> DeviceBuffer {
+    // The caller only asks for windows its own plan placed inside the arena, and
+    // the arena outlives the view through the `Arc`.
+    let pointer = shifted(arena.pointer, offset);
+    DeviceBuffer {
+        pointer,
+        len,
+        arena: Some(Arc::clone(arena)),
     }
 }
 
@@ -351,7 +385,29 @@ impl Gpu {
             )));
         }
         note_allocation(allocation_bytes(len));
-        Ok(DeviceBuffer { pointer, len })
+        Ok(DeviceBuffer {
+            pointer,
+            len,
+            arena: None,
+        })
+    }
+
+    /// One allocation the scratch buffers carve up, so a token allocates
+    /// nothing after the session starts.
+    pub fn arena(&self, floats: usize) -> Result<Arc<Arena>, EngineError> {
+        self.bind()?;
+        let bytes = allocation_bytes(floats);
+        let mut pointer = DevicePtr(0);
+        // SAFETY: the driver writes the allocation handle into `pointer`.
+        let status = unsafe { cuMemAlloc_v2(&raw mut pointer, bytes) };
+        if status != SUCCESS {
+            return Err(EngineError::Unsupported(format!(
+                "cuda: arena allocation of {bytes} bytes failed: {}",
+                error_message(status)
+            )));
+        }
+        note_allocation(bytes);
+        Ok(Arc::new(Arena { pointer, bytes }))
     }
 
     /// Bytes held on the device right now, and the most ever held at once.

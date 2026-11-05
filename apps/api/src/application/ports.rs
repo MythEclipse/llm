@@ -106,6 +106,11 @@ pub struct PlanInfo {
     pub identity: String,
     /// `regime: reason` for every regime on the general path.
     pub fallbacks: Vec<String>,
+    /// Scratch the largest prefill chunk plans, and how much of it is shared
+    /// between buffers whose lifetimes do not overlap.
+    pub scratch_bytes: usize,
+    pub scratch_reused_bytes: usize,
+    pub scratch_identity: String,
 }
 
 #[derive(Debug, Clone)]

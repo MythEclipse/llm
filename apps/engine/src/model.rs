@@ -1,10 +1,11 @@
 //! The MiniCPM5 transformer: embeddings → 42 decoder layers → logits.
 
-use crate::compute::{Activation, AttentionSpec, Compute, GroupMember};
+use crate::compute::{Activation, AttentionSpec, Compute, GroupMember, Workspace};
 use crate::error::EngineError;
 use crate::gguf::GgufFile;
 use crate::ops::RopeTable;
 use crate::tensor::{Weight, as_f32};
+use crate::workspace::{self, BufferPlan};
 use tracing::{debug, info, instrument};
 
 /// Geometry taken from the GGUF header.
@@ -285,6 +286,19 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// The scratch layout this model plans for `tokens` at `capacity`, without
+    /// allocating it: the endpoint reports these numbers and [`Scratch::new`]
+    /// allocates the same plan.
+    pub fn scratch_plan(&self, tokens: usize, capacity: usize) -> BufferPlan {
+        let score_grid = self.compute.plan().attention(tokens).needs_score_grid();
+        BufferPlan::plan(workspace::scratch_requests(
+            &self.config,
+            tokens,
+            capacity,
+            score_grid,
+        ))
+    }
+
     pub fn rope_table(&self, positions: usize) -> RopeTable {
         RopeTable::new(self.config.n_rot, self.config.rope_base, positions)
     }
@@ -301,12 +315,16 @@ impl<'a> Model<'a> {
 
     /// Logits for the last token of `tokens`, with keys/values appended at
     /// `kv.len()`.
+    ///
+    /// `scratch` is sized for `tokens` by [`Scratch::new`], so the pass itself
+    /// allocates nothing: a decode step reuses the same buffers every token.
     #[instrument(skip_all, fields(tokens = tokens.len(), position = kv.len()))]
     pub fn forward(
         &self,
         tokens: &[u32],
         kv: &mut KvCache,
         rope: &RopeTable,
+        scratch: &mut Scratch,
     ) -> Result<Vec<f32>, EngineError> {
         let n = tokens.len();
         if n == 0 {
@@ -323,7 +341,12 @@ impl<'a> Model<'a> {
         let start = kv.len();
         debug!(tokens = n, start, "forward pass started");
 
-        let mut x = self.compute.alloc(n * embd)?;
+        if scratch.tokens() < n {
+            return Err(EngineError::Format(format!(
+                "scratch holds {} tokens, {n} requested",
+                scratch.tokens()
+            )));
+        }
         for token in tokens {
             if *token as usize >= config.n_vocab {
                 return Err(EngineError::Format(format!(
@@ -332,32 +355,36 @@ impl<'a> Model<'a> {
             }
         }
         self.compute
-            .embeddings(&self.token_embd, tokens, &mut x, 0)?;
+            .embeddings(&self.token_embd, tokens, &mut scratch.x, 0)?;
 
-        let mut scratch = Scratch::new(&self.compute, config, n)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let _layer_span =
                 tracing::debug_span!("transformer_layer", layer = index, tokens = n, start)
                     .entered();
-            self.layer_forward(layer, index, &mut x, n, start, kv, rope, &mut scratch)?;
+            self.layer_forward(layer, index, n, start, kv, rope, scratch)?;
         }
         kv.len = start + n;
 
         self.compute.rmsnorm(
-            &x,
+            &scratch.x,
             (n - 1) * embd,
             self.output_norm,
             config.eps,
             1,
-            &mut scratch.normed,
+            &mut scratch.output_norm,
             0,
         )?;
-        let mut logits = self.compute.alloc(config.n_vocab)?;
-        self.compute
-            .matmul(&self.output, &scratch.normed, 0, 1, &mut logits, 0)?;
+        self.compute.matmul(
+            &self.output,
+            &scratch.output_norm,
+            0,
+            1,
+            &mut scratch.logits,
+            0,
+        )?;
 
         let mut values = vec![0.0f32; config.n_vocab];
-        self.compute.download(&logits, &mut values)?;
+        self.compute.download(&scratch.logits, &mut values)?;
         debug!(tokens = n, position = start + n, "forward pass complete");
         Ok(values)
     }
@@ -367,7 +394,6 @@ impl<'a> Model<'a> {
         &self,
         layer: &Layer<'a>,
         index: usize,
-        x: &mut Activation,
         n: usize,
         start: usize,
         kv: &mut KvCache,
@@ -382,12 +408,12 @@ impl<'a> Model<'a> {
         // straight from the hidden state — one kernel instead of a write-out,
         // a read-back, and a quantise pass.
         let normed = self.compute.norm_prepare(
-            x,
+            &scratch.x,
             0,
             layer.attn_norm,
             config.eps,
             n,
-            &mut scratch.normed,
+            &mut scratch.normed_attn,
             0,
         )?;
         self.compute.matmul_prepared_group(
@@ -408,7 +434,7 @@ impl<'a> Model<'a> {
                     out_offset: 0,
                 },
             ],
-            &scratch.normed,
+            &scratch.normed_attn,
             0,
             &normed,
             n,
@@ -439,8 +465,6 @@ impl<'a> Model<'a> {
             scores_stride: start + n,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
         };
-        let needed = self.compute.attention_scores(&spec, n);
-        scratch.ensure_scores(&self.compute, needed)?;
         self.compute.attend(
             &scratch.q,
             &kv.keys[index],
@@ -458,18 +482,18 @@ impl<'a> Model<'a> {
             0,
             None,
             n,
-            x,
+            &mut scratch.x,
             0,
             &mut scratch.projected,
         )?;
 
         let normed = self.compute.norm_prepare(
-            x,
+            &scratch.x,
             0,
             layer.ffn_norm,
             config.eps,
             n,
-            &mut scratch.normed,
+            &mut scratch.normed_ffn,
             0,
         )?;
         self.compute.matmul_prepared_group(
@@ -485,7 +509,7 @@ impl<'a> Model<'a> {
                     out_offset: 0,
                 },
             ],
-            &scratch.normed,
+            &scratch.normed_ffn,
             0,
             &normed,
             n,
@@ -503,7 +527,7 @@ impl<'a> Model<'a> {
             0,
             Some(&activated),
             n,
-            x,
+            &mut scratch.x,
             0,
             &mut scratch.projected,
         )?;
@@ -511,8 +535,21 @@ impl<'a> Model<'a> {
     }
 }
 
-struct Scratch {
-    normed: Activation,
+/// Buffers one forward pass reuses.
+///
+/// The plan decides the sizes and the offsets: the kernel plan says whether a
+/// score grid is needed at all, and the lifetime table in [`crate::workspace`]
+/// says which buffers can share a region. One allocation per scratch, so a
+/// decode step allocates nothing at all.
+pub struct Scratch {
+    workspace: Workspace,
+    /// Tokens this scratch is sized for.
+    tokens: usize,
+    x: Activation,
+    logits: Activation,
+    output_norm: Activation,
+    normed_attn: Activation,
+    normed_ffn: Activation,
     q: Activation,
     k: Activation,
     v: Activation,
@@ -525,28 +562,59 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(compute: &Compute, config: &Config, n: usize) -> Result<Self, EngineError> {
+    pub fn new(
+        compute: &Compute,
+        config: &Config,
+        tokens: usize,
+        capacity: usize,
+    ) -> Result<Self, EngineError> {
+        let score_grid = compute.plan().attention(tokens).needs_score_grid();
+        let plan = BufferPlan::plan(workspace::scratch_requests(
+            config, tokens, capacity, score_grid,
+        ));
+        let workspace = compute.workspace(plan)?;
+        let x = workspace.view("x");
+        let logits = workspace.view("logits");
+        let output_norm = workspace.view("output_norm");
+        let normed_attn = workspace.view("normed_attn");
+        let normed_ffn = workspace.view("normed_ffn");
+        let q = workspace.view("q");
+        let k = workspace.view("k");
+        let v = workspace.view("v");
+        let attn = workspace.view("attn");
+        let projected = workspace.view("projected");
+        let gate = workspace.view("gate");
+        let up = workspace.view("up");
+        let activated = workspace.view("activated");
+        let scores = workspace.view("scores");
         Ok(Self {
-            normed: compute.alloc(n * config.n_embd)?,
-            q: compute.alloc(n * config.n_embd)?,
-            k: compute.alloc(n * config.kv_dim())?,
-            v: compute.alloc(n * config.kv_dim())?,
-            attn: compute.alloc(n * config.n_embd)?,
-            projected: compute.alloc(n * config.n_embd)?,
-            gate: compute.alloc(n * config.n_ff)?,
-            up: compute.alloc(n * config.n_ff)?,
-            activated: compute.alloc(n * config.n_ff)?,
-            scores: compute.alloc(1)?,
+            workspace,
+            tokens,
+            x,
+            logits,
+            output_norm,
+            normed_attn,
+            normed_ffn,
+            q,
+            k,
+            v,
+            attn,
+            projected,
+            gate,
+            up,
+            activated,
+            scores,
         })
     }
 
-    /// Attention scratch, grown in powers of two so a long decode does not
-    /// reallocate on every token.
-    fn ensure_scores(&mut self, compute: &Compute, needed: usize) -> Result<(), EngineError> {
-        if self.scores.len() < needed {
-            self.scores = compute.alloc(needed.next_power_of_two())?;
-        }
-        Ok(())
+    /// Tokens this scratch can carry in one call.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Bytes the plan holds.
+    pub fn bytes(&self) -> usize {
+        self.workspace.bytes()
     }
 }
 
@@ -564,4 +632,26 @@ fn weight<'a>(
         )));
     }
     Ok(Weight::new(tensor.dtype, k, out, gguf.data(name)?))
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::Config;
+
+    /// The geometry of the model this engine ships with: 42 layers, 16 query
+    /// heads over 2 kv heads, head_dim 128.
+    pub fn minicpm() -> Config {
+        Config {
+            n_layers: 42,
+            n_embd: 2048,
+            n_ff: 6144,
+            n_head: 16,
+            n_head_kv: 2,
+            head_dim: 128,
+            n_rot: 128,
+            rope_base: 5e6,
+            eps: 1e-6,
+            n_vocab: 130_560,
+        }
+    }
 }

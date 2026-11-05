@@ -8,7 +8,7 @@ use llm_engine::chat::{Role as EngineRole, Turn, render};
 use llm_engine::manifest::BuildManifest;
 use llm_engine::{
     Event, GenerationRequest as CoreRequest, GgufFile, Model, SamplingParams, Session, Tokenizer,
-    generate,
+    generate, session::PREFILL_CHUNK,
 };
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, instrument};
@@ -69,7 +69,7 @@ impl LocalChatEngine {
             threads,
             device: model.device_name().map(str::to_owned),
             build: build_info(),
-            plan: plan_info(model),
+            plan: plan_info(model, context),
         };
         if let Some(note) = model.device_note() {
             tracing::warn!(%note, "no GPU backend, running on the cpu");
@@ -237,8 +237,9 @@ fn build_info() -> BuildInfo {
 }
 
 /// Which kernels this model resolved to, and why any of them is the general one.
-fn plan_info(model: &Model<'_>) -> PlanInfo {
+fn plan_info(model: &Model<'_>, context: usize) -> PlanInfo {
     let plan = model.compute().plan();
+    let scratch = model.scratch_plan(PREFILL_CHUNK.min(context), context);
     PlanInfo {
         decode: plan.decode.tactic.to_string(),
         prefill: plan.prefill.tactic.to_string(),
@@ -248,6 +249,9 @@ fn plan_info(model: &Model<'_>) -> PlanInfo {
             .into_iter()
             .map(|(regime, reason)| format!("{regime}: {reason}"))
             .collect(),
+        scratch_bytes: scratch.bytes(),
+        scratch_reused_bytes: scratch.reused_floats() * std::mem::size_of::<f32>(),
+        scratch_identity: scratch.identity(),
     }
 }
 

@@ -16,12 +16,13 @@ pub mod session;
 pub mod tactics;
 pub mod tensor;
 pub mod tokenizer;
+pub mod workspace;
 
 pub use compute::{Activation, AttentionSpec, Compute};
 pub use error::EngineError;
 pub use generate::{Event, GenerationRequest, RunStats, StopReason, generate};
 pub use gguf::{DType, GgufFile, TensorInfo};
-pub use model::{Config, KvCache, Model};
+pub use model::{Config, KvCache, Model, Scratch};
 pub use sampler::SamplingParams;
 pub use session::Session;
 pub use tokenizer::{StreamDecoder, Tokenizer};

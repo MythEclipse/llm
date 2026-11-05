@@ -60,6 +60,9 @@ impl Default for FakeEngine {
                     prefill: "attention.prefill_mma_f16".to_string(),
                     identity: "3".repeat(64),
                     fallbacks: Vec::new(),
+                    scratch_bytes: 4096,
+                    scratch_reused_bytes: 1024,
+                    scratch_identity: "4".repeat(64),
                 },
             },
         }

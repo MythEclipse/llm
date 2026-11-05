@@ -12,6 +12,7 @@ use crate::model::Config;
 use crate::ops::{self, RopeTable};
 use crate::tactics::{AttentionPath, KernelPlan};
 use crate::tensor::{Weight, dequant_row, matmul};
+use crate::workspace::BufferPlan;
 
 /// A tensor the forward pass reads or writes.
 pub enum Activation {
@@ -53,6 +54,38 @@ pub struct AttentionSpec {
     pub kv_dim: usize,
     pub scores_stride: usize,
     pub scale: f32,
+}
+
+/// The buffers one session reuses, laid out by the plan and allocated once.
+///
+/// On the device they are windows into a single arena, so a token allocates
+/// nothing; on the host each is its own vector, because a `Vec` cannot be a view.
+pub struct Workspace {
+    arena: Option<std::sync::Arc<crate::cuda::Arena>>,
+    plan: BufferPlan,
+}
+
+impl Workspace {
+    /// The buffer the plan calls `name`.
+    pub fn view(&self, name: &str) -> Activation {
+        let index = self
+            .plan
+            .index_of(name)
+            .expect("every requested buffer is in the plan");
+        match &self.arena {
+            Some(arena) => Activation::Device(crate::cuda::view(
+                arena,
+                self.plan.offset(index),
+                self.plan.size(index),
+            )),
+            None => Activation::Host(vec![0.0; self.plan.size(index)]),
+        }
+    }
+
+    /// Bytes the whole plan holds.
+    pub fn bytes(&self) -> usize {
+        self.plan.bytes()
+    }
 }
 
 /// The device used for the whole forward pass, and the kernel plan resolved for
@@ -116,6 +149,18 @@ impl Compute {
     /// The kernels this model resolved to, and why.
     pub fn plan(&self) -> &KernelPlan {
         &self.plan
+    }
+
+    /// Allocate the plan in one go: one arena on the device, one vector per
+    /// buffer on the host.
+    pub fn workspace(&self, plan: BufferPlan) -> Result<Workspace, EngineError> {
+        match &self.gpu {
+            Some(gpu) => Ok(Workspace {
+                arena: Some(gpu.arena(plan.floats())?),
+                plan,
+            }),
+            None => Ok(Workspace { arena: None, plan }),
+        }
     }
 
     /// Why the CPU backend is in use, when it was not a free choice.
