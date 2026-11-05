@@ -293,6 +293,8 @@ struct Kernels {
     rmsnorm: Function,
     rmsnorm_quantize: Function,
     silu_mul: Function,
+    split_query_gate: Function,
+    sigmoid_mul: Function,
     copy_f32: Function,
     fill_f32: Function,
     axpby_f32: Function,
@@ -425,6 +427,8 @@ impl Gpu {
                 rmsnorm: load("rmsnorm_rows")?,
                 rmsnorm_quantize: load("rmsnorm_quantize_rows")?,
                 silu_mul: load("silu_mul")?,
+                split_query_gate: load("split_query_gate")?,
+                sigmoid_mul: load("sigmoid_mul")?,
                 copy_f32: load("copy_f32")?,
                 fill_f32: load("fill_f32")?,
                 axpby_f32: load("axpby_f32")?,
@@ -934,6 +938,55 @@ impl Gpu {
         self.launch(
             self.kernels.silu_mul,
             (blocks(n), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Multiply an activation by `sigmoid(gate)`, elementwise.
+    pub fn sigmoid_mul(
+        &self,
+        act: &DeviceBuffer,
+        gate: &DeviceBuffer,
+        n: usize,
+    ) -> Result<(), EngineError> {
+        let mut args = [
+            Arg::Pointer(act.pointer),
+            Arg::Pointer(gate.pointer),
+            Arg::Int(n as i32),
+        ];
+        self.launch(
+            self.kernels.sigmoid_mul,
+            (blocks(n), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut args,
+        )
+    }
+
+    /// Split a packed query projection into its query and gate halves.
+    pub fn split_query_gate(
+        &self,
+        packed: &DeviceBuffer,
+        query: &DeviceBuffer,
+        gate: &DeviceBuffer,
+        heads: usize,
+        head_dim: usize,
+        tokens: usize,
+    ) -> Result<(), EngineError> {
+        let total = tokens * heads * head_dim;
+        let mut args = [
+            Arg::Pointer(packed.pointer),
+            Arg::Pointer(query.pointer),
+            Arg::Pointer(gate.pointer),
+            Arg::Int(heads as i32),
+            Arg::Int(head_dim as i32),
+            Arg::Int(total as i32),
+        ];
+        self.launch(
+            self.kernels.split_query_gate,
+            (blocks(total), 1, 1),
             (256, 1, 1),
             0,
             &mut args,

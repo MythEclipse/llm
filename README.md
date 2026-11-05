@@ -745,10 +745,18 @@ dipadatkan, L2-normalisasi q/k per head, delta rule per head nilai
 (`S *= exp(g)`, `delta = (v - S·k)·beta`, `S += k·delta`, `out = S·q/√d`), lalu
 gated RMSNorm dengan gerbang `silu(z)` dan proyeksi `ssm_out`.
 
-Blok ini berjalan di host, jadi model yang memakainya (atau yang head-nya lebih
-dari 128, atau yang menormalkan q/k per head) tidak ditawari jalur GPU: satu
-sumber kebenaran lebih baik daripada jalur cepat yang diam-diam salah. Model
-yang seluruhnya dense tetap memakai GPU seperti sebelumnya.
+Di GPU, keempat proyeksi blok ini jalan di device; hanya aritmetika state-nya
+yang dibaca balik ke host, karena delta rule belum punya kernel. Per token itu
+sekitar 50 KB turun dan 16 KB naik, sementara bobot yang dilewati proyeksi
+berukuran gigabyte — jadi pulau host ini murah, dan modelnya tidak lagi dipaksa
+ke CPU. Konsekuensinya blok recurrent tidak bisa masuk graph capture; model yang
+punya blok itu tetap menjalankan decode tanpa graph.
+
+Blok attention `qwen35` selebar 256 per head juga jalan di device: kernel
+decode-split dan kernel serial men-staging sampai 256 elemen per head. Prefill
+selebar itu memakai kernel serial (yang tiled mengikat empat dimensi per lane,
+yaitu 128); bentuk tiled untuk 256 adalah pekerjaan berikutnya, bukan syarat
+kebenaran.
 
 Verifikasi: `llama-eval-callback` dari llama.cpp `d812350493` (build yang
 menjalankan file ini 10,5 t/s) membuang nilai tiap tensor, dan
@@ -764,9 +772,17 @@ tersimpan `[kanal, tap]` (tap tercepat), bukan `[tap, kanal]`; dan bias
 `ssm_dt` harus ditambahkan sebelum softplus. Salah satunya menghasilkan model
 yang tetap jalan dan mengeluarkan teks yang meyakinkan tapi salah.
 
-Kecepatan sekarang: 7 t/s decode di CPU untuk 4,2B Q8_0 (llama.cpp 10 t/s).
-Prefill memproses blok recurrent token demi token; bentuk chunked-parallel dan
-kernel GPU adalah pekerjaan berikutnya, bukan syarat kebenaran.
+Kecepatan, 4,2B Q8_0, context 1024, diukur dengan `llm-cli bench`:
+
+| | CPU | GPU (RTX 4050 Laptop) |
+|---|---|---|
+| pp128 | 13,8 t/s | 89,6 t/s |
+| pp512 | 18,9 t/s | 91,1 t/s |
+| tg32 | 7,9 t/s | 26,5 t/s |
+
+VRAM 4,17 GiB terpakai, 4,49 GiB puncak. Teks yang dihasilkan GPU dan CPU
+identik untuk prompt uji (39 token, berhenti di EOS), dan tiap blok cocok
+sampai ~5e-3 — tingkat derau kuantisasi aktivasi, bukan selisih aritmetika.
 
 ## Mixture of experts
 

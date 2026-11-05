@@ -315,6 +315,36 @@ extern "C" __global__ void rmsnorm_rows(const float* __restrict__ src,
     }
 }
 
+// out *= sigmoid(gate): the gate of a gated attention block, applied to the
+// attention output elementwise.
+extern "C" __global__ void sigmoid_mul(float* __restrict__ act,
+                                       const float* __restrict__ gate, int n) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= n) {
+        return;
+    }
+    act[index] *= 1.0f / (1.0f + expf(-gate[index]));
+}
+
+// Pull a query projection that packs a gate beside each query apart: per head the
+// file stores `head_dim` query values then `head_dim` gate values, and the two
+// halves go to separate buffers.
+extern "C" __global__ void split_query_gate(const float* __restrict__ packed,
+                                            float* __restrict__ query,
+                                            float* __restrict__ gate,
+                                            int heads, int head_dim, int total) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= total) {
+        return;
+    }
+    const int dim = index % head_dim;
+    const int head = (index / head_dim) % heads;
+    const int token = index / (head_dim * heads);
+    const int source = (token * heads + head) * head_dim * 2;
+    query[index] = packed[source + dim];
+    gate[index] = packed[source + head_dim + dim];
+}
+
 // quants = quantize(rmsnorm(src)): the normalised rows go straight to int8 for
 // the projections that consume them, so the f32 normalisation is never written
 // out and read back.
@@ -558,7 +588,10 @@ extern "C" __global__ void rope_append(float* __restrict__ query,
 // `scores` holds n_head * tokens rows of `scores_stride` floats so batched rows
 // never share a softmax buffer.
 #define ATTENTION_WARPS 4
-#define MAX_HEAD_DIM 128
+// The widest head the split/serial kernels stage. qwen35 attention blocks are
+// 256 wide, and both kernels index their per-warp accumulator by head_dim/32, so
+// the constant bounds the register array as well as the shared partials.
+#define MAX_HEAD_DIM 256
 
 __device__ __forceinline__ float warp_max(float value) {
     for (int step = 16; step > 0; step >>= 1) {
@@ -660,9 +693,9 @@ extern "C" __global__ void attention_split(const float* __restrict__ query,
     }
     __syncthreads();
 
-    float accumulator[4];
+    float accumulator[MAX_HEAD_DIM / 32];
     #pragma unroll
-    for (int element = 0; element < 4; ++element) {
+    for (int element = 0; element < MAX_HEAD_DIM / 32; ++element) {
         accumulator[element] = 0.0f;
     }
     float total = 0.0f;
@@ -686,12 +719,12 @@ extern "C" __global__ void attention_split(const float* __restrict__ query,
     __syncthreads();
 
     const size_t base = ((size_t)head * splits + split) * head_dim;
-    if (threadIdx.x < head_dim) {
+    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
         float sum = 0.0f;
         for (int source = 0; source < ATTENTION_WARPS; ++source) {
-            sum += partial[source][threadIdx.x];
+            sum += partial[source][dim];
         }
-        partial_acc[base + threadIdx.x] = sum;
+        partial_acc[base + dim] = sum;
     }
     if (threadIdx.x == 0) {
         partial_max[(size_t)head * splits + split] = local_max;
@@ -705,25 +738,27 @@ extern "C" __global__ void attention_combine(const float* __restrict__ partial_a
                                              float* __restrict__ out,
                                              int head_dim, int splits) {
     const int head = blockIdx.x;
-    if (threadIdx.x >= head_dim) {
-        return;
+    // One block per head, but the head can be wider than the block: a 256-wide
+    // head is two passes of a 128-thread block, and writing only the first half
+    // leaves the rest of the output holding whatever the buffer had before.
+    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+        float global_max = -INFINITY;
+        for (int split = 0; split < splits; ++split) {
+            global_max = fmaxf(global_max, partial_max[(size_t)head * splits + split]);
+        }
+        float denominator = 0.0f;
+        float numerator = 0.0f;
+        for (int split = 0; split < splits; ++split) {
+            const size_t index = (size_t)head * splits + split;
+            // The partial sums are unnormalised, so the split's weight is its own
+            // sum rescaled against the global max: numerator and denominator both
+            // scale by it, and only the denominator carries the sum.
+            const float factor = expf(partial_max[index] - global_max);
+            denominator += partial_sum[index] * factor;
+            numerator += partial_acc[index * head_dim + dim] * factor;
+        }
+        out[(size_t)head * head_dim + dim] = numerator / denominator;
     }
-    float global_max = -INFINITY;
-    for (int split = 0; split < splits; ++split) {
-        global_max = fmaxf(global_max, partial_max[(size_t)head * splits + split]);
-    }
-    float denominator = 0.0f;
-    float numerator = 0.0f;
-    for (int split = 0; split < splits; ++split) {
-        const size_t index = (size_t)head * splits + split;
-        // The partial sums are unnormalised, so the split's weight is its own
-        // sum rescaled against the global max: numerator and denominator both
-        // scale by it, and only the denominator carries the sum.
-        const float factor = expf(partial_max[index] - global_max);
-        denominator += partial_sum[index] * factor;
-        numerator += partial_acc[index * head_dim + threadIdx.x] * factor;
-    }
-    out[(size_t)head * head_dim + threadIdx.x] = numerator / denominator;
 }
 
 // Quantize activations to Q8_0, one warp per 32-element block. Doing this once
@@ -1676,7 +1711,7 @@ extern "C" __global__ void attention(const float* __restrict__ query,
     }
     __syncthreads();
 
-    float accumulator[4];
+    float accumulator[MAX_HEAD_DIM / 32];
     for (int element = 0; element < elements; ++element) {
         accumulator[element] = 0.0f;
     }
@@ -1692,12 +1727,12 @@ extern "C" __global__ void attention(const float* __restrict__ query,
     }
     __syncthreads();
 
-    if (threadIdx.x < head_dim) {
+    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
         float sum = 0.0f;
         for (int source = 0; source < ATTENTION_WARPS; ++source) {
-            sum += partial[source][threadIdx.x];
+            sum += partial[source][dim];
         }
-        out[((size_t)token * n_head + head) * head_dim + threadIdx.x] = sum;
+        out[((size_t)token * n_head + head) * head_dim + dim] = sum;
     }
 }
 

@@ -5,14 +5,28 @@
 pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     assert_eq!(x.len(), weight.len(), "rmsnorm weight length mismatch");
     assert_eq!(out.len(), x.len(), "rmsnorm output length mismatch");
-    // ggml accumulates the sum of squares in double; doing it in f32 shifts the
-    // scale enough to move logits after 42 layers.
-    let mean_square =
-        (x.iter().map(|value| (value * value) as f64).sum::<f64>() / x.len() as f64) as f32;
-    let scale = 1.0 / (mean_square + eps).sqrt();
+    let scale = rms_scale(x, eps);
     for ((slot, value), w) in out.iter_mut().zip(x).zip(weight) {
         *slot = value * scale * w;
     }
+}
+
+/// The same norm with the row as its own output, for callers that already own
+/// the buffer — the per-head norm of a query projection is the only one.
+pub fn rmsnorm_in_place(row: &mut [f32], weight: &[f32], eps: f32) {
+    assert_eq!(row.len(), weight.len(), "rmsnorm weight length mismatch");
+    let scale = rms_scale(row, eps);
+    for (slot, w) in row.iter_mut().zip(weight) {
+        *slot *= scale * w;
+    }
+}
+
+/// ggml accumulates the sum of squares in double; doing it in f32 shifts the
+/// scale enough to move logits after 42 layers.
+fn rms_scale(row: &[f32], eps: f32) -> f32 {
+    let mean_square =
+        (row.iter().map(|value| (value * value) as f64).sum::<f64>() / row.len() as f64) as f32;
+    1.0 / (mean_square + eps).sqrt()
 }
 
 /// SiLU, the activation inside the SwiGLU feed-forward block.

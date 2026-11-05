@@ -197,8 +197,11 @@ impl Config {
     /// Whether this model needs the host code paths: the delta net runs on the
     /// host, and the attention kernels are written for a head dimension of at
     /// most 128.
-    pub fn needs_host_path(&self) -> bool {
-        self.ssm.is_some() || self.head_dim > 128 || self.qk_norm
+    /// Whether some blocks hand work to the host even when a device is present.
+    /// The delta rule has no kernel, so a recurrent block reads its projections
+    /// back and uploads its output; that also rules out capturing a graph.
+    pub fn has_host_blocks(&self) -> bool {
+        self.ssm.is_some()
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -214,13 +217,13 @@ impl Config {
 /// Whether this engine can run the model at all, decided from its header.
 ///
 /// Two block types are implemented: attention and the gated delta net. The
-/// device kernels are written for a head dimension of at most 128; wider heads
-/// run on the host, which [`Config::needs_host_path`] reports.
+/// attention kernels stage up to 256 elements per head; anything wider has no
+/// kernel and no host path either.
 fn check_supported(architecture: &str, head_dim: usize) -> Result<(), EngineError> {
     let _ = architecture;
     if head_dim > 256 {
         return Err(EngineError::Unsupported(format!(
-            "head_dim {head_dim} exceeds the 128 the attention kernels are written for"
+            "head_dim {head_dim} exceeds the 256 the attention kernels stage"
         )));
     }
     Ok(())
@@ -521,17 +524,12 @@ impl<'a> Model<'a> {
             Err(_) => weight(gguf, "token_embd.weight", config.n_embd, config.n_vocab)?,
         };
 
-        // The delta net and a head dimension above 128 run on the host, so a
-        // model that needs either is not offered the device at all rather than
-        // being half-accelerated and quietly wrong.
-        let compute = if use_gpu && !config.needs_host_path() {
+        // Every block runs on the device when there is one. A recurrent block
+        // hands its four projections back to the host for the state update and
+        // takes the result back, because the delta rule has no kernel yet; the
+        // projections are what the weights cost, so that island is cheap.
+        let compute = if use_gpu {
             Compute::auto(&config, weight_bytes)
-        } else if config.needs_host_path() {
-            Compute::with_note(
-                None,
-                Some("this model's blocks run on the host path".to_string()),
-                &config,
-            )
         } else {
             Compute::cpu(&config)
         };
@@ -663,6 +661,7 @@ impl<'a> Model<'a> {
         self.embed(tokens, scratch)?;
         if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
             dump_activation(
+                &self.compute,
                 &dir,
                 "inp_embd",
                 &scratch.x,
@@ -707,7 +706,7 @@ impl<'a> Model<'a> {
         // only a model that runs entirely on the device is captured.
         let capture = graphs.steps >= self.compute.plan().graph_after_steps
             && self.compute.can_capture()
-            && !self.config.needs_host_path();
+            && !self.config.has_host_blocks();
         if capture {
             self.compute.begin_capture()?;
         }
@@ -789,9 +788,12 @@ impl<'a> Model<'a> {
             let _layer_span =
                 tracing::debug_span!("transformer_layer", layer = index, tokens = n, start)
                     .entered();
-            self.layer_forward(layer, index, n, start, kv, recurrent, rope, scratch, capacity)?;
+            self.layer_forward(
+                layer, index, n, start, kv, recurrent, rope, scratch, capacity,
+            )?;
             if let Some(dir) = &dump {
                 dump_activation(
+                    &self.compute,
                     dir,
                     &format!("l_out-{index}-at{start}"),
                     &scratch.x,
@@ -843,9 +845,17 @@ impl<'a> Model<'a> {
         capacity: usize,
     ) -> Result<(), EngineError> {
         match &layer.attn {
-            Attention::Dense(attn) => {
-                self.dense_attention(attn, layer.attn_norm, index, n, start, kv, rope, scratch, capacity)?
-            }
+            Attention::Dense(attn) => self.dense_attention(
+                attn,
+                layer.attn_norm,
+                index,
+                n,
+                start,
+                kv,
+                rope,
+                scratch,
+                capacity,
+            )?,
             Attention::Recurrent(attn) => {
                 self.recurrent_attention(attn, layer.attn_norm, index, n, recurrent, scratch)?
             }
@@ -907,7 +917,14 @@ impl<'a> Model<'a> {
                 &normed,
                 n,
             )?;
-            split_query_gate(scratch, n, config.n_head, config.head_dim)?;
+            self.compute.split_query_gate(
+                &scratch.q_full,
+                &mut scratch.q,
+                &mut scratch.attn_gate,
+                n,
+                config.n_head,
+                config.head_dim,
+            )?;
             &mut scratch.q
         } else {
             self.compute.matmul_prepared_group(
@@ -936,16 +953,16 @@ impl<'a> Model<'a> {
             &mut scratch.q
         };
         if let Some(weight) = attn.q_norm {
-            normalise_heads(query, weight, config.eps, config.n_head, config.head_dim, n)?;
+            self.compute
+                .rmsnorm_rows_in_place(query, 0, weight, config.eps, n * config.n_head)?;
         }
         if let Some(weight) = attn.k_norm {
-            normalise_heads(
+            self.compute.rmsnorm_rows_in_place(
                 &mut scratch.k,
+                0,
                 weight,
                 config.eps,
-                config.n_head_kv,
-                config.head_dim,
-                n,
+                n * config.n_head_kv,
             )?;
         }
 
@@ -987,14 +1004,27 @@ impl<'a> Model<'a> {
         )?;
         if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
             let width = n * config.n_head * config.head_dim;
-            dump_activation(&dir, &format!("a_pregate-{index}-n{n}"), &scratch.attn, width);
-            dump_activation(&dir, &format!("a_query-{index}-n{n}"), &scratch.q, width);
+            dump_activation(
+                &self.compute,
+                &dir,
+                &format!("a_pregate-{index}-n{n}"),
+                &scratch.attn,
+                width,
+            );
         }
         if attn.gated {
-            apply_gate(&mut scratch.attn, &scratch.attn_gate)?;
+            let width = n * config.n_head * config.head_dim;
+            self.compute
+                .sigmoid_mul(&mut scratch.attn, &scratch.attn_gate, width)?;
             if let Ok(dir) = std::env::var("LLM_DUMP_LAYERS") {
                 let width = n * config.n_head * config.head_dim;
-                dump_activation(&dir, &format!("a_gated-{index}-n{n}"), &scratch.attn, width);
+                dump_activation(
+                    &self.compute,
+                    &dir,
+                    &format!("a_gated-{index}-n{n}"),
+                    &scratch.attn,
+                    width,
+                );
             }
         }
 
@@ -1067,10 +1097,14 @@ impl<'a> Model<'a> {
         let buffers = scratch.deltanet.as_mut().ok_or_else(|| {
             EngineError::Format("recurrent scratch missing from the workspace".into())
         })?;
-        copy_to_host(&scratch.recurrent_qkv, &mut buffers.qkv)?;
-        copy_to_host(&scratch.recurrent_z, &mut buffers.z)?;
-        copy_to_host(&scratch.recurrent_alpha, &mut buffers.alpha)?;
-        copy_to_host(&scratch.recurrent_beta, &mut buffers.beta)?;
+        self.compute
+            .download(&scratch.recurrent_qkv, &mut buffers.qkv)?;
+        self.compute
+            .download(&scratch.recurrent_z, &mut buffers.z)?;
+        self.compute
+            .download(&scratch.recurrent_alpha, &mut buffers.alpha)?;
+        self.compute
+            .download(&scratch.recurrent_beta, &mut buffers.beta)?;
         // Both gates are elementwise, so they belong with the projection that
         // produced them rather than with the state update.
         deltanet::activate_alpha(&mut buffers.alpha, attn.dt, geometry.v_heads);
@@ -1111,8 +1145,7 @@ impl<'a> Model<'a> {
             dump_slice(&dir, &format!("r_conv-{index}-last"), &buffers.conv);
             dump_slice(&dir, &format!("r_out-{index}-n{n}"), produced);
         }
-        self.compute
-            .upload(&mut scratch.recurrent_out, produced)?;
+        self.compute.upload(&mut scratch.recurrent_out, produced)?;
         self.compute.matmul_add(
             &attn.out,
             &scratch.recurrent_out,
@@ -1423,104 +1456,21 @@ fn dump_slice(dir: &str, name: &str, values: &[f32]) {
 
 /// Write an activation as raw little-endian f32, so a reference implementation's
 /// dump can be compared value by value. Set `LLM_DUMP_LAYERS` to a directory.
-fn dump_activation(dir: &str, name: &str, values: &Activation, len: usize) {
+fn dump_activation(compute: &Compute, dir: &str, name: &str, values: &Activation, len: usize) {
     use std::io::Write;
-    let Some(values) = values.host() else {
+    let len = len.min(values.len());
+    let mut buffer = vec![0.0f32; len];
+    if compute.download(values, &mut buffer).is_err() {
         return;
-    };
+    }
     let path = std::path::Path::new(dir).join(format!("{name}.f32"));
     if let Ok(mut file) = std::fs::File::create(path) {
         let mut bytes = Vec::with_capacity(len * 4);
-        for value in &values[..len.min(values.len())] {
+        for value in &buffer {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         let _ = file.write_all(&bytes);
     }
-}
-
-/// Pull a query projection that packs a gate beside each query apart.
-///
-/// The file stores, per head, `head_dim` query values followed by `head_dim`
-/// gate values; the attention kernel wants the queries alone, and the gate is
-/// applied to its output.
-fn split_query_gate(
-    scratch: &mut Scratch,
-    tokens: usize,
-    n_head: usize,
-    head_dim: usize,
-) -> Result<(), EngineError> {
-    let packed = scratch.q_full.host().ok_or_else(|| {
-        EngineError::Format("packed query needs the host path".into())
-    })?;
-    let queries = scratch
-        .q
-        .host_mut()
-        .ok_or_else(|| EngineError::Format("query buffer needs the host path".into()))?;
-    let gates = scratch
-        .attn_gate
-        .host_mut()
-        .ok_or_else(|| EngineError::Format("gate buffer needs the host path".into()))?;
-    for token in 0..tokens {
-        for head in 0..n_head {
-            let source = (token * n_head + head) * head_dim * 2;
-            let destination = (token * n_head + head) * head_dim;
-            queries[destination..destination + head_dim]
-                .copy_from_slice(&packed[source..source + head_dim]);
-            gates[destination..destination + head_dim]
-                .copy_from_slice(&packed[source + head_dim..source + head_dim * 2]);
-        }
-    }
-    Ok(())
-}
-
-/// RMS-normalise every head of a q or k projection, in place.
-fn normalise_heads(
-    values: &mut Activation,
-    weight: &[f32],
-    eps: f32,
-    heads: usize,
-    head_dim: usize,
-    tokens: usize,
-) -> Result<(), EngineError> {
-    let values = values
-        .host_mut()
-        .ok_or_else(|| EngineError::Format("per-head norm needs the host path".into()))?;
-    for token in 0..tokens {
-        for head in 0..heads {
-            let start = (token * heads + head) * head_dim;
-            let head_values = &mut values[start..start + head_dim];
-            let variance =
-                head_values.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
-            let denom = (variance + eps).sqrt();
-            for (index, value) in head_values.iter_mut().enumerate() {
-                *value = *value / denom * weight[index];
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Multiply attention output by `sigmoid(gate)`, elementwise.
-fn apply_gate(values: &mut Activation, gate: &Activation) -> Result<(), EngineError> {
-    let values = values
-        .host_mut()
-        .ok_or_else(|| EngineError::Format("gated attention needs the host path".into()))?;
-    let gate = gate
-        .host()
-        .ok_or_else(|| EngineError::Format("gated attention needs the host path".into()))?;
-    for (value, gate) in values.iter_mut().zip(gate) {
-        *value *= 1.0 / (1.0 + (-gate).exp());
-    }
-    Ok(())
-}
-
-/// Copy an activation into a host buffer the block math owns.
-fn copy_to_host(activation: &Activation, destination: &mut [f32]) -> Result<(), EngineError> {
-    let source = activation
-        .host()
-        .ok_or_else(|| EngineError::Format("recurrent blocks run on the host path".into()))?;
-    destination.copy_from_slice(source);
-    Ok(())
 }
 
 /// Read one block's tensors, in whichever shape the file declares.
@@ -1794,15 +1744,17 @@ pub mod tests {
             }),
             ..minicpm()
         };
-        let recurrent: Vec<usize> = (0..config.n_layers).filter(|i| config.is_recurrent(*i)).collect();
+        let recurrent: Vec<usize> = (0..config.n_layers)
+            .filter(|i| config.is_recurrent(*i))
+            .collect();
         assert_eq!(recurrent, vec![0, 1, 2, 4, 5, 6]);
         assert_eq!(config.attention_layers(), 2);
-        assert!(config.needs_host_path());
+        assert!(config.has_host_blocks());
     }
 
     #[test]
     fn a_dense_model_needs_no_host_path() {
-        assert!(!minicpm().needs_host_path());
+        assert!(!minicpm().has_host_blocks());
     }
 
     /// The geometry of the model this engine ships with: 42 layers, 16 query

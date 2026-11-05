@@ -613,6 +613,89 @@ impl Compute {
         }
     }
 
+    /// Multiply an activation by `sigmoid(gate)`, elementwise.
+    pub fn sigmoid_mul(
+        &self,
+        act: &mut Activation,
+        gate: &Activation,
+        n: usize,
+    ) -> Result<(), EngineError> {
+        match (&self.gpu, act, gate) {
+            (Some(gpu), Activation::Device(act), Activation::Device(gate)) => {
+                gpu.sigmoid_mul(act, gate, n)
+            }
+            (None, Activation::Host(act), Activation::Host(gate)) => {
+                for (value, gate) in act.iter_mut().zip(gate.iter()).take(n) {
+                    *value *= 1.0 / (1.0 + (-gate).exp());
+                }
+                Ok(())
+            }
+            _ => unreachable!("activation belongs to the other backend"),
+        }
+    }
+
+    /// Split a query projection that packs a gate beside each query.
+    pub fn split_query_gate(
+        &self,
+        packed: &Activation,
+        query: &mut Activation,
+        gate: &mut Activation,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<(), EngineError> {
+        match (&self.gpu, packed, query, gate) {
+            (
+                Some(gpu),
+                Activation::Device(packed),
+                Activation::Device(query),
+                Activation::Device(gate),
+            ) => gpu.split_query_gate(packed, query, gate, heads, head_dim, tokens),
+            (None, Activation::Host(packed), Activation::Host(query), Activation::Host(gate)) => {
+                for token in 0..tokens {
+                    for head in 0..heads {
+                        let source = (token * heads + head) * head_dim * 2;
+                        let destination = (token * heads + head) * head_dim;
+                        query[destination..destination + head_dim]
+                            .copy_from_slice(&packed[source..source + head_dim]);
+                        gate[destination..destination + head_dim]
+                            .copy_from_slice(&packed[source + head_dim..source + head_dim * 2]);
+                    }
+                }
+                Ok(())
+            }
+            _ => unreachable!("activation belongs to the other backend"),
+        }
+    }
+
+    /// Normalise `rows` consecutive rows of `weight.len()` elements in place.
+    ///
+    /// The query and key norms of a gated attention block are per head, so the
+    /// rows are heads rather than tokens: same kernel, a different stride.
+    pub fn rmsnorm_rows_in_place(
+        &self,
+        act: &mut Activation,
+        offset: usize,
+        weight: &[f32],
+        eps: f32,
+        rows: usize,
+    ) -> Result<(), EngineError> {
+        let n = weight.len();
+        match (&self.gpu, act) {
+            (Some(gpu), Activation::Device(buffer)) => {
+                gpu.rmsnorm_rows(buffer, offset, buffer, offset, weight, n, rows, eps)
+            }
+            (None, Activation::Host(values)) => {
+                for row in 0..rows {
+                    let from = offset + row * n;
+                    ops::rmsnorm_in_place(&mut values[from..from + n], weight, eps);
+                }
+                Ok(())
+            }
+            _ => unreachable!("activation belongs to the other backend"),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,

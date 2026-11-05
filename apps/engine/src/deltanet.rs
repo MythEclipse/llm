@@ -200,10 +200,7 @@ fn convolve(
 fn l2_normalise(geometry: &Geometry, buffers: &mut Buffers, eps: f32) {
     let head_dim = geometry.head_dim;
     for head in 0..geometry.k_heads {
-        for start in [
-            head * head_dim,
-            geometry.key_dim + head * head_dim,
-        ] {
+        for start in [head * head_dim, geometry.key_dim + head * head_dim] {
             let values = &mut buffers.conv[start..start + head_dim];
             let sum: f32 = values.iter().map(|value| value * value).sum();
             let denom = (sum + eps).sqrt();
@@ -268,7 +265,8 @@ fn delta_rule(
         }
 
         // Gated RMS norm over the head, gated by the projection's own silu.
-        let z = &buffers.z[token * value_dim + head * head_dim..token * value_dim + (head + 1) * head_dim];
+        let z = &buffers.z
+            [token * value_dim + head * head_dim..token * value_dim + (head + 1) * head_dim];
         let variance: f32 = out.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
         let denom = (variance + weights.eps).sqrt();
         let destination = &mut buffers.out
@@ -361,7 +359,11 @@ mod tests {
         );
         // Channels 0..4 are the query and key heads, which the block normalises;
         // channels 4..6 are the value head, which it does not.
-        assert!((buffers.conv[4] - silu(0.5)).abs() < 1e-6, "{:?}", buffers.conv);
+        assert!(
+            (buffers.conv[4] - silu(0.5)).abs() < 1e-6,
+            "{:?}",
+            buffers.conv
+        );
         assert!((conv[0] - 0.5).abs() < 1e-6, "state keeps the input row");
     }
 
@@ -400,12 +402,23 @@ mod tests {
         // with a 1/sqrt(head_dim) scale.
         let value = silu(1.0);
         let expected = value / (geometry.head_dim as f32).sqrt();
-        assert!((buffers.raw[0] - expected).abs() < 1e-6, "{:?}", buffers.raw);
-        assert!(buffers.raw[1].abs() < 1e-6, "the second row of the state is empty");
+        assert!(
+            (buffers.raw[0] - expected).abs() < 1e-6,
+            "{:?}",
+            buffers.raw
+        );
+        assert!(
+            buffers.raw[1].abs() < 1e-6,
+            "the second row of the state is empty"
+        );
 
         // The gated norm then normalises the head and multiplies by silu(z).
         let normalised = expected / (expected * expected / 2.0 + 1e-6).sqrt();
         let expected_out = normalised * silu(1.0);
-        assert!((buffers.out[0] - expected_out).abs() < 1e-5, "{:?}", buffers.out);
+        assert!(
+            (buffers.out[0] - expected_out).abs() < 1e-5,
+            "{:?}",
+            buffers.out
+        );
     }
 }

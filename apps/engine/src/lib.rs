@@ -3,8 +3,8 @@
 pub mod byte_level;
 pub mod chat;
 pub mod compute;
-pub mod deltanet;
 mod cuda;
+pub mod deltanet;
 pub mod error;
 pub mod generate;
 pub mod gguf;
