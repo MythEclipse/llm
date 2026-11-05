@@ -378,7 +378,13 @@ async function send(event) {
     }
     await consumeEvents(response, (name, payload) => {
       if (name === "start") {
-        el("run-tokens").textContent = `${payload.prompt_tokens} prompt`;
+        // History is trimmed to fit the window; say so instead of letting the
+        // model look like it forgot on its own.
+        const dropped = payload.dropped_turns ?? 0;
+        el("run-tokens").textContent =
+          dropped > 0
+            ? `${payload.prompt_tokens} prompt · ${dropped} pesan lama dibuang`
+            : `${payload.prompt_tokens} prompt`;
       } else if (name === "token") {
         text += payload.text;
         streamed.node.dataset.raw = text;

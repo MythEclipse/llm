@@ -83,7 +83,12 @@ impl ChatEngine for FakeEngine {
         async move {
             let (sender, events) = mpsc::channel(8);
             tokio::spawn(async move {
-                let _ = sender.send(GenerationEvent::Start { prompt_tokens }).await;
+                let _ = sender
+                    .send(GenerationEvent::Start {
+                        prompt_tokens,
+                        dropped_turns: 0,
+                    })
+                    .await;
                 for chunk in ["Halo", " dunia"] {
                     let _ = sender
                         .send(GenerationEvent::Token {

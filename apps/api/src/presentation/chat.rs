@@ -138,9 +138,15 @@ pub async fn send_message<E: ChatEngine + 'static>(
 
         while let Some(event) = events.recv().await {
             let sse = match event {
-                GenerationEvent::Start { prompt_tokens } => Event::default()
+                GenerationEvent::Start {
+                    prompt_tokens,
+                    dropped_turns,
+                } => Event::default()
                     .event("start")
-                    .json_data(serde_json::json!({ "prompt_tokens": prompt_tokens }))
+                    .json_data(serde_json::json!({
+                        "prompt_tokens": prompt_tokens,
+                        "dropped_turns": dropped_turns,
+                    }))
                     .ok(),
                 GenerationEvent::Token { text: chunk } => {
                     text.push_str(&chunk);

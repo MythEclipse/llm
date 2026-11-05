@@ -119,6 +119,69 @@ impl LocalChatEngine {
             .collect();
         self.chat.render(&turns, false)
     }
+
+    /// Render the turns that still fit, dropping the oldest history first.
+    ///
+    /// `None` means even the newest turn alone does not fit the window.
+    fn fit_turns(&self, turns: &[ChatTurn], max_tokens: usize) -> Option<(String, usize)> {
+        let budget = self.context.checked_sub(max_tokens)?;
+        let (kept, dropped) = keep_that_fits(turns, budget, |candidate| {
+            self.tokenizer.encode(&self.prompt(candidate)).len()
+        })?;
+        Some((self.prompt(&kept), dropped))
+    }
+}
+
+/// Keep the longest tail of `turns` whose prompt costs at most `budget` tokens.
+///
+/// A conversation outgrows any window, and refusing to answer is a worse answer
+/// than forgetting how the chat started. The system turn always stays, and how
+/// many trailing turns survive is monotone in prompt length, so the search
+/// bisects instead of re-rendering once per dropped turn. Returns the kept turns
+/// and how many were dropped.
+fn keep_that_fits(
+    turns: &[ChatTurn],
+    budget: usize,
+    mut measure: impl FnMut(&[ChatTurn]) -> usize,
+) -> Option<(Vec<ChatTurn>, usize)> {
+    let system = usize::from(matches!(
+        turns.first().map(|turn| turn.role),
+        Some(TurnRole::System)
+    ));
+    let body = &turns[system..];
+    let keep = |tail: usize| {
+        let mut start = body.len().saturating_sub(tail);
+        // A history that begins with an assistant turn reads as a reply to
+        // nothing. Dropping it only shortens the prompt, so the search stays
+        // monotone.
+        while start + 1 < body.len() && body[start].role == TurnRole::Assistant {
+            start += 1;
+        }
+        let mut kept: Vec<ChatTurn> = turns[..system].to_vec();
+        kept.extend_from_slice(&body[start..]);
+        (kept, start)
+    };
+
+    let whole = keep(body.len());
+    if measure(&whole.0) <= budget {
+        return Some(whole);
+    }
+    let mut low = 1;
+    let mut high = body.len();
+    let mut best = None;
+    while low <= high {
+        let tail = low + (high - low) / 2;
+        let candidate = keep(tail);
+        if measure(&candidate.0) <= budget {
+            best = Some(candidate);
+            low = tail + 1;
+        } else if tail == 1 {
+            return best;
+        } else {
+            high = tail - 1;
+        }
+    }
+    best
 }
 
 impl ChatEngine for LocalChatEngine {
@@ -131,13 +194,17 @@ impl ChatEngine for LocalChatEngine {
         &self,
         request: GenerateRequest,
     ) -> impl Future<Output = Result<GenerationHandle, EngineError>> + Send {
-        let prompt = self.prompt(&request.turns);
-        let tokens = self.tokenizer.encode(&prompt);
-        debug!(
-            prompt_tokens = tokens.len(),
-            max_tokens = request.max_tokens,
-            "generation request prepared"
-        );
+        let prepared = self
+            .fit_turns(&request.turns, request.max_tokens)
+            .map(|(prompt, dropped)| (self.tokenizer.encode(&prompt), dropped));
+        if let Some((tokens, dropped_turns)) = &prepared {
+            debug!(
+                prompt_tokens = tokens.len(),
+                dropped_turns,
+                max_tokens = request.max_tokens,
+                "generation request prepared"
+            );
+        }
         let context = self.context;
         let build_hash = self.build_hash.clone();
         let model = self.model;
@@ -148,6 +215,9 @@ impl ChatEngine for LocalChatEngine {
         let worker_cancel = Arc::clone(&cancel);
 
         async move {
+            let Some((tokens, dropped_turns)) = prepared else {
+                return Err(EngineError::ContextFull);
+            };
             if tokens.len() + request.max_tokens > context {
                 return Err(EngineError::ContextFull);
             }
@@ -182,6 +252,7 @@ impl ChatEngine for LocalChatEngine {
                     Event::Start { prompt_tokens } => {
                         let _ = sender.blocking_send(GenerationEvent::Start {
                             prompt_tokens: prompt_tokens as u32,
+                            dropped_turns: dropped_turns as u32,
                         });
                     }
                     Event::Token { text, .. } => {
@@ -295,4 +366,78 @@ fn resident_bytes() -> u64 {
 fn page_size() -> u64 {
     // 4 KiB on every platform this service runs on.
     4096
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn turn(role: TurnRole, content: &str) -> ChatTurn {
+        ChatTurn {
+            role,
+            content: content.to_string(),
+        }
+    }
+
+    /// Ten tokens per character, so a test budget reads like a prompt size.
+    fn ten_per_char(turns: &[ChatTurn]) -> usize {
+        turns.iter().map(|turn| turn.content.len()).sum::<usize>() * 10
+    }
+
+    #[test]
+    fn a_conversation_that_fits_keeps_every_turn() {
+        let turns = [
+            turn(TurnRole::System, "sys"),
+            turn(TurnRole::User, "hi"),
+            turn(TurnRole::Assistant, "hello"),
+            turn(TurnRole::User, "again"),
+        ];
+        let (kept, dropped) = keep_that_fits(&turns, 1000, ten_per_char).expect("fits");
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn the_oldest_turns_go_first_and_the_system_turn_stays() {
+        let turns = [
+            turn(TurnRole::System, "sys"),
+            turn(TurnRole::User, "a".repeat(10).as_str()),
+            turn(TurnRole::Assistant, "b".repeat(10).as_str()),
+            turn(TurnRole::User, "c".repeat(10).as_str()),
+            turn(TurnRole::Assistant, "d".repeat(10).as_str()),
+            turn(TurnRole::User, "ee"),
+        ];
+        // Whole prompt is 450; 250 holds the system turn plus the last three.
+        let (kept, dropped) = keep_that_fits(&turns, 250, ten_per_char).expect("some fit");
+        assert_eq!(dropped, 2);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[0].role, TurnRole::System);
+        assert_eq!(kept.last().expect("kept").content, "ee");
+    }
+
+    #[test]
+    fn a_history_that_would_start_with_a_reply_drops_that_reply() {
+        let turns = [
+            turn(TurnRole::System, "sys"),
+            turn(TurnRole::User, "a".repeat(10).as_str()),
+            turn(TurnRole::Assistant, "b".repeat(10).as_str()),
+            turn(TurnRole::User, "cc"),
+        ];
+        // 240 cannot hold the whole prompt (250), and the tail that would fit is
+        // [assistant, user]: the reply to nothing goes too.
+        let (kept, dropped) = keep_that_fits(&turns, 240, ten_per_char).expect("some fit");
+        assert_eq!(dropped, 2);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].role, TurnRole::User);
+        assert_eq!(kept[1].content, "cc");
+    }
+
+    #[test]
+    fn a_single_turn_wider_than_the_window_reports_no_fit() {
+        let turns = [
+            turn(TurnRole::System, "sys"),
+            turn(TurnRole::User, "x".repeat(1000).as_str()),
+        ];
+        assert!(keep_that_fits(&turns, 100, ten_per_char).is_none());
+    }
 }

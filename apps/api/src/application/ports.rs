@@ -74,10 +74,18 @@ pub struct RunOutcome {
 
 #[derive(Debug, Clone)]
 pub enum GenerationEvent {
-    Start { prompt_tokens: u32 },
-    Token { text: String },
+    Start {
+        prompt_tokens: u32,
+        /// History turns left out so the prompt and the reply fit the window.
+        dropped_turns: u32,
+    },
+    Token {
+        text: String,
+    },
     Finished(RunOutcome),
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 pub struct GenerationHandle {
