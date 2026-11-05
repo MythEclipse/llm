@@ -10,7 +10,16 @@ use crate::application::ports::{
 use crate::domain::conversation::{ConversationRepository, NewMessage, Role, UNTITLED, title_from};
 use crate::domain::stats::{NewRun, RunRepository, RunStats};
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+/// The system turn, in the language the conversation is in.
+///
+/// Measured on the shipped model: with `"You are a helpful assistant."` a
+/// two-turn conversation collapses — asked "Kode proyeknya apa?" after being told
+/// it is NX-42, the model answers "I'm sorry, I can't assist with that." and then
+/// repeats that refusal for every later turn. With one Indonesian sentence it
+/// answers "Kode proyek NX-42." A longer instruction ("jangan mengulang kalimat
+/// pengguna") made it worse, drifting into Javanese, so the prompt stays short.
+const DEFAULT_SYSTEM_PROMPT: &str =
+    "Anda adalah asisten AI. Jawab singkat dalam bahasa Indonesia.";
 
 pub struct SendMessageCommand {
     pub conversation_id: Uuid,
