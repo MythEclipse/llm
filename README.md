@@ -102,6 +102,7 @@ cargo test --release -p llm-engine -- --ignored   # butuh model asli
 | `ops`, `quant_q8`, `matmul` | rmsnorm, rope, softmax, silu, dot Q8_0 vs referensi f64, matmul batch vs naive | lulus |
 | `gpu_matmul` | kernel CUDA vs kernel CPU pada bobot asli, n=1/8/64; pipeline GPU harus menghasilkan argmax yang sama | max\|Δ\| ≈ 1,5e-6, argmax 8181 |
 | `http_api` | router + use case + SQLite in-memory + engine palsu: 201/204/404/400, urutan SSE, pencatatan run | lulus |
+| `tactics`, `workspace`, `manifest` | tabel taktik tidak pernah memilih varian `Rejected` untuk bentuk mana pun dan setiap barisnya membawa bukti; perencana tidak pernah menumpuk dua buffer yang hidup di fase sama; identitas build 64 hex dan stabil | lulus |
 
 Kenapa toleransi logits 0.2: ggml men-dequant bobot Q8_0 ke f16 di dalam
 matmul-nya, sedangkan engine ini menghitung dot Q8_0 eksak. Selisihnya ~0.1 pada
@@ -549,19 +550,27 @@ Kedua angka di bawah diukur dengan **clock SM dikunci 1800 MHz**
 antar proses dan perbandingan kehilangan artinya: pengukuran yang sama bisa
 memberi 4.000 atau 5.200 tok/s hanya karena suhu awal kartu.
 
+Kolom engine diukur ulang setelah kerja rencana memori dan CUDA graph
+(`bench -p 128,512,1024 -n 128 -r 3`), kolom llama.cpp tetap dari sesi terkunci
+yang sama: yang berubah hanya sisi ini, dan sebarannya ikut ditulis.
+
 | Tes | llm GPU | llama.cpp GPU | Rasio |
 |---|---:|---:|---:|
-| pp128 | 3.536 ± 21 tok/s | 3.788 ± 235 tok/s | 93% |
-| pp512 | 4.601 ± 3 tok/s | 4.735 ± 73 tok/s | 97% |
-| pp1024 | 4.429 ± 1 tok/s | 4.677 ± 92 tok/s | 95% |
-| tg128 | 68,2 ± 0,03 tok/s | 69,3 ± 0,04 tok/s | 98% |
+| pp128 | 3.718 ± 36 tok/s | 3.788 ± 235 tok/s | 98% |
+| pp512 | 4.740 ± 2 tok/s | 4.735 ± 73 tok/s | 100% |
+| pp1024 | 4.566 ± 2 tok/s | 4.677 ± 92 tok/s | 98% |
+| tg128 | 70,27 ± 0,15 tok/s | 69,3 ± 0,04 tok/s | 101% |
+
+Angka 100% dan 101% ada di dalam sebaran pengukuran llama.cpp (±73 tok/s pada
+pp512, ±0,04 pada tg128), jadi bacaannya "setara dalam noise", bukan "lebih
+cepat".
 
 Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 17,1–19,5 tok/s, prefill 70–99 vs 27–35 tok/s.
 
 | Metrik | llm GPU | llama.cpp GPU |
 |---|---:|---:|
-| VRAM (ctx 4096) | 2,9 GiB | 2,49 GiB |
+| VRAM (ctx 4096) | 2,76 GiB | 2,49 GiB |
 | Load + 1 token (wall) | 0,9 s | 1,32 s |
 
 ### Apa yang sudah menutup sebagian jarak
@@ -599,6 +608,47 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
 - **Decode**: q|k|v dan gate|up satu launch (295 → 169 peluncuran per token),
   attention split dua kali lebih halus, rmsnorm satu barrier dengan load vektor.
 
+### Yang datang dari netra-kernel
+
+Empat mekanisme diambil dari compiler AOT Netra (risetnya di
+`docs/research/netra-kernel.md`); yang tidak diambil adalah compilernya sendiri,
+karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
+
+- **Identitas build.** `build.rs` mencatat sha256 `gpu.cu`, sha256 PTX yang
+  benar-benar dikompilasi, arch, versi nvcc, dan setiap `.entry` di PTX.
+  `BuildManifest::identity()` menghash semuanya, `/api/model` melaporkannya, dan
+  `bench` mencetaknya di bawah tabel — jadi angka di README ini menunjuk satu
+  artefak, bukan satu commit yang mungkin sudah dibangun ulang. Setiap run di
+  SQLite juga menyimpan `build_hash`, lewat migrasi tersendiri.
+- **Rencana kernel saat load.** Dulu `attention_path()` memutuskan per panggilan
+  (uji bentuk + env `LLM_ATTN_OLD` + ambang token), sementara
+  `attention_scores()` menghitung ulang keputusan yang sama untuk ukuran scratch
+  — dua tempat yang bisa berbeda tanpa ketahuan. Sekarang `tactics.rs` memilih
+  sekali saat model dimuat dari tabel yang setiap barisnya membawa pengukuran
+  yang menerimanya: tile fp32 `Verified` di belakang tensor core f16,
+  delapan-head-per-blok `Rejected` karena 112 KB shared tidak muat di 99 KB,
+  dan bentuk yang tidak punya tile jatuh ke jalur serial **dengan alasannya
+  dicatat**. Tiga aturan yang dijaga test: varian `Rejected` tidak pernah
+  terpilih untuk bentuk apa pun, regime di jalur umum selalu menyebut alasannya,
+  dan penggabungan berhenti di 512 token — di 1.024 token terukur 2,40 ms
+  melawan 2 × 0,70 ms.
+- **Rencana memori statis.** `workspace.rs` mendeklarasikan setiap buffer
+  scratch dengan rentang fase hidupnya, lalu menempatkannya: dua buffer yang
+  rentangnya tidak bertemu berbagi satu wilayah, dan yang hidup di fase sama
+  tidak pernah ditumpuk. Satu arena per sesi, jadi satu token tidak
+  mengalokasikan apa pun — sebelumnya 13 alokasi + 13 pembebasan per token.
+  Ukuran mengikuti rencana kernel, jadi jalur yang menyimpan probabilitas di
+  register merencanakan grid skor nol, bukan 537 MB yang dibutuhkan jalur serial.
+- **Graph decode.** Satu langkah decode = 169 peluncuran; sekarang direkam sekali
+  dan diputar ulang dengan satu panggilan driver. Tiga hal harus pindah agar
+  graph-nya sah: engine punya stream sendiri (legacy default tidak bisa
+  di-capture), nilai yang berubah tiap token (`posisi`, `visible`) dibaca kernel
+  lewat pointer ke device, dan embedding + unggah posisi tetap di luar graph
+  karena keduanya butuh salinan host. Karena grid attention melebar saat konteks
+  terisi, sesi menyimpan satu graph per jumlah split — ide "profil per bentuk"
+  dari Netra. Mengunci grid di kapasitas menghasilkan satu graph, tetapi
+  biayanya 69,0 → 59,0 tok/s, jadi cache itu bukan hiasan.
+
 ### Sisa jarak, dan ke mana harus pergi
 
 - **Matmul prefill tinggal ±2–4%** (83 ms lawan ±80 ms pada pp512). Sisa yang
@@ -612,10 +662,10 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
   menunggu tile K/V yang di-stage skalar dan dibaca ulang 32× per KV head. Yang
   dibutuhkan tile query lebih besar (K/V dibaca 16× bukan 32×) dengan warp yang
   cukup untuk menyembunyikan staging-nya, bukan tambalan satu baris.
-- **Decode 98%**: lantai DRAM 2,39 GB/token ÷ 187,8 GB/s = 12,7 ms, matmul-nya
-  13,4 ms (178 GB/s), sisanya ±0,9 ms kernel kecil + ±0,4 ms celah antar
-  peluncuran. Untuk menutup itu yang benar CUDA graph (satu replay per token),
-  bukan tambal per kernel.
+- **Decode 101%**: lantai DRAM 2,39 GB/token ÷ 187,8 GB/s = 12,7 ms, matmul-nya
+  13,4 ms (178 GB/s). Celah antar peluncuran sudah hilang oleh graph; sisa ±0,9 ms
+  adalah kernel kecil yang benar-benar bekerja, dan yang tersisa di atas lantai
+  DRAM hanya selisih 178 vs 187,8 GB/s.
 - **CPU**: prefill masih 2,5–3× tertinggal dan decode turun dengan konteks
   (jalur CPU belum memakai tiling attention).
 
@@ -632,6 +682,16 @@ Di CPU (llama.cpp `-ngl 0 -t 20`, engine ini `LLM_GPU=0`): decode 16,9–17,2 vs
   atas adalah yang menghitung semua token.
 
 ## Catatan implementasi
+
+- **Tidak ada alokasi di jalur token.** Scratch satu token dan satu chunk
+  direncanakan sekali per sesi (`workspace.rs`), dan `Model::forward` tidak
+  memanggil `alloc` sama sekali. Itu juga yang membuat capture graph mungkin.
+- **Keputusan kernel ada di satu tempat.** `tactics.rs` memilih jalur attention
+  dan kebijakan penggabungan matmul saat model dimuat; `compute.rs` hanya
+  menanyakan rencana itu. Tidak ada ambang bentuk yang tersebar di call site.
+- **Angka menunjuk artefak.** Setiap keluaran `bench` mencetak identitas build dan
+  identitas rencana; tanpa itu sebuah angka tidak bisa dibandingkan dengan angka
+  lain.
 
 - Bobot tetap terkuantisasi di mmap; dequant dilakukan per baris di dalam
   matmul, tidak pernah seluruh model.
