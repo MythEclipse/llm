@@ -11,7 +11,7 @@ apps/api         lib  domain / application / infrastructure / presentation (Kana
 apps/gateway     bin  Axum + serve SPA
 apps/cli         bin  REPL terminal (fase berikut)
 .migrations      crate sea-orm-migration (SQLite)
-web              SPA statis: index.html + app.js + style.css
+web              SPA statis: index.html + app.js + markdown.js + style.css
 ```
 
 ## Menjalankan
@@ -36,6 +36,13 @@ Variabel lingkungan:
 | `LLM_LOG` | `info` | filter tracing |
 
 Migrasi SQLite dijalankan otomatis saat start.
+
+Antarmuka web mengikuti bentuk aplikasi chat yang lazim: sidebar percakapan +
+tombol percakapan baru, transkrip dengan gelembung pesan dan markdown (blok kode
+berlabel bahasa, tombol salin), komposer mengambang dengan pengaturan suhu dan
+panjang jawaban, serta rail telemetri yang bisa dibuka-tutup. Tema gelap dan
+terang, keduanya lolos kontras WCAG AA untuk teks yang dibaca. Tanpa build step
+dan tanpa CDN: `web/` disajikan apa adanya oleh gateway.
 
 Tracing engine dan request HTTP memakai field terstruktur. Gunakan filter
 berdasarkan kebutuhan diagnosis tanpa mengubah output benchmark:

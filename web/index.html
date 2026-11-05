@@ -1,61 +1,117 @@
 <!doctype html>
-<html lang="id">
+<html lang="id" data-theme="dark">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>LLM lokal · MiniCPM5</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>LLM lokal</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <span class="dot" aria-hidden="true"></span>
-        <strong id="model-name">memuat model…</strong>
-        <span class="muted" id="model-meta"></span>
-      </div>
-      <div class="live" aria-live="polite">
-        <span><b id="live-tps">–</b> tok/s</span>
-        <span><b id="live-ttft">–</b> ms TTFT</span>
-        <span><b id="live-tokens">–</b> token</span>
-      </div>
-    </header>
-
-    <main class="layout">
-      <aside class="panel conversations">
-        <div class="panel-head">
-          <h2>Percakapan</h2>
-          <button id="new-chat" type="button">Baru</button>
+    <div class="app" id="app">
+      <aside class="sidebar" id="sidebar" aria-label="Percakapan">
+        <div class="sidebar-top">
+          <div class="brand">
+            <span class="brand-dot" aria-hidden="true"></span>
+            <span class="brand-name" id="brand-name">memuat…</span>
+          </div>
+          <button class="icon-button" id="close-sidebar" type="button" aria-label="Tutup panel">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
         </div>
-        <ul id="conversation-list" class="conversation-list"></ul>
+
+        <button class="new-chat" id="new-chat" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          Percakapan baru
+        </button>
+
+        <nav class="conversations" id="conversation-list" aria-label="Daftar percakapan"></nav>
+
+        <div class="sidebar-foot">
+          <button class="sidebar-action" id="open-telemetry" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8" /></svg>
+            Telemetri
+          </button>
+          <button class="sidebar-action" id="toggle-theme" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 109 9 7 7 0 01-9-9z" /></svg>
+            <span id="theme-label">Tema terang</span>
+          </button>
+        </div>
       </aside>
 
-      <section class="panel chat">
-        <div id="transcript" class="transcript" aria-live="polite"></div>
-        <form id="composer" class="composer">
-          <label class="sr-only" for="prompt">Pesan</label>
-          <textarea id="prompt" rows="3" placeholder="Tulis pesan… (Enter kirim, Shift+Enter baris baru)"></textarea>
-          <div class="composer-actions">
-            <label class="field">
-              <span>suhu</span>
-              <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7" />
-            </label>
-            <label class="field">
-              <span>maks token</span>
-              <input id="max-tokens" type="number" min="1" max="4096" step="1" value="512" />
-            </label>
-            <button id="send" type="submit">Kirim</button>
-            <button id="stop" type="button" class="ghost" hidden>Stop</button>
+      <main class="chat">
+        <header class="chat-head">
+          <button class="icon-button" id="open-sidebar" type="button" aria-label="Buka percakapan">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+          </button>
+          <div class="chat-head-text">
+            <h1 id="chat-title">Percakapan baru</h1>
+            <p id="chat-meta">model lokal</p>
           </div>
-        </form>
-      </section>
+          <div class="chat-head-actions">
+            <span class="pill" id="live-pill" hidden><b id="live-tps">–</b> tok/s</span>
+            <button class="icon-button" id="open-telemetry-top" type="button" aria-label="Telemetri">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8" /></svg>
+            </button>
+          </div>
+        </header>
 
-      <aside class="panel stats">
-        <div class="tabs" role="tablist">
-          <button role="tab" aria-selected="true" data-tab="live">Live</button>
-          <button role="tab" aria-selected="false" data-tab="history">Statistik</button>
+        <div class="transcript" id="transcript" role="log" aria-live="polite"></div>
+
+        <div class="composer-shell">
+          <form class="composer" id="composer">
+            <label class="sr-only" for="prompt">Pesan</label>
+            <textarea
+              id="prompt"
+              rows="1"
+              placeholder="Tanya apa saja…"
+              autocomplete="off"
+            ></textarea>
+            <div class="composer-bar">
+              <button class="chip-button" id="settings-toggle" type="button" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 7h10M18 7h2M4 17h2M10 17h10M15 4v6M9 14v6" />
+                </svg>
+                <span id="settings-summary">temp 0.7 · 512 token</span>
+              </button>
+              <div class="composer-buttons">
+                <button class="send" id="send" type="submit" aria-label="Kirim">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6" /></svg>
+                </button>
+                <button class="send stop" id="stop" type="button" aria-label="Hentikan" hidden>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" /></svg>
+                </button>
+              </div>
+            </div>
+            <div class="settings" id="settings" hidden>
+              <label>
+                <span>suhu <b id="temp-value">0.7</b></span>
+                <input id="temperature" type="range" min="0" max="2" step="0.1" value="0.7" />
+              </label>
+              <label>
+                <span>maks token</span>
+                <input id="max-tokens" type="number" min="1" max="4096" step="1" value="512" />
+              </label>
+            </div>
+          </form>
+          <p class="disclaimer">
+            Enter kirim · Shift+Enter baris baru · berjalan lokal di mesin ini
+          </p>
+        </div>
+      </main>
+
+      <aside class="telemetry" id="telemetry" aria-label="Telemetri">
+        <div class="telemetry-head">
+          <div class="tabs" role="tablist">
+            <button role="tab" aria-selected="true" data-tab="live">Live</button>
+            <button role="tab" aria-selected="false" data-tab="history">Riwayat</button>
+          </div>
+          <button class="icon-button" id="close-telemetry" type="button" aria-label="Tutup telemetri">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
         </div>
 
-        <div id="tab-live" class="tab-body">
+        <div class="telemetry-body" id="tab-live">
           <dl class="metrics">
             <div><dt>tok/s</dt><dd id="run-tps">–</dd></div>
             <div><dt>TTFT</dt><dd id="run-ttft">–</dd></div>
@@ -64,13 +120,15 @@
             <div><dt>ctx</dt><dd id="run-ctx">–</dd></div>
             <div><dt>berhenti</dt><dd id="run-stop">–</dd></div>
           </dl>
-          <h3>Latensi per token</h3>
-          <div id="latency-chart" class="chart"></div>
-          <h3>Info model</h3>
-          <dl id="model-info" class="kv"></dl>
+          <h2>Latensi per token</h2>
+          <div class="chart" id="latency-chart"></div>
+          <h2>Model</h2>
+          <dl class="kv" id="model-info"></dl>
+          <h2>Build</h2>
+          <dl class="kv" id="build-info"></dl>
         </div>
 
-        <div id="tab-history" class="tab-body" hidden>
+        <div class="telemetry-body" id="tab-history" hidden>
           <dl class="metrics">
             <div><dt>total run</dt><dd id="stat-runs">–</dd></div>
             <div><dt>total token</dt><dd id="stat-tokens">–</dd></div>
@@ -79,18 +137,16 @@
             <div><dt>p95 tok/s</dt><dd id="stat-p95">–</dd></div>
             <div><dt>rata TTFT</dt><dd id="stat-ttft">–</dd></div>
           </dl>
-          <h3>Token per hari</h3>
-          <div id="daily-chart" class="chart"></div>
-          <h3>Run terakhir</h3>
-          <table class="runs">
-            <thead>
-              <tr><th>waktu</th><th>tok</th><th>tok/s</th><th>TTFT</th><th>stop</th></tr>
-            </thead>
-            <tbody id="runs-body"></tbody>
-          </table>
+          <h2>Token per hari</h2>
+          <div class="chart" id="daily-chart"></div>
+          <h2>Run terakhir</h2>
+          <div class="runs" id="runs-body"></div>
         </div>
       </aside>
-    </main>
+    </div>
+
+    <div class="scrim" id="scrim" hidden></div>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
     <script type="module" src="/app.js"></script>
   </body>

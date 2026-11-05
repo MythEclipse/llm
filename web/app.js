@@ -1,5 +1,7 @@
-// Chat UI: conversations on the left, transcript in the middle, live telemetry
-// on the right. No framework, no build step — plain ES modules.
+// Chat UI: sidebar of conversations, transcript in the middle, telemetry on the
+// right. Plain ES modules, no build step — the gateway serves this directory.
+
+import { render as renderMarkdown } from "/markdown.js";
 
 const el = (id) => document.getElementById(id);
 
@@ -9,7 +11,17 @@ const state = {
   messages: [],
   streaming: false,
   abort: null,
+  model: null,
 };
+
+const SUGGESTIONS = [
+  ["Jelaskan CUDA graph", "kenapa satu replay per token lebih murah dari 169 peluncuran"],
+  ["Ringkas arsitektur repo ini", "engine, api, gateway, cli — siapa memiliki apa"],
+  ["Tulis tes Rust", "untuk perencana memori yang tidak boleh menumpuk buffer hidup"],
+  ["Bandingkan Q8_0 dan Q4_K", "ukuran, akurasi, dan berapa bandwidth yang dihemat"],
+];
+
+// ------------------------------------------------------------------- plumbing
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -23,29 +35,14 @@ async function api(path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
-// ---------------------------------------------------------------- model + meta
-
-async function loadModel() {
-  const info = await api("/api/model");
-  el("model-name").textContent = info.name;
-  el("model-meta").textContent =
-    `${info.layers} layer · ${info.embedding}d · ctx ${info.context} · ${
-      info.device ?? `${info.threads} thread`
-    }`;
-  const rows = [
-    ["arsitektur", info.architecture],
-    ["layer", info.layers],
-    ["embedding", info.embedding],
-    ["ffn", info.feed_forward],
-    ["head q/kv", `${info.heads}/${info.kv_heads}`],
-    ["vocab", info.vocab.toLocaleString("id-ID")],
-    ["tensor", `${info.quantized_tensors} Q8_0 / ${info.tensors}`],
-    ["bobot", formatBytes(info.weight_bytes)],
-    ["KV cache", formatBytes(info.kv_bytes)],
-  ];
-  el("model-info").innerHTML = rows
-    .map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`)
-    .join("");
+function toast(message) {
+  const node = el("toast");
+  node.textContent = message;
+  node.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => {
+    node.hidden = true;
+  }, 1600);
 }
 
 function formatBytes(bytes) {
@@ -59,7 +56,58 @@ function formatBytes(bytes) {
   return `${value.toFixed(value < 10 && unit > 0 ? 1 : 0)} ${units[unit]}`;
 }
 
-// ------------------------------------------------------------- conversations
+function shortHash(hash) {
+  return typeof hash === "string" ? hash.slice(0, 12) : "–";
+}
+
+// ---------------------------------------------------------------------- model
+
+async function loadModel() {
+  const info = await api("/api/model");
+  state.model = info;
+  el("brand-name").textContent = info.name;
+  el("chat-meta").textContent = `${info.layers} layer · ${info.embedding}d · ctx ${info.context} · ${
+    info.device ?? `${info.threads} thread`
+  }`;
+
+  el("model-info").innerHTML = [
+    ["arsitektur", info.architecture],
+    ["layer", info.layers],
+    ["embedding", info.embedding],
+    ["ffn", info.feed_forward],
+    ["head q/kv", `${info.heads}/${info.kv_heads}`],
+    ["vocab", info.vocab.toLocaleString("id-ID")],
+    ["tensor", `${info.quantized_tensors} Q8_0 / ${info.tensors}`],
+    ["bobot", formatBytes(info.weight_bytes)],
+    ["KV cache", formatBytes(info.kv_bytes)],
+    ["perangkat", info.device ?? "cpu"],
+  ]
+    .map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`)
+    .join("");
+
+  const build = info.build;
+  const plan = info.plan;
+  const rows = [
+    ["arch", build.arch],
+    ["nvcc", build.nvcc],
+    ["kernel", build.kernels],
+    ["sumber", shortHash(build.source_sha256)],
+    ["ptx", shortHash(build.ptx_sha256)],
+    ["build", shortHash(build.identity)],
+    ["decode", plan.decode],
+    ["prefill", plan.prefill],
+    ["rencana", shortHash(plan.identity)],
+    ["scratch", formatBytes(plan.scratch_bytes)],
+  ];
+  for (const [regime, reason] of plan.fallbacks ?? []) {
+    rows.push([`fallback ${regime}`, reason]);
+  }
+  el("build-info").innerHTML = rows
+    .map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`)
+    .join("");
+}
+
+// -------------------------------------------------------------- conversations
 
 async function loadConversations() {
   state.conversations = await api("/api/conversations");
@@ -68,20 +116,26 @@ async function loadConversations() {
 
 function renderConversations() {
   const list = el("conversation-list");
+  list.innerHTML = "";
   if (state.conversations.length === 0) {
-    list.innerHTML = `<li class="empty" style="display:block;padding:0.5rem">Belum ada percakapan.</li>`;
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "Belum ada percakapan.";
+    list.append(empty);
     return;
   }
-  list.innerHTML = "";
   for (const conversation of state.conversations) {
-    const item = document.createElement("li");
-    item.className = conversation.id === state.activeId ? "active" : "";
+    const item = document.createElement("div");
+    item.className = "conversation";
+    item.classList.toggle("active", conversation.id === state.activeId);
+
     const open = document.createElement("button");
     open.type = "button";
     open.className = "title";
     open.textContent = conversation.title;
     open.title = conversation.title;
     open.addEventListener("click", () => openConversation(conversation.id));
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "remove";
@@ -89,6 +143,7 @@ function renderConversations() {
     remove.title = "Hapus percakapan";
     remove.setAttribute("aria-label", `Hapus ${conversation.title}`);
     remove.addEventListener("click", () => deleteConversation(conversation.id));
+
     item.append(open, remove);
     list.append(item);
   }
@@ -98,8 +153,11 @@ async function openConversation(id) {
   state.activeId = id;
   const detail = await api(`/api/conversations/${id}`);
   state.messages = detail.messages;
+  const title = detail.conversation.title || "Percakapan baru";
+  el("chat-title").textContent = title;
   renderConversations();
   renderTranscript();
+  closeDrawer();
 }
 
 async function deleteConversation(id) {
@@ -107,6 +165,7 @@ async function deleteConversation(id) {
   if (state.activeId === id) {
     state.activeId = null;
     state.messages = [];
+    el("chat-title").textContent = "Percakapan baru";
     renderTranscript();
   }
   await loadConversations();
@@ -120,42 +179,142 @@ async function createConversation() {
   await loadConversations();
   await openConversation(conversation.id);
   el("prompt").focus();
+  return conversation;
+}
+
+function startNewChat() {
+  state.activeId = null;
+  state.messages = [];
+  el("chat-title").textContent = "Percakapan baru";
+  renderTranscript();
+  el("prompt").focus();
+  closeDrawer();
 }
 
 // ------------------------------------------------------------------ transcript
 
+function thread() {
+  return el("transcript").querySelector(".thread");
+}
+
 function renderTranscript() {
   const transcript = el("transcript");
-  if (!state.activeId) {
-    transcript.innerHTML = `<p class="empty">Pilih percakapan atau buat yang baru untuk mulai.</p>`;
+  transcript.innerHTML = "";
+  const container = document.createElement("div");
+  container.className = "thread";
+  transcript.append(container);
+
+  if (!state.activeId || state.messages.length === 0) {
+    container.append(hero());
     return;
   }
-  transcript.innerHTML = "";
   for (const message of state.messages) {
-    transcript.append(messageNode(message.role, message.content));
+    container.append(messageNode(message.role, message.content));
   }
-  transcript.scrollTop = transcript.scrollHeight;
+  scrollToBottom();
+}
+
+function hero() {
+  const node = document.createElement("section");
+  node.className = "hero";
+  const name = state.model?.name ?? "model lokal";
+  const title = document.createElement("h2");
+  title.textContent = `Halo. Mau dibahas apa?`;
+  const lead = document.createElement("p");
+  lead.textContent = `${name} berjalan di mesin ini — tidak ada permintaan yang keluar. Pilih satu contoh atau tulis sendiri.`;
+
+  const grid = document.createElement("div");
+  grid.className = "suggestions";
+  for (const [label, hint] of SUGGESTIONS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "suggestion";
+    button.innerHTML = `<b></b><span></span>`;
+    button.querySelector("b").textContent = label;
+    button.querySelector("span").textContent = hint;
+    button.addEventListener("click", () => {
+      el("prompt").value = label;
+      autoGrow();
+      el("prompt").focus();
+    });
+    grid.append(button);
+  }
+  node.append(title, lead, grid);
+  return node;
 }
 
 function messageNode(role, content) {
   const node = document.createElement("article");
   node.className = `message ${role}`;
-  const label = document.createElement("span");
-  label.className = "role";
-  label.textContent = role === "user" ? "kamu" : "model";
+
+  // Only the model gets a mark: a user badge is one more thing to read for
+  // nothing, and ChatGPT/Gemini do not have one either.
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = "AI";
+  avatar.setAttribute("aria-hidden", "true");
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  if (role === "user") {
+    bubble.textContent = content;
+  } else {
+    bubble.append(renderMarkdown(content));
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.textContent = "salin";
+  copy.addEventListener("click", async () => {
+    await copyText(node.dataset.raw ?? bubble.innerText);
+    toast("tersalin");
+  });
+  actions.append(copy);
+
   const body = document.createElement("div");
-  body.textContent = content;
-  node.append(label, body);
+  body.className = "body";
+  body.append(bubble, actions);
+  if (role === "user") {
+    node.append(body);
+  } else {
+    node.append(avatar, body);
+  }
+  node.dataset.raw = content;
+  return node;
+}
+
+function appendMessage(role, content) {
+  const container = thread();
+  if (container.querySelector(".hero")) {
+    container.innerHTML = "";
+  }
+  const node = messageNode(role, content);
+  container.append(node);
+  scrollToBottom();
   return node;
 }
 
 function appendStreamingMessage() {
-  const node = messageNode("assistant", "");
-  node.classList.add("pending");
+  const node = appendMessage("assistant", "");
+  const bubble = node.querySelector(".bubble");
+  bubble.innerHTML = `<span class="caret"></span>`;
   node.dataset.streaming = "true";
-  el("transcript").append(node);
-  el("transcript").scrollTop = el("transcript").scrollHeight;
-  return node.querySelector("div");
+  return { node, bubble };
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    toast("salin gagal");
+  }
+}
+
+function scrollToBottom() {
+  const transcript = el("transcript");
+  transcript.scrollTop = transcript.scrollHeight;
 }
 
 // --------------------------------------------------------------------- sending
@@ -165,20 +324,45 @@ async function send(event) {
   const prompt = el("prompt").value.trim();
   if (!prompt || state.streaming) return;
 
-  if (!state.activeId) await createConversation();
+  if (!state.activeId) {
+    await createConversation();
+  }
+  const conversationId = state.activeId;
 
   state.streaming = true;
   el("send").disabled = true;
+  el("send").hidden = true;
   el("stop").hidden = false;
+  el("live-pill").hidden = false;
+  el("live-tps").textContent = "–";
   el("prompt").value = "";
+  autoGrow();
 
-  const userNode = messageNode("user", prompt);
-  el("transcript").append(userNode);
-  const target = appendStreamingMessage();
+  appendMessage("user", prompt);
+  state.messages.push({ role: "user", content: prompt });
+  const streamed = appendStreamingMessage();
   state.abort = new AbortController();
+  let text = "";
+
+  const paint = () => {
+    streamed.bubble.innerHTML = "";
+    streamed.bubble.append(renderMarkdown(text));
+    const caret = document.createElement("span");
+    caret.className = "caret";
+    streamed.bubble.append(caret);
+  };
+  let frame = 0;
+  const schedulePaint = () => {
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      paint();
+      scrollToBottom();
+    });
+  };
 
   try {
-    const response = await fetch(`/api/conversations/${state.activeId}/messages`, {
+    const response = await fetch(`/api/conversations/${conversationId}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       signal: state.abort.signal,
@@ -192,23 +376,48 @@ async function send(event) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error ?? `HTTP ${response.status}`);
     }
-    await consumeEvents(response, target);
+    await consumeEvents(response, (name, payload) => {
+      if (name === "start") {
+        el("run-tokens").textContent = `${payload.prompt_tokens} prompt`;
+      } else if (name === "token") {
+        text += payload.text;
+        streamed.node.dataset.raw = text;
+        schedulePaint();
+      } else if (name === "stats") {
+        applyRunStats(payload);
+      } else if (name === "error") {
+        text += `\n\n> error: ${payload.message}`;
+        schedulePaint();
+      }
+    });
+    streamed.node.classList.remove("error");
   } catch (error) {
-    if (error.name !== "AbortError") {
-      target.textContent = `[gagal] ${error.message}`;
+    if (error.name === "AbortError") {
+      text += text ? "\n\n_dihentikan_" : "_dihentikan_";
+    } else {
+      streamed.node.classList.add("error");
+      text += text ? `\n\n> ${error.message}` : error.message;
     }
+    paint();
   } finally {
+    if (frame) cancelAnimationFrame(frame);
+    paint();
+    streamed.bubble.querySelector(".caret")?.remove();
+    streamed.node.dataset.streaming = "";
     state.streaming = false;
     el("send").disabled = false;
+    el("send").hidden = false;
     el("stop").hidden = true;
     state.abort = null;
     await loadConversations();
-    await openConversation(state.activeId);
+    if (state.activeId === conversationId) {
+      await openConversation(conversationId);
+    }
     await loadHistory();
   }
 }
 
-async function consumeEvents(response, target) {
+async function consumeEvents(response, onEvent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -222,49 +431,37 @@ async function consumeEvents(response, target) {
     while (boundary !== -1) {
       const chunk = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-      handleEvent(chunk, target);
+      dispatch(chunk, onEvent);
       boundary = buffer.indexOf("\n\n");
     }
   }
 }
 
-function handleEvent(chunk, target) {
+function dispatch(chunk, onEvent) {
   let name = "message";
-  const dataLines = [];
+  const data = [];
   for (const line of chunk.split("\n")) {
     if (line.startsWith("event:")) name = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+    else if (line.startsWith("data:")) data.push(line.slice(5).trim());
   }
-  if (dataLines.length === 0) return;
-  const payload = JSON.parse(dataLines.join("\n"));
-
-  if (name === "start") {
-    el("run-tokens").textContent = `${payload.prompt_tokens} prompt`;
-  } else if (name === "token") {
-    target.classList.remove("pending");
-    target.textContent += payload.text;
-    el("transcript").scrollTop = el("transcript").scrollHeight;
-    const shown = target.textContent.length;
-    el("live-tokens").textContent = shown;
-  } else if (name === "stats") {
-    applyRunStats(payload);
-  } else if (name === "error") {
-    target.textContent += `\n[error] ${payload.message}`;
+  if (data.length === 0) return;
+  try {
+    onEvent(name, JSON.parse(data.join("\n")));
+  } catch {
+    // A half-written frame is not worth failing the whole answer for.
   }
 }
 
 async function stopGeneration() {
   if (!state.activeId) return;
   await api(`/api/conversations/${state.activeId}/stop`, { method: "POST" });
-  if (state.abort) state.abort.abort();
+  state.abort?.abort();
 }
 
-// ------------------------------------------------------------------ statistics
+// ------------------------------------------------------------------ telemetry
 
 function applyRunStats(run) {
   el("live-tps").textContent = run.tokens_per_second.toFixed(2);
-  el("live-ttft").textContent = run.ttft_ms;
-  el("live-tokens").textContent = run.generated_tokens;
   el("run-tps").textContent = run.tokens_per_second.toFixed(2);
   el("run-ttft").textContent = `${run.ttft_ms} ms`;
   el("run-prefill").textContent = `${run.prefill_ms} ms`;
@@ -289,41 +486,85 @@ async function loadHistory() {
   drawBars(el("daily-chart"), daily.map((bucket) => bucket.tokens), "token");
 
   el("runs-body").innerHTML = runs
-    .map(
-      (run) => `<tr>
-        <td>${new Date(run.created_at).toLocaleString("id-ID", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</td>
-        <td>${run.generated_tokens}</td>
-        <td>${run.tokens_per_second.toFixed(2)}</td>
-        <td>${run.ttft_ms}</td>
-        <td>${run.stop_reason}</td>
-      </tr>`,
-    )
+    .map((run) => {
+      const when = new Date(run.created_at).toLocaleString("id-ID", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      return `<div class="run-row"><span class="when">${when}</span><span>${run.generated_tokens} tok</span><span>${run.tokens_per_second.toFixed(1)} t/s</span></div>`;
+    })
     .join("");
 }
 
 function drawBars(container, values, unit) {
   const series = (values ?? []).slice(-60);
   if (series.length === 0) {
-    container.innerHTML = `<p class="muted">belum ada data</p>`;
+    container.innerHTML = `<p class="empty" style="color:var(--text-faint);font-size:0.78rem">belum ada data</p>`;
     return;
   }
   const max = Math.max(...series, 1);
   const width = 300;
-  const height = 120;
-  // Keep at least 14 slots so a single day of data reads as one bar on a
-  // timeline instead of a solid block.
+  const height = 96;
+  // Keep at least 14 slots so one day of data reads as a bar on a timeline
+  // rather than a solid block.
   const slots = Math.max(series.length, 14);
   const barWidth = width / slots;
   const originX = width - barWidth * series.length;
   const bars = series
     .map((value, index) => {
-      const barHeight = Math.max(1, (value / max) * (height - 16));
+      const barHeight = Math.max(1, (value / max) * (height - 12));
       const x = originX + index * barWidth;
       const y = height - barHeight;
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1, barWidth - 1).toFixed(1)}" height="${barHeight.toFixed(1)}" fill="#6aa9ff" opacity="0.85"><title>${value.toFixed(2)} ${unit}</title></rect>`;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1, barWidth - 1).toFixed(1)}" height="${barHeight.toFixed(1)}" rx="1" style="fill:var(--accent);opacity:0.85"><title>${value.toFixed(2)} ${unit}</title></rect>`;
     })
     .join("");
   container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="grafik ${unit}">${bars}</svg>`;
+}
+
+// --------------------------------------------------------------------- panels
+
+function openDrawer() {
+  el("app").classList.add("sidebar-open");
+  el("scrim").hidden = false;
+}
+
+function closeDrawer() {
+  el("app").classList.remove("sidebar-open");
+  if (!el("app").classList.contains("telemetry-open")) {
+    el("scrim").hidden = true;
+  }
+}
+
+function toggleTelemetry() {
+  const app = el("app");
+  const open = app.classList.toggle("telemetry-open");
+  if (open) {
+    el("scrim").hidden = false;
+    loadHistory().catch(() => {});
+  } else if (!app.classList.contains("sidebar-open")) {
+    el("scrim").hidden = true;
+  }
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  el("theme-label").textContent = theme === "dark" ? "Tema terang" : "Tema gelap";
+  localStorage.setItem("llm-theme", theme);
+}
+
+function autoGrow() {
+  const prompt = el("prompt");
+  prompt.style.height = "auto";
+  prompt.style.height = `${Math.min(prompt.scrollHeight, 220)}px`;
+}
+
+function updateSettingsSummary() {
+  const temperature = Number(el("temperature").value).toFixed(1);
+  const tokens = el("max-tokens").value;
+  el("temp-value").textContent = temperature;
+  el("settings-summary").textContent = `temp ${temperature} · ${tokens} token`;
 }
 
 // ---------------------------------------------------------------------- wiring
@@ -341,21 +582,55 @@ function setupTabs() {
 }
 
 async function main() {
+  applyTheme(localStorage.getItem("llm-theme") ?? "dark");
   setupTabs();
+
   el("composer").addEventListener("submit", send);
   el("stop").addEventListener("click", stopGeneration);
-  el("new-chat").addEventListener("click", createConversation);
+  el("new-chat").addEventListener("click", startNewChat);
+  el("toggle-theme").addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+  });
+  el("open-sidebar").addEventListener("click", openDrawer);
+  el("close-sidebar").addEventListener("click", closeDrawer);
+  el("open-telemetry").addEventListener("click", toggleTelemetry);
+  el("open-telemetry-top").addEventListener("click", toggleTelemetry);
+  el("close-telemetry").addEventListener("click", toggleTelemetry);
+  el("scrim").addEventListener("click", () => {
+    closeDrawer();
+    if (el("app").classList.contains("telemetry-open")) toggleTelemetry();
+  });
+
+  el("settings-toggle").addEventListener("click", () => {
+    const panel = el("settings");
+    panel.hidden = !panel.hidden;
+    el("settings-toggle").setAttribute("aria-expanded", String(!panel.hidden));
+  });
+  el("temperature").addEventListener("input", updateSettingsSummary);
+  el("max-tokens").addEventListener("input", updateSettingsSummary);
+
+  el("prompt").addEventListener("input", autoGrow);
   el("prompt").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       el("composer").requestSubmit();
     }
   });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeDrawer();
+      if (el("app").classList.contains("telemetry-open")) toggleTelemetry();
+    }
+  });
 
+  updateSettingsSummary();
   renderTranscript();
   await loadModel();
   await loadConversations();
   await loadHistory();
+  if (state.conversations.length > 0) {
+    await openConversation(state.conversations[0].id);
+  }
 }
 
 main().catch((error) => {
