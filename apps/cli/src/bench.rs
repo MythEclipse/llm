@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use llm_engine::manifest::BuildManifest;
 use llm_engine::{
     GenerationRequest, GgufFile, Model, SamplingParams, Session, Tokenizer, generate,
 };
@@ -134,6 +135,7 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
         &device,
         &options.model_path,
         model.compute().device_footprint(),
+        &identity_line(&model),
     );
     Ok(measurements)
 }
@@ -166,11 +168,28 @@ fn deviation(samples: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+/// Which artifact and which kernels produced the numbers below.
+fn identity_line(model: &Model<'_>) -> String {
+    let build = BuildManifest::current();
+    let plan = model.compute().plan();
+    format!(
+        "build {} ({} {}, {} kernels), plan {} (decode {}, prefill {})",
+        build.identity(),
+        build.arch,
+        build.nvcc,
+        build.kernels.len(),
+        plan.identity(),
+        plan.decode.tactic,
+        plan.prefill.tactic,
+    )
+}
+
 fn report(
     measurements: &[Measurement],
     device: &str,
     model_path: &std::path::Path,
     device_bytes: Option<(usize, usize)>,
+    identity: &str,
 ) {
     let name = model_path.file_stem().map_or_else(
         || "model".to_string(),
@@ -187,6 +206,7 @@ fn report(
     if let Some((live, peak)) = device_bytes {
         println!("| | | vram | {} live, {} peak |", gib(live), gib(peak));
     }
+    println!("{identity}");
 }
 
 /// Bytes as GiB with two decimals, the unit llama.cpp prints its buffers in.

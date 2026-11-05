@@ -56,6 +56,9 @@ impl GenerateRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct RunOutcome {
+    /// Identity of the kernels that produced these numbers, so a stored run can
+    /// be traced back to one build.
+    pub build_hash: String,
     pub prompt_tokens: u32,
     pub generated_tokens: u32,
     pub prefill_ms: u32,
@@ -82,6 +85,29 @@ pub struct GenerationHandle {
     pub cancel: Arc<AtomicBool>,
 }
 
+/// What the binary was compiled from.
+#[derive(Debug, Clone)]
+pub struct BuildInfo {
+    pub arch: String,
+    pub source_sha256: String,
+    pub ptx_sha256: Option<String>,
+    pub nvcc: String,
+    pub kernels: usize,
+    /// Hash over the fields above: the artifact identity.
+    pub identity: String,
+}
+
+/// Which kernels this model resolved to at load, and whether any of them is the
+/// general path.
+#[derive(Debug, Clone)]
+pub struct PlanInfo {
+    pub decode: String,
+    pub prefill: String,
+    pub identity: String,
+    /// `regime: reason` for every regime on the general path.
+    pub fallbacks: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub name: String,
@@ -101,6 +127,8 @@ pub struct ModelInfo {
     pub threads: usize,
     /// Device running the matmuls; `None` means the CPU.
     pub device: Option<String>,
+    pub build: BuildInfo,
+    pub plan: PlanInfo,
 }
 
 /// `Arc<T>` is a chat engine whenever `T` is, so handlers can hold one shared

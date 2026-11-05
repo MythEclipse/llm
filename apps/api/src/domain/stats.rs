@@ -22,6 +22,9 @@ pub struct RunStats {
     pub sampler: String,
     pub token_latencies_ms: Vec<f32>,
     pub peak_rss_bytes: u64,
+    /// Identity of the build that produced the numbers; `None` for rows written
+    /// before the column existed.
+    pub build_hash: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -42,6 +45,7 @@ pub struct NewRun {
     pub sampler: String,
     pub token_latencies_ms: Vec<f32>,
     pub peak_rss_bytes: u64,
+    pub build_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

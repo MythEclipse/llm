@@ -180,6 +180,7 @@ impl<R: RunRepository, C: ConversationRepository> FinishChatUseCase<R, C> {
                 sampler: command.sampler,
                 token_latencies_ms: command.outcome.token_latencies_ms,
                 peak_rss_bytes: command.outcome.peak_rss_bytes,
+                build_hash: Some(command.outcome.build_hash),
             })
             .await?;
         tracing::info!(

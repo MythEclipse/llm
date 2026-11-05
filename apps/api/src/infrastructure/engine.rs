@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use llm_engine::chat::{Role as EngineRole, Turn, render};
+use llm_engine::manifest::BuildManifest;
 use llm_engine::{
     Event, GenerationRequest as CoreRequest, GgufFile, Model, SamplingParams, Session, Tokenizer,
     generate,
@@ -13,8 +14,8 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, instrument};
 
 use crate::application::ports::{
-    ChatEngine, ChatTurn, EngineError, GenerateRequest, GenerationEvent, GenerationHandle,
-    ModelInfo, RunOutcome, TurnRole,
+    BuildInfo, ChatEngine, ChatTurn, EngineError, GenerateRequest, GenerationEvent,
+    GenerationHandle, ModelInfo, PlanInfo, RunOutcome, TurnRole,
 };
 
 const STOP_TOKENS: [&str; 2] = ["<|im_end|>", "</s>"];
@@ -25,6 +26,7 @@ pub struct LocalChatEngine {
     tokenizer: Arc<Tokenizer>,
     stop_tokens: Vec<u32>,
     info: ModelInfo,
+    build_hash: String,
     slots: Arc<Semaphore>,
     context: usize,
 }
@@ -66,6 +68,8 @@ impl LocalChatEngine {
             kv_bytes,
             threads,
             device: model.device_name().map(str::to_owned),
+            build: build_info(),
+            plan: plan_info(model),
         };
         if let Some(note) = model.device_note() {
             tracing::warn!(%note, "no GPU backend, running on the cpu");
@@ -82,6 +86,7 @@ impl LocalChatEngine {
             model,
             tokenizer: Arc::new(tokenizer),
             stop_tokens,
+            build_hash: info.build.identity.clone(),
             info,
             slots: Arc::new(Semaphore::new(1)),
             context,
@@ -123,6 +128,7 @@ impl ChatEngine for LocalChatEngine {
             "generation request prepared"
         );
         let context = self.context;
+        let build_hash = self.build_hash.clone();
         let model = self.model;
         let tokenizer = Arc::clone(&self.tokenizer);
         let stop_tokens = self.stop_tokens.clone();
@@ -188,6 +194,7 @@ impl ChatEngine for LocalChatEngine {
                             "generation worker finished"
                         );
                         let outcome = RunOutcome {
+                            build_hash: build_hash.clone(),
                             prompt_tokens: stats.prompt_tokens as u32,
                             generated_tokens: stats.generated_tokens as u32,
                             prefill_ms: stats.prefill_ms as u32,
@@ -213,6 +220,34 @@ impl ChatEngine for LocalChatEngine {
 
             Ok(GenerationHandle { events, cancel })
         }
+    }
+}
+
+/// The artifact identity, straight from the build script's record.
+fn build_info() -> BuildInfo {
+    let manifest = BuildManifest::current();
+    BuildInfo {
+        arch: manifest.arch.to_string(),
+        source_sha256: manifest.source_sha256.to_string(),
+        ptx_sha256: manifest.ptx_sha256.map(str::to_owned),
+        nvcc: manifest.nvcc.to_string(),
+        kernels: manifest.kernels.len(),
+        identity: manifest.identity(),
+    }
+}
+
+/// Which kernels this model resolved to, and why any of them is the general one.
+fn plan_info(model: &Model<'_>) -> PlanInfo {
+    let plan = model.compute().plan();
+    PlanInfo {
+        decode: plan.decode.tactic.to_string(),
+        prefill: plan.prefill.tactic.to_string(),
+        identity: plan.identity(),
+        fallbacks: plan
+            .fallbacks()
+            .into_iter()
+            .map(|(regime, reason)| format!("{regime}: {reason}"))
+            .collect(),
     }
 }
 

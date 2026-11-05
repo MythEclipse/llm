@@ -5,7 +5,7 @@ use axum::extract::State;
 use serde::Serialize;
 use tracing::instrument;
 
-use crate::application::ports::ChatEngine;
+use crate::application::ports::{BuildInfo, ChatEngine, PlanInfo};
 use crate::presentation::error::AppError;
 use crate::presentation::state::AppState;
 
@@ -28,6 +28,51 @@ pub struct ModelResponse {
     pub threads: usize,
     /// `null` on the CPU backend.
     pub device: Option<String>,
+    pub build: BuildInfoResponse,
+    pub plan: PlanInfoResponse,
+}
+
+/// The artifact these numbers came from: source hash, PTX hash, compiler, arch.
+#[derive(Debug, Serialize)]
+pub struct BuildInfoResponse {
+    pub arch: String,
+    pub source_sha256: String,
+    pub ptx_sha256: Option<String>,
+    pub nvcc: String,
+    pub kernels: usize,
+    pub identity: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlanInfoResponse {
+    pub decode: String,
+    pub prefill: String,
+    pub identity: String,
+    pub fallbacks: Vec<String>,
+}
+
+impl From<BuildInfo> for BuildInfoResponse {
+    fn from(info: BuildInfo) -> Self {
+        Self {
+            arch: info.arch,
+            source_sha256: info.source_sha256,
+            ptx_sha256: info.ptx_sha256,
+            nvcc: info.nvcc,
+            kernels: info.kernels,
+            identity: info.identity,
+        }
+    }
+}
+
+impl From<PlanInfo> for PlanInfoResponse {
+    fn from(info: PlanInfo) -> Self {
+        Self {
+            decode: info.decode,
+            prefill: info.prefill,
+            identity: info.identity,
+            fallbacks: info.fallbacks,
+        }
+    }
 }
 
 #[instrument(skip_all)]
@@ -52,5 +97,7 @@ pub async fn model_info<E: ChatEngine + 'static>(
         kv_bytes: info.kv_bytes,
         threads: info.threads,
         device: info.device,
+        build: info.build.into(),
+        plan: info.plan.into(),
     }))
 }

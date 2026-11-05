@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use llm_api::application::ports::{
-    ChatEngine, EngineError, GenerateRequest, GenerationEvent, GenerationHandle, ModelInfo,
-    RunOutcome,
+    BuildInfo, ChatEngine, EngineError, GenerateRequest, GenerationEvent, GenerationHandle,
+    ModelInfo, PlanInfo, RunOutcome,
 };
 use llm_api::infrastructure::{SeaOrmConversationRepository, SeaOrmRunRepository};
 use llm_api::presentation::{AppState, build_router};
@@ -47,6 +47,20 @@ impl Default for FakeEngine {
                 kv_bytes: 2048,
                 threads: 1,
                 device: None,
+                build: BuildInfo {
+                    arch: "sm_89".to_string(),
+                    source_sha256: "0".repeat(64),
+                    ptx_sha256: Some("1".repeat(64)),
+                    nvcc: "release 13.4".to_string(),
+                    kernels: 21,
+                    identity: "2".repeat(64),
+                },
+                plan: PlanInfo {
+                    decode: "attention.decode_split".to_string(),
+                    prefill: "attention.prefill_mma_f16".to_string(),
+                    identity: "3".repeat(64),
+                    fallbacks: Vec::new(),
+                },
             },
         }
     }
@@ -76,6 +90,7 @@ impl ChatEngine for FakeEngine {
                 }
                 let _ = sender
                     .send(GenerationEvent::Finished(RunOutcome {
+                        build_hash: "2".repeat(64),
                         prompt_tokens,
                         generated_tokens: 2,
                         prefill_ms: 100,

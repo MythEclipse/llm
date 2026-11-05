@@ -40,6 +40,7 @@ impl From<run::Model> for RunStats {
             sampler: model.sampler,
             token_latencies_ms: serde_json::from_str(&model.token_latencies_ms).unwrap_or_default(),
             peak_rss_bytes: model.peak_rss_bytes.max(0) as u64,
+            build_hash: model.build_hash,
             created_at: model.created_at.with_timezone(&Utc),
         }
     }
@@ -78,6 +79,7 @@ impl RunRepository for SeaOrmRunRepository {
                 serde_json::to_string(&run.token_latencies_ms).unwrap_or_else(|_| "[]".to_string())
             ),
             peak_rss_bytes: Set(run.peak_rss_bytes as i64),
+            build_hash: Set(run.build_hash),
             created_at: Set(Utc::now().into()),
         };
         let inserted = model.insert(&self.db).await.map_err(map_db_err)?;

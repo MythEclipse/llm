@@ -85,6 +85,7 @@ pub mod run {
         pub sampler: String,
         pub token_latencies_ms: String,
         pub peak_rss_bytes: i64,
+        pub build_hash: Option<String>,
         pub created_at: DateTimeWithTimeZone,
     }
 
