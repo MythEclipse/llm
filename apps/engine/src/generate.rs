@@ -81,6 +81,12 @@ pub fn generate(
     let mut sampler = Sampler::new(request.params.seed);
     let mut decoder = StreamDecoder::new();
     let mut emitted: Vec<u32> = Vec::new();
+    // The repeat window holds generated tokens only, not the prompt tail.
+    // Seeding it from the prompt (as llama.cpp does) was measured and rejected:
+    // it suppresses the very tokens the answer has to recall, and a four turn
+    // conversation went from "Kode proyek NX-42." to a Javanese refusal that
+    // claimed it had never been told the code.
+    let mut window: Vec<u32> = Vec::new();
     let mut latencies = Vec::new();
     let mut ttft_ms = 0u64;
     let mut last_emit = Instant::now();
@@ -92,12 +98,13 @@ pub fn generate(
             stop_reason = StopReason::Cancelled;
             break;
         }
-        let token = sampler.sample(&mut logits, &emitted, &request.params)?;
+        let token = sampler.sample(&mut logits, &window, &request.params)?;
         if request.stop_tokens.contains(&token) {
             stop_reason = StopReason::EndOfText;
             break;
         }
         emitted.push(token);
+        window.push(token);
         tracing::trace!(
             token_index = emitted.len(),
             token_id = token,

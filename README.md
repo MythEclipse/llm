@@ -700,14 +700,29 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
 - **Angka menunjuk artefak.** Setiap keluaran `bench` mencetak identitas build dan
   identitas rencana; tanpa itu sebuah angka tidak bisa dibandingkan dengan angka
   lain.
+- **Truncation sampling lebih sempit dari default llama.cpp, dan itu diukur.**
+  Pada `top_p 0.95` / `min_p 0.05` model ini keluar dari bahasa Indonesia:
+  menjawab dengan bahasa Jawa dan menyangkal fakta yang baru saja diberikan.
+  `0.8 / 0.15` benar tapi masih menyisakan ekor Jawa ("iki ana"), `0.75 / 0.25`
+  bersih di semua pertanyaan yang diuji, pada dua seed. Default API dan
+  `SamplingParams::default()` memakai 0.75 / 0.25.
+- **Prompt percakapan diawali BOS**, karena template model memintanya
+  (`{{- bos_token }}`) dan sebelumnya engine ini tidak pernah mengirimnya.
+  Tanpa BOS jawaban recall keluar melantur; dengan BOS jawabannya
+  "Kode proyek NX-42.".
+- **Jendela repeat-penalty sengaja hanya berisi token yang dihasilkan**, bukan
+  ekor prompt seperti llama.cpp: menyalin kebiasaan itu terukur lebih buruk
+  karena menekan justru token yang harus diingat (jawaban berubah menjadi
+  penolakan berbahasa Jawa).
 - **System prompt ikut bahasa percakapan, dan itu bukan selera.** Diukur pada
   model ini: dengan `"You are a helpful assistant."` percakapan dua giliran
   runtuh — ditanya "Kode proyeknya apa?" setelah diberi tahu NX-42, jawabannya
   `"I'm sorry, I can't assist with that."` lalu penolakan itu diulang untuk
-  giliran berikutnya. Dengan satu kalimat Indonesia, jawabannya
-  `"Kode proyeknya NX-42."` Instruksi yang lebih panjang ("jangan mengulang
-  kalimat pengguna") justru membuatnya melantur ke bahasa Jawa, jadi prompt
-  dibiarkan pendek.
+  giliran berikutnya. Dengan `"Anda adalah asisten AI. Jawab singkat dalam
+  bahasa Indonesia."` model menjawab satu giliran lalu membeku pada fragmen yang
+  sama ("Aku inggah."). Dengan `"Kamu asisten yang membantu."` keempat pertanyaan
+  dijawab dan kedua fakta diingat; instruksi yang lebih panjang justru membuatnya
+  melantur, jadi prompt dibiarkan satu kalimat.
 - **Bentuk launch divalidasi terhadap device, bukan diasumsikan.** Saat load,
   `cuFuncGetAttribute` dan `cuOccupancyMaxActiveBlocksPerMultiprocessor` dibaca
   untuk tiga kernel yang menentukan: matmul prompt 127 register / 77.824 byte

@@ -101,9 +101,13 @@ pub async fn send_message<E: ChatEngine + 'static>(
             .unwrap_or(DEFAULT_MAX_TOKENS)
             .clamp(1, MAX_MAX_TOKENS),
         temperature: body.temperature.unwrap_or(0.7).clamp(0.0, 2.0),
-        top_p: body.top_p.unwrap_or(0.95).clamp(0.0, 1.0),
+        // Truncation defaults are narrower than llama.cpp's (0.95 / 0.05)
+        // because this model leaves Indonesian when the candidate pool is wide:
+        // at 0.95 / 0.05 it answers in Javanese and refuses facts it was just
+        // given, at 0.75 / 0.25 every answer came back clean Indonesian.
+        top_p: body.top_p.unwrap_or(0.75).clamp(0.0, 1.0),
         top_k: body.top_k.unwrap_or(40).min(200),
-        min_p: body.min_p.unwrap_or(0.05).clamp(0.0, 1.0),
+        min_p: body.min_p.unwrap_or(0.25).clamp(0.0, 1.0),
         repeat_penalty: body.repeat_penalty.unwrap_or(1.1).clamp(0.5, 2.0),
         seed: body.seed.unwrap_or(0x5EED_1234_ABCD_0001),
     };

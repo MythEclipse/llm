@@ -21,8 +21,13 @@ impl Default for SamplingParams {
         Self {
             temperature: 0.7,
             top_k: 40,
-            top_p: 0.95,
-            min_p: 0.05,
+            // Narrower than llama.cpp's 0.95 / 0.05: with the wider pool this
+            // model leaves Indonesian entirely. Measured on the shipped model:
+            // 0.95 / 0.05 answered in Javanese and denied facts it was given,
+            // 0.8 / 0.15 was correct but kept a Javanese tail, 0.75 / 0.25 came
+            // back clean on every question.
+            top_p: 0.75,
+            min_p: 0.25,
             repeat_penalty: 1.1,
             repeat_last_n: 64,
             seed: 0x5EED_1234_ABCD_0001,

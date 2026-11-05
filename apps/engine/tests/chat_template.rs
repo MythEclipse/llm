@@ -20,7 +20,7 @@ fn single_user_turn_closes_with_assistant_header() {
 
     assert_eq!(
         prompt,
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+        "<s><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
          <|im_start|>user\nHalo<|im_end|>\n\
          <|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
