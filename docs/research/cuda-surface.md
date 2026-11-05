@@ -151,6 +151,29 @@ nm -D --defined-only /usr/lib/libcuda.so.1 | awk '{print $3}' | grep '^cu' | sor
 ```
 
 
+## 6. Library CUDA yang terpasang, dan kenapa tidak dipakai
+
+Selain driver API, toolkit ini memasang library host yang siap dipanggil:
+cuBLAS 13.8.0.4 (termasuk `cublasLt`), cuFFT, cuRAND, cuSolver, cuSPARSE, NPP,
+dan NVRTC — semua ada di `/opt/cuda/lib64` beserta versi statisnya. Ada juga
+CCCL (CUB, Thrust, libcu++) di `/opt/cuda/include/cccl`.
+
+Semuanya sengaja di luar jalur runtime repo ini, dan bukan karena tidak tersedia:
+
+| Library | Kalau dipakai | Kenapa tidak |
+|---|---|---|
+| cuBLAS / cuBLASLt | matmul jadi satu panggilan, hampir pasti lebih cepat dari kernel tangan | seluruh premis repo ini "inferensi ditulis sendiri"; memakainya menghapus objek yang diukur |
+| CUB / Thrust | scan, sort, reduce, radix | tidak ada satu pun operasi itu di jalur inferensi |
+| cuFFT, cuSolver, cuSPARSE, NPP | — | tidak ada FFT/solver/sparse/image di model ini |
+| NVRTC | kompilasi kernel saat runtime | build sudah menghasilkan PTX lewat `nvcc`; NVRTC hanya menambah jalur kedua |
+| cuRAND | sampler | sampler berjalan di CPU dengan seed yang bisa direproduksi; RNG GPU akan memindahkan keputusan ke device |
+
+Satu pemakaian yang sah dan belum dilakukan: **cuBLAS sebagai oracle
+kebenaran**. `gpu_matmul` sekarang membandingkan kernel GPU dengan kernel CPU
+repo ini; membandingkannya juga dengan `cublasGemmEx` akan menutup celah "dua
+implementasi kita sama-sama salah dengan cara yang sama". Itu test, bukan jalur
+runtime, dan menambah satu dev-dependency.
+
 ## Lampiran A — 555 entry point driver API
 Nama sudah dinormalkan: sufiks `_v2`/`_v3`/`_ptsz`/`_ptds` dilebur, karena
 itu varian ABI dari fungsi yang sama. Yang bertanda **tebal** sudah dipakai
