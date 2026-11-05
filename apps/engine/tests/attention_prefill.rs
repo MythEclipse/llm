@@ -110,6 +110,7 @@ fn tiled_matches_host() {
         kv_dim,
         scores_stride: capacity,
         scale,
+        capacity,
     };
     let mut q = compute.alloc(tokens * n_head * head_dim).unwrap();
     let mut k = compute.alloc(capacity * kv_dim).unwrap();

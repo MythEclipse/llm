@@ -54,6 +54,9 @@ pub struct AttentionSpec {
     pub kv_dim: usize,
     pub scores_stride: usize,
     pub scale: f32,
+    /// Context capacity: the decode grid and its shared window are fixed from
+    /// this, so they do not move as the context fills.
+    pub capacity: usize,
 }
 
 /// The buffers one session reuses, laid out by the plan and allocated once.
@@ -144,6 +147,55 @@ impl Compute {
     /// CPU backend that remembers why the device was abandoned mid-load.
     pub fn with_fallback(error: EngineError, config: &Config) -> Self {
         Self::with_note(None, Some(error.to_string()), config)
+    }
+
+    /// Writes the position the kernels read. Called once per forward pass,
+    /// before the layer loop: a captured decode step bakes its arguments, so the
+    /// position has to arrive through memory.
+    pub fn set_position(&self, position: usize, visible: usize) -> Result<(), EngineError> {
+        match &self.gpu {
+            Some(gpu) => gpu.set_position(position, visible),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a decode step can be captured at all.
+    pub fn can_capture(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// The decode grid's shape key for `visible` positions. A captured step is
+    /// only valid for the grid it was recorded with, so the caller caches one
+    /// graph per value.
+    pub fn decode_splits(&self, visible: usize) -> usize {
+        crate::cuda::split_count(visible)
+    }
+
+    pub fn begin_capture(&self) -> Result<(), EngineError> {
+        match &self.gpu {
+            Some(gpu) => gpu.begin_capture(),
+            None => Err(EngineError::Unsupported("no device to capture on".into())),
+        }
+    }
+
+    pub fn end_capture(&self) -> Result<crate::cuda::Graph, EngineError> {
+        match &self.gpu {
+            Some(gpu) => gpu.end_capture(),
+            None => Err(EngineError::Unsupported("no device to capture on".into())),
+        }
+    }
+
+    pub fn cancel_capture(&self) {
+        if let Some(gpu) = &self.gpu {
+            gpu.cancel_capture();
+        }
+    }
+
+    pub fn replay(&self, graph: &crate::cuda::Graph) -> Result<(), EngineError> {
+        match &self.gpu {
+            Some(gpu) => gpu.replay(graph),
+            None => Ok(()),
+        }
     }
 
     /// The kernels this model resolved to, and why.
@@ -629,7 +681,6 @@ impl Compute {
                 head_dim,
                 table.n_rot(),
                 table.base(),
-                start,
                 kv_dim,
             );
         }
@@ -734,9 +785,15 @@ impl Compute {
                 match self.attention_path(tokens) {
                     // Decode: one token has no batch to hide latency behind, so
                     // the positions are spread over blocks instead.
-                    AttentionPath::DecodeSplit => {
-                        gpu.attention_split(q, k, v, target, geometry, start + tokens)
-                    }
+                    AttentionPath::DecodeSplit => gpu.attention_split(
+                        q,
+                        k,
+                        v,
+                        target,
+                        geometry,
+                        start + tokens,
+                        spec.capacity,
+                    ),
                     // Prefill: sixteen queries per block, keys and values staged
                     // in shared memory, softmax kept online.
                     AttentionPath::PrefillTiled => {

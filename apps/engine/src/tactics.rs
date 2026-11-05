@@ -192,6 +192,10 @@ const GROUP_ALWAYS_MEMBERS: usize = 3;
 /// Below this many tokens the row-at-a-time matmul quantises inline, so a
 /// separate quantise pass would be one launch for nothing.
 const PREPARE_MIN_TOKENS: usize = 8;
+/// Decode steps before a graph is worth capturing. The capture itself is one
+/// pass of driver work plus instantiation, and the first steps are also what
+/// grow the lazily-sized buffers a capture cannot allocate inside.
+const GRAPH_AFTER_STEPS: usize = 8;
 
 /// One variant that was considered for a regime.
 #[derive(Debug, Clone)]
@@ -228,6 +232,8 @@ pub struct KernelPlan {
     pub considered: Vec<Considered>,
     /// Scratch bytes are sized from the plan, not guessed at the call site.
     pub prepare_min_tokens: usize,
+    /// Decode steps that run plainly before the session captures a graph.
+    pub graph_after_steps: usize,
     group_always_members: usize,
     group_max_tokens: usize,
     device: Option<String>,
@@ -256,6 +262,7 @@ impl KernelPlan {
             prefill,
             considered,
             prepare_min_tokens: PREPARE_MIN_TOKENS,
+            graph_after_steps: GRAPH_AFTER_STEPS,
             group_always_members: GROUP_ALWAYS_MEMBERS,
             group_max_tokens: GROUP_FFN_MAX_TOKENS,
             device: device.map(str::to_owned),
@@ -305,6 +312,8 @@ impl KernelPlan {
         hasher.update(self.prefill.tactic.as_bytes());
         hasher.update(b"\n");
         hasher.update(self.prepare_min_tokens.to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(self.graph_after_steps.to_string().as_bytes());
         hasher.update(b"\n");
         hasher.update(self.group_always_members.to_string().as_bytes());
         hasher.update(b"\n");

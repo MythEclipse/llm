@@ -25,6 +25,15 @@ pub struct Function(pub *mut c_void);
 /// `CUevent` is an opaque driver pointer.
 pub type Event = *mut c_void;
 
+/// `CUstream`, `CUgraph` and `CUgraphExec` are opaque driver pointers.
+pub type Stream = *mut c_void;
+pub type Graph = *mut c_void;
+pub type GraphExec = *mut c_void;
+
+/// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`: capture follows this thread only, so a
+/// stray launch elsewhere cannot be recorded into the graph.
+pub const STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
+
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` from the driver API.
 pub const FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED: i32 = 8;
 
@@ -52,10 +61,6 @@ unsafe extern "C" {
     pub fn cuCtxSetCurrent(context: Context) -> i32;
     pub fn cuMemAlloc_v2(pointer: *mut DevicePtr, bytes: usize) -> i32;
     pub fn cuMemFree_v2(pointer: DevicePtr) -> i32;
-    pub fn cuMemcpyHtoD_v2(destination: DevicePtr, source: *const c_void, bytes: usize) -> i32;
-    pub fn cuMemcpyDtoH_v2(destination: *mut c_void, source: DevicePtr, bytes: usize) -> i32;
-    /// Waits for every queued launch on the current context's default stream.
-    pub fn cuCtxSynchronize() -> i32;
     pub fn cuModuleLoadData(module: *mut Module, image: *const c_void) -> i32;
     pub fn cuModuleGetFunction(function: *mut Function, module: Module, name: *const c_char)
     -> i32;
@@ -83,6 +88,35 @@ unsafe extern "C" {
         extra: *mut *mut c_void,
     ) -> i32;
     pub fn cuGetErrorString(error: i32, message: *mut *const c_char) -> i32;
+    /// The engine owns one stream, so every launch and copy has one order.
+    pub fn cuStreamCreate(stream: *mut Stream, flags: u32) -> i32;
+    pub fn cuStreamDestroy_v2(stream: Stream) -> i32;
+    pub fn cuStreamSynchronize(stream: Stream) -> i32;
+    pub fn cuMemcpyHtoDAsync_v2(
+        destination: DevicePtr,
+        source: *const c_void,
+        bytes: usize,
+        stream: Stream,
+    ) -> i32;
+    pub fn cuMemcpyDtoHAsync_v2(
+        destination: *mut c_void,
+        source: DevicePtr,
+        bytes: usize,
+        stream: Stream,
+    ) -> i32;
+    /// Records the launches queued on the stream between begin and end.
+    pub fn cuStreamBeginCapture(stream: Stream, mode: i32) -> i32;
+    pub fn cuStreamEndCapture(stream: Stream, graph: *mut Graph) -> i32;
+    pub fn cuGraphInstantiate_v2(
+        exec: *mut GraphExec,
+        graph: Graph,
+        error_node: *mut Graph,
+        error_string: *mut c_char,
+        buffer_size: usize,
+    ) -> i32;
+    pub fn cuGraphLaunch(exec: GraphExec, stream: Stream) -> i32;
+    pub fn cuGraphExecDestroy(exec: GraphExec) -> i32;
+    pub fn cuGraphDestroy(graph: Graph) -> i32;
 }
 
 /// Human-readable name for a driver error code.

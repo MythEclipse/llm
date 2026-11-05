@@ -19,6 +19,7 @@ pub mod tokenizer;
 pub mod workspace;
 
 pub use compute::{Activation, AttentionSpec, Compute};
+pub use cuda::Graph;
 pub use error::EngineError;
 pub use generate::{Event, GenerationRequest, RunStats, StopReason, generate};
 pub use gguf::{DType, GgufFile, TensorInfo};

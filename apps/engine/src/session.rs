@@ -1,7 +1,7 @@
 //! One conversation's inference state: KV cache, rope table, position, scratch.
 
 use crate::error::EngineError;
-use crate::model::{KvCache, Model, Scratch};
+use crate::model::{DecodeGraphs, KvCache, Model, Scratch};
 use crate::ops::RopeTable;
 use tracing::{debug, instrument};
 
@@ -19,6 +19,8 @@ pub struct Session<'a> {
     /// A chunk's buffers, allocated on the first prefill and sized for the
     /// largest chunk this conversation asks for.
     prefill: Option<Scratch>,
+    /// The decode steps this session has captured, one per attention grid.
+    graphs: DecodeGraphs,
 }
 
 impl<'a> Session<'a> {
@@ -32,6 +34,7 @@ impl<'a> Session<'a> {
             rope: model.rope_table(capacity),
             decode: Scratch::new(model.compute(), &model.config, 1, capacity)?,
             prefill: None,
+            graphs: DecodeGraphs::default(),
             model,
         })
     }
@@ -95,9 +98,15 @@ impl<'a> Session<'a> {
             kv,
             rope,
             decode,
+            graphs,
             ..
         } = self;
-        model.forward(&[token], kv, rope, decode)
+        model.forward_decode(token, kv, rope, decode, graphs)
+    }
+
+    /// How many decode steps this session is replaying from a graph.
+    pub fn graph_count(&self) -> usize {
+        self.graphs.len()
     }
 
     /// Give the prefill path a scratch that holds `tokens`, keeping the one it

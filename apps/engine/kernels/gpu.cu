@@ -499,9 +499,12 @@ extern "C" __global__ void rope_append(float* __restrict__ query,
                                        __half* __restrict__ values,
                                        int tokens, int q_heads, int kv_heads,
                                        int head_dim, int half, int n_rot,
-                                       float base, int start, int kv_dim) {
+                                       float base, const int* position_ptr, int kv_dim) {
     const int stride = gridDim.x * blockDim.x;
     const int first = blockIdx.x * blockDim.x + threadIdx.x;
+    // Read once per block: the engine writes this value before the launch, and a
+    // captured graph replays the same launch at a new position.
+    const int start = *position_ptr;
 
     const int query_total = tokens * q_heads * half;
     for (int index = first; index < query_total; index += stride) {
@@ -617,8 +620,10 @@ extern "C" __global__ void attention_split(const float* __restrict__ query,
                                            float* __restrict__ partial_max,
                                            float* __restrict__ partial_sum,
                                            int n_head, int n_head_kv, int head_dim,
-                                           int visible, int splits, float scale) {
+                                           const int* visible_ptr, int splits, float scale) {
     extern __shared__ float weights[];
+    // The visible count grows every token; a captured graph cannot bake it.
+    const int visible = *visible_ptr;
     __shared__ float scratch[ATTENTION_WARPS];
     __shared__ float partial[ATTENTION_WARPS][MAX_HEAD_DIM];
 

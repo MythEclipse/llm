@@ -9,7 +9,7 @@
 mod sys;
 
 use std::collections::HashMap;
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::sync::{Arc, Mutex};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,12 +18,14 @@ use half::f16;
 
 use sys::{
     ATTRIBUTE_MULTIPROCESSORS, Context, Device, DevicePtr, Event,
-    FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, Module, SUCCESS, cuCtxCreate_v2, cuCtxDestroy_v2,
-    cuCtxSetCurrent, cuCtxSynchronize, cuDeviceGet, cuDeviceGetAttribute, cuDeviceGetName,
-    cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy, cuEventElapsedTime, cuEventRecord,
-    cuEventSynchronize, cuFuncSetAttribute, cuInit, cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2,
-    cuMemGetInfo_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuModuleGetFunction, cuModuleLoadData,
-    error_message,
+    FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, Function, GraphExec, Module, STREAM_CAPTURE_THREAD_LOCAL,
+    SUCCESS, Stream, cuCtxCreate_v2, cuCtxDestroy_v2, cuCtxSetCurrent, cuDeviceGet,
+    cuDeviceGetAttribute, cuDeviceGetName, cuDeviceTotalMem_v2, cuEventCreate, cuEventDestroy,
+    cuEventElapsedTime, cuEventRecord, cuEventSynchronize, cuFuncSetAttribute, cuGraphDestroy,
+    cuGraphExecDestroy, cuGraphInstantiate_v2, cuGraphLaunch, cuInit, cuLaunchKernel,
+    cuMemAlloc_v2, cuMemFree_v2, cuMemGetInfo_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
+    cuModuleGetFunction, cuModuleLoadData, cuStreamBeginCapture, cuStreamCreate,
+    cuStreamDestroy_v2, cuStreamEndCapture, cuStreamSynchronize, error_message,
 };
 
 use crate::error::EngineError;
@@ -70,7 +72,10 @@ const MAX_SPLITS: usize = 1024;
 
 /// Enough blocks to fill the device, and never a window wider than the kernel's
 /// shared array — the second bound is what keeps long contexts legal.
-fn split_count(visible: usize) -> usize {
+///
+/// This is also the shape key of a captured decode step: two calls with the same
+/// split count launch the same grid, so one graph serves both.
+pub fn split_count(visible: usize) -> usize {
     let wanted = visible.div_ceil(SPLIT_POSITIONS).max(1);
     let required = visible.div_ceil(MAX_SPLIT_POSITIONS).max(1);
     wanted.max(required).min(MAX_SPLITS)
@@ -174,6 +179,30 @@ pub fn view(arena: &Arc<Arena>, offset: usize, len: usize) -> DeviceBuffer {
     }
 }
 
+/// `[position, visible]` on the device. A captured decode graph bakes kernel
+/// arguments, so the values that change per token live in memory the kernels
+/// read instead.
+struct StateBuffer {
+    buffer: DeviceBuffer,
+    /// Host mirror the asynchronous copy reads from; it has to outlive the copy.
+    values: Box<[i32; 2]>,
+}
+
+/// A captured decode step: the launches are recorded once and replayed with one
+/// driver call, on the same pointers.
+pub struct Graph {
+    exec: GraphExec,
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `cuGraphInstantiate_v2` and is destroyed once.
+        unsafe {
+            let _ = cuGraphExecDestroy(self.exec);
+        }
+    }
+}
+
 /// A kernel handle, looked up by name once at open time.
 #[allow(dead_code)]
 struct Kernels {
@@ -228,10 +257,17 @@ pub struct Gpu {
     total_bytes: usize,
     /// Streaming multiprocessors, which is how many blocks one wave holds.
     multiprocessors: usize,
+    /// One stream for every launch and copy, so the order is the one written
+    /// here and a decode step can be captured.
+    stream: Stream,
     weights: Mutex<HashMap<(usize, usize), Resident>>,
     workspace: Mutex<Option<DeviceBuffer>>,
     activation: Mutex<Option<DeviceBuffer>>,
     tokens: Mutex<Option<DeviceBuffer>>,
+    /// `[position, visible]` on the device, so a captured graph reads the
+    /// position of the token it is replaying instead of the one it was
+    /// captured with.
+    state: Mutex<Option<StateBuffer>>,
     names: Vec<(Function, &'static str)>,
     profile_enabled: bool,
     profile: Mutex<Option<HashMap<&'static str, (f64, u64)>>>,
@@ -274,6 +310,12 @@ impl Gpu {
 
             let mut context = Context(std::ptr::null_mut());
             check(cuCtxCreate_v2(&raw mut context, 0, device), "cuCtxCreate")?;
+
+            // One stream for the whole engine: capture needs a stream that is not
+            // the legacy default one, and a single order keeps every copy where
+            // the caller put it.
+            let mut stream: Stream = std::ptr::null_mut();
+            check(cuStreamCreate(&raw mut stream, 0), "cuStreamCreate")?;
 
             let image = CString::new(ptx).expect("PTX has no interior NUL");
             let mut module = Module(std::ptr::null_mut());
@@ -330,9 +372,11 @@ impl Gpu {
                 total_bytes,
                 multiprocessors: multiprocessors.max(1) as usize,
                 weights: Mutex::new(HashMap::new()),
+                stream,
                 workspace: Mutex::new(None),
                 activation: Mutex::new(None),
                 tokens: Mutex::new(None),
+                state: Mutex::new(None),
             })
         }
     }
@@ -345,12 +389,40 @@ impl Gpu {
         self.total_bytes
     }
 
-    /// Waits for every launch queued on the default stream.
+    /// Waits for every launch queued on this engine's stream.
     pub fn synchronize(&self) {
         // SAFETY: the context is current on this thread, set by each entry point.
         unsafe {
             cuCtxSetCurrent(self.context);
-            cuCtxSynchronize();
+            let _ = cuStreamSynchronize(self.stream);
+        }
+    }
+
+    /// Host to device, waiting for it. The asynchronous call plus a stream wait
+    /// is the synchronous copy it replaces, but ordered against the launches
+    /// instead of against a stream this engine does not use.
+    fn copy_to_device(&self, destination: DevicePtr, source: *const c_void, bytes: usize) -> i32 {
+        // SAFETY: both pointers are valid for `bytes`; the stream belongs here.
+        unsafe {
+            let status = cuMemcpyHtoDAsync_v2(destination, source, bytes, self.stream);
+            if status == SUCCESS {
+                cuStreamSynchronize(self.stream)
+            } else {
+                status
+            }
+        }
+    }
+
+    /// Device to host, waiting for it.
+    fn copy_from_device(&self, destination: *mut c_void, source: DevicePtr, bytes: usize) -> i32 {
+        // SAFETY: both pointers are valid for `bytes`; the stream belongs here.
+        unsafe {
+            let status = cuMemcpyDtoHAsync_v2(destination, source, bytes, self.stream);
+            if status == SUCCESS {
+                cuStreamSynchronize(self.stream)
+            } else {
+                status
+            }
         }
     }
 
@@ -410,6 +482,128 @@ impl Gpu {
         Ok(Arc::new(Arena { pointer, bytes }))
     }
 
+    /// Writes the position this pass works at, and the number of visible keys,
+    /// where the kernels read them. A captured graph bakes arguments, so these
+    /// two values cannot be arguments.
+    pub fn set_position(&self, position: usize, visible: usize) -> Result<(), EngineError> {
+        self.bind()?;
+        let mut slot = self.state.lock().expect("state lock");
+        if slot.is_none() {
+            *slot = Some(StateBuffer {
+                buffer: self.alloc(2)?,
+                values: Box::new([0, 0]),
+            });
+        }
+        let state = slot.as_mut().expect("just created");
+        state.values[0] = position as i32;
+        state.values[1] = visible as i32;
+        // Asynchronous on purpose: the stream orders this copy before the
+        // launches that read it, so a decode step does not wait on the host. The
+        // source is owned by the same struct, so it outlives the copy.
+        // SAFETY: both pointers are valid for the copied length.
+        let status = unsafe {
+            cuMemcpyHtoDAsync_v2(
+                state.buffer.pointer,
+                state.values.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(&*state.values),
+                self.stream,
+            )
+        };
+        if status != SUCCESS {
+            return Err(EngineError::Unsupported(format!(
+                "cuda: position upload failed: {}",
+                error_message(status)
+            )));
+        }
+        Ok(())
+    }
+
+    /// `[position, visible]` as the kernels receive it.
+    fn state_pointers(&self) -> Result<(DevicePtr, DevicePtr), EngineError> {
+        let slot = self.state.lock().expect("state lock");
+        let state = slot
+            .as_ref()
+            .ok_or_else(|| EngineError::Unsupported("cuda: position was never set".into()))?;
+        Ok((state.buffer.pointer, shifted(state.buffer.pointer, 1)))
+    }
+
+    /// Starts recording launches on the stream. Everything recorded must be a
+    /// launch on a pointer that will not move, and nothing may allocate while it
+    /// is open.
+    pub fn begin_capture(&self) -> Result<(), EngineError> {
+        self.bind()?;
+        if self.profile_enabled {
+            return Err(EngineError::Unsupported(
+                "cuda: profiling records events, which cannot be captured".into(),
+            ));
+        }
+        // SAFETY: the stream belongs to this engine and is not capturing yet.
+        check(
+            unsafe { cuStreamBeginCapture(self.stream, STREAM_CAPTURE_THREAD_LOCAL) },
+            "cuStreamBeginCapture",
+        )
+    }
+
+    /// Closes the recording and instantiates it, ready to replay.
+    pub fn end_capture(&self) -> Result<Graph, EngineError> {
+        let mut graph = std::ptr::null_mut();
+        // SAFETY: a capture is open on this stream; the driver writes one handle.
+        check(
+            unsafe { cuStreamEndCapture(self.stream, &raw mut graph) },
+            "cuStreamEndCapture",
+        )?;
+        let mut exec = std::ptr::null_mut();
+        let mut error_node = std::ptr::null_mut();
+        let mut message = [0 as c_char; 256];
+        // SAFETY: `graph` is a live handle; the buffers are ours.
+        let status = unsafe {
+            cuGraphInstantiate_v2(
+                &raw mut exec,
+                graph,
+                &raw mut error_node,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        // SAFETY: the graph is not needed once instantiated.
+        unsafe {
+            let _ = cuGraphDestroy(graph);
+        }
+        if status != SUCCESS {
+            let detail: String = message
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8 as char)
+                .collect();
+            return Err(EngineError::Unsupported(format!(
+                "cuda: graph instantiation failed: {} {detail}",
+                error_message(status)
+            )));
+        }
+        Ok(Graph { exec })
+    }
+
+    /// Abandons a capture that failed halfway, so the stream is usable again.
+    pub fn cancel_capture(&self) {
+        let mut graph = std::ptr::null_mut();
+        // SAFETY: ending the capture is the only way back; the graph is dropped.
+        unsafe {
+            if cuStreamEndCapture(self.stream, &raw mut graph) == SUCCESS && !graph.is_null() {
+                let _ = cuGraphDestroy(graph);
+            }
+        }
+    }
+
+    /// Replays a captured step in one call.
+    pub fn replay(&self, graph: &Graph) -> Result<(), EngineError> {
+        self.bind()?;
+        // SAFETY: the exec was instantiated by this engine and is alive.
+        check(
+            unsafe { cuGraphLaunch(graph.exec, self.stream) },
+            "cuGraphLaunch",
+        )
+    }
+
     /// Bytes held on the device right now, and the most ever held at once.
     pub fn device_bytes(&self) -> (usize, usize) {
         (
@@ -422,13 +616,11 @@ impl Gpu {
         self.bind()?;
         assert!(source.len() <= destination.len, "upload larger than buffer");
         // SAFETY: both pointers are valid for the copied length.
-        let status = unsafe {
-            cuMemcpyHtoD_v2(
-                destination.pointer,
-                source.as_ptr().cast::<c_void>(),
-                std::mem::size_of_val(source),
-            )
-        };
+        let status = self.copy_to_device(
+            destination.pointer,
+            source.as_ptr().cast::<c_void>(),
+            std::mem::size_of_val(source),
+        );
         if status != SUCCESS {
             return Err(EngineError::Unsupported(format!(
                 "cuda: host-to-device copy failed: {}",
@@ -447,14 +639,11 @@ impl Gpu {
             destination.len() <= source.len,
             "download larger than buffer"
         );
-        // SAFETY: both pointers are valid for the copied length.
-        let status = unsafe {
-            cuMemcpyDtoH_v2(
-                destination.as_mut_ptr().cast::<c_void>(),
-                source.pointer,
-                std::mem::size_of_val(destination),
-            )
-        };
+        let status = self.copy_from_device(
+            destination.as_mut_ptr().cast::<c_void>(),
+            source.pointer,
+            std::mem::size_of_val(destination),
+        );
         if status != SUCCESS {
             return Err(EngineError::Unsupported(format!(
                 "cuda: device-to-host copy failed: {}",
@@ -749,10 +938,10 @@ impl Gpu {
         head_dim: usize,
         n_rot: usize,
         base: f32,
-        start: usize,
         kv_dim: usize,
     ) -> Result<(), EngineError> {
         let total = tokens * q_heads * (head_dim / 2);
+        let (position, _) = self.state_pointers()?;
         let mut args = [
             Arg::Pointer(query.pointer),
             Arg::Pointer(key.pointer),
@@ -766,7 +955,7 @@ impl Gpu {
             Arg::Int((head_dim / 2) as i32),
             Arg::Int(n_rot as i32),
             Arg::Float(base),
-            Arg::Int(start as i32),
+            Arg::Pointer(position),
             Arg::Int(kv_dim as i32),
         ];
         self.launch(
@@ -923,6 +1112,12 @@ impl Gpu {
     }
 
     /// Decode attention: positions split across blocks, then combined.
+    ///
+    /// `visible` sets the split count and therefore the grid, so a captured step
+    /// is only valid for the grid it was recorded with — the caller keys its
+    /// graph cache on [`split_count`]. The partials buffer is sized for
+    /// `capacity` instead, so its address does not move as the context grows.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_split(
         &self,
         query: &DeviceBuffer,
@@ -931,15 +1126,13 @@ impl Gpu {
         out: &DeviceBuffer,
         geometry: AttentionGeometry,
         visible: usize,
+        capacity: usize,
     ) -> Result<(), EngineError> {
         let splits = split_count(visible);
-        let positions = visible.div_ceil(splits);
-        assert!(
-            positions <= MAX_SPLIT_POSITIONS,
-            "visible positions per block exceed the shared window"
-        );
+        let (_, visible) = self.state_pointers()?;
         let heads = geometry.n_head;
-        let floats = heads * splits * geometry.head_dim + heads * splits * 2;
+        let widest = split_count(capacity);
+        let floats = heads * widest * geometry.head_dim + heads * widest * 2;
         let workspace = self.workspace(floats)?;
 
         let mut args = [
@@ -955,7 +1148,7 @@ impl Gpu {
             Arg::Int(geometry.n_head as i32),
             Arg::Int(geometry.n_head_kv as i32),
             Arg::Int(geometry.head_dim as i32),
-            Arg::Int(visible as i32),
+            Arg::Pointer(visible),
             Arg::Int(splits as i32),
             Arg::Float(geometry.scale),
         ];
@@ -963,7 +1156,7 @@ impl Gpu {
             self.kernels.attention_split,
             (heads as u32, splits as u32, 1),
             (ATTENTION_THREADS, 1, 1),
-            (positions * 4) as u32,
+            (MAX_SPLIT_POSITIONS * 4) as u32,
             &mut args,
         )?;
 
@@ -1339,13 +1532,11 @@ impl Gpu {
             && buffer.len() >= tokens.len()
         {
             // SAFETY: both pointers are valid for the copied length.
-            let status = unsafe {
-                cuMemcpyHtoD_v2(
-                    buffer.pointer,
-                    tokens.as_ptr().cast::<c_void>(),
-                    std::mem::size_of_val(tokens),
-                )
-            };
+            let status = self.copy_to_device(
+                buffer.pointer,
+                tokens.as_ptr().cast::<c_void>(),
+                std::mem::size_of_val(tokens),
+            );
             if status == SUCCESS {
                 return Ok(buffer.pointer);
             }
@@ -1356,13 +1547,11 @@ impl Gpu {
         }
         let buffer = self.alloc(tokens.len().max(1))?;
         // SAFETY: both pointers are valid for the copied length.
-        let status = unsafe {
-            cuMemcpyHtoD_v2(
-                buffer.pointer,
-                tokens.as_ptr().cast::<c_void>(),
-                std::mem::size_of_val(tokens),
-            )
-        };
+        let status = self.copy_to_device(
+            buffer.pointer,
+            tokens.as_ptr().cast::<c_void>(),
+            std::mem::size_of_val(tokens),
+        );
         if status != SUCCESS {
             return Err(EngineError::Unsupported(format!(
                 "cuda: token upload failed: {}",
@@ -1425,9 +1614,8 @@ impl Gpu {
         self.bind()?;
         let buffer = self.alloc(bytes.len().div_ceil(4))?;
         // SAFETY: the buffer holds at least `bytes.len()` bytes.
-        let status = unsafe {
-            cuMemcpyHtoD_v2(buffer.pointer, bytes.as_ptr().cast::<c_void>(), bytes.len())
-        };
+        let status =
+            self.copy_to_device(buffer.pointer, bytes.as_ptr().cast::<c_void>(), bytes.len());
         if status != SUCCESS {
             return Err(EngineError::Unsupported(format!(
                 "cuda: weight upload failed: {}",
@@ -1463,7 +1651,7 @@ impl Gpu {
             let event = self.event()?;
             // SAFETY: the event was just created and the stream is the default.
             unsafe {
-                cuEventRecord(event, std::ptr::null_mut());
+                cuEventRecord(event, self.stream);
             }
             Some(event)
         } else {
@@ -1488,7 +1676,7 @@ impl Gpu {
                 block.1,
                 block.2,
                 shared_bytes,
-                std::ptr::null_mut(),
+                self.stream,
                 pointers.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
@@ -1525,7 +1713,7 @@ impl Gpu {
         };
         // SAFETY: both events exist and the stream is the default one.
         unsafe {
-            cuEventRecord(end, std::ptr::null_mut());
+            cuEventRecord(end, self.stream);
             cuEventSynchronize(end);
         }
         let mut milliseconds = 0.0f32;
@@ -1587,8 +1775,12 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         self.report_profile();
         self.weights.lock().expect("weight cache lock").clear();
-        // SAFETY: the context was created by this struct and is destroyed once.
+        self.state.lock().expect("state lock").take();
+        // SAFETY: the stream and context were created by this struct and are
+        // destroyed once, stream first.
         unsafe {
+            let _ = cuStreamSynchronize(self.stream);
+            let _ = cuStreamDestroy_v2(self.stream);
             let _ = cuCtxDestroy_v2(self.context);
         }
     }

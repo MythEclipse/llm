@@ -88,6 +88,11 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
     let device = model.device_name().unwrap_or("cpu").to_string();
 
     let mut measurements = Vec::new();
+    // What the session built while decoding: the graphs it captured and the
+    // scratch its plan holds. Reported so a number can be traced to the
+    // machinery behind it.
+    let mut graphs = 0usize;
+    let mut scratch_bytes = 0usize;
     for &prompt in &options.prompts {
         let tokens = repeat_to(&filler, prompt);
         let mut samples = Vec::with_capacity(options.repeats);
@@ -95,6 +100,7 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
             let mut session = Session::new(&model, options.context)?;
             let started = Instant::now();
             session.prefill(&tokens)?;
+            scratch_bytes = scratch_bytes.max(session.scratch_bytes());
             samples.push(prompt as f64 / started.elapsed().as_secs_f64());
         }
         measurements.push(Measurement {
@@ -121,6 +127,8 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
             };
             let cancel = AtomicBool::new(false);
             let stats = generate(&mut session, &tokenizer, &request, &cancel, |_| {})?;
+            graphs = graphs.max(session.graph_count());
+            scratch_bytes = scratch_bytes.max(session.scratch_bytes());
             samples.push(generation as f64 / (stats.decode_ms as f64 / 1000.0));
         }
         measurements.push(Measurement {
@@ -136,6 +144,8 @@ pub fn run(options: &BenchOptions) -> Result<Vec<Measurement>, Box<dyn std::erro
         &options.model_path,
         model.compute().device_footprint(),
         &identity_line(&model),
+        graphs,
+        scratch_bytes,
     );
     Ok(measurements)
 }
@@ -190,6 +200,8 @@ fn report(
     model_path: &std::path::Path,
     device_bytes: Option<(usize, usize)>,
     identity: &str,
+    graphs: usize,
+    scratch_bytes: usize,
 ) {
     let name = model_path.file_stem().map_or_else(
         || "model".to_string(),
@@ -207,11 +219,26 @@ fn report(
         println!("| | | vram | {} live, {} peak |", gib(live), gib(peak));
     }
     println!("{identity}");
+    if scratch_bytes > 0 {
+        println!(
+            "scratch {} planned, {graphs} decode graph(s) captured",
+            size(scratch_bytes)
+        );
+    }
 }
 
 /// Bytes as GiB with two decimals, the unit llama.cpp prints its buffers in.
 fn gib(bytes: usize) -> String {
     format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// Bytes in whichever unit keeps the number readable.
+fn size(bytes: usize) -> String {
+    if bytes >= 1 << 30 {
+        gib(bytes)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 /// JSON form, matching llama-bench's `-o json` shape closely enough to be read by

@@ -1,6 +1,7 @@
 //! The MiniCPM5 transformer: embeddings → 42 decoder layers → logits.
 
 use crate::compute::{Activation, AttentionSpec, Compute, GroupMember, Workspace};
+use crate::cuda::Graph;
 use crate::error::EngineError;
 use crate::gguf::GgufFile;
 use crate::ops::RopeTable;
@@ -134,6 +135,12 @@ impl KvCache {
 
     pub fn reset(&mut self) {
         self.len = 0;
+    }
+
+    /// Moves the position forward without a pass. A replayed graph has already
+    /// written the keys and values; the counter still has to follow.
+    pub fn advance(&mut self, tokens: usize) {
+        self.len += tokens;
     }
 }
 
@@ -326,6 +333,95 @@ impl<'a> Model<'a> {
         rope: &RopeTable,
         scratch: &mut Scratch,
     ) -> Result<Vec<f32>, EngineError> {
+        self.set_position(kv, tokens.len())?;
+        self.embed(tokens, scratch)?;
+        self.body(tokens, kv, rope, scratch)?;
+        self.read_logits(scratch)
+    }
+
+    /// One decode step, captured into a graph once this session has run enough
+    /// of them for the capture to pay for itself.
+    ///
+    /// A captured step is the same launches on the same pointers; only the
+    /// position changes, and the kernels read that from device memory. The first
+    /// steps run plainly for a second reason too: they are what grows the
+    /// lazily-sized buffers, and nothing may allocate while a capture is open.
+    pub fn forward_decode(
+        &self,
+        token: u32,
+        kv: &mut KvCache,
+        rope: &RopeTable,
+        scratch: &mut Scratch,
+        graphs: &mut DecodeGraphs,
+    ) -> Result<Vec<f32>, EngineError> {
+        graphs.steps += 1;
+        // The position and the embedding are outside the graph: both change with
+        // the token, and both need a host copy, which a capture cannot contain.
+        self.set_position(kv, 1)?;
+        self.embed(&[token], scratch)?;
+        // The grid the attention kernel launches with depends on how many
+        // positions are visible, so the cache is keyed on it: the same graph is
+        // replayed until the context crosses into a wider grid.
+        let shape = self.compute.decode_splits(kv.len() + 1);
+        if let Some(graph) = graphs.captured.get(&shape) {
+            self.compute.replay(graph)?;
+            kv.advance(1);
+            return self.read_logits(scratch);
+        }
+        let capture =
+            graphs.steps >= self.compute.plan().graph_after_steps && self.compute.can_capture();
+        if capture {
+            self.compute.begin_capture()?;
+        }
+        let outcome = self.body(&[token], kv, rope, scratch);
+        if capture {
+            match outcome {
+                Ok(()) => {
+                    let captured = self.compute.end_capture()?;
+                    self.compute.replay(&captured)?;
+                    graphs.captured.insert(shape, captured);
+                }
+                Err(error) => {
+                    self.compute.cancel_capture();
+                    return Err(error);
+                }
+            }
+        } else {
+            outcome?;
+        }
+        self.read_logits(scratch)
+    }
+
+    /// Writes the position the kernels read, before anything is launched.
+    fn set_position(&self, kv: &KvCache, tokens: usize) -> Result<(), EngineError> {
+        // A captured decode step bakes its arguments, so the one value that moves
+        // every token arrives through a pointer instead.
+        self.compute.set_position(kv.len(), kv.len() + tokens)
+    }
+
+    /// The embedding lookup, which needs a host copy of the token ids and so
+    /// stays outside a captured step.
+    fn embed(&self, tokens: &[u32], scratch: &mut Scratch) -> Result<(), EngineError> {
+        for token in tokens {
+            if *token as usize >= self.config.n_vocab {
+                return Err(EngineError::Format(format!(
+                    "token {token} outside vocabulary"
+                )));
+            }
+        }
+        self.compute
+            .embeddings(&self.token_embd, tokens, &mut scratch.x, 0)
+    }
+
+    /// The launches of one pass, and nothing that waits on the host: this is
+    /// exactly what a decode step records into a graph.
+    fn body(
+        &self,
+        tokens: &[u32],
+        kv: &mut KvCache,
+        rope: &RopeTable,
+        scratch: &mut Scratch,
+    ) -> Result<(), EngineError> {
         let n = tokens.len();
         if n == 0 {
             return Err(EngineError::Format("empty prompt".into()));
@@ -339,6 +435,7 @@ impl<'a> Model<'a> {
         let config = &self.config;
         let embd = config.n_embd;
         let start = kv.len();
+        let capacity = kv.capacity();
         debug!(tokens = n, start, "forward pass started");
 
         if scratch.tokens() < n {
@@ -347,21 +444,12 @@ impl<'a> Model<'a> {
                 scratch.tokens()
             )));
         }
-        for token in tokens {
-            if *token as usize >= config.n_vocab {
-                return Err(EngineError::Format(format!(
-                    "token {token} outside vocabulary"
-                )));
-            }
-        }
-        self.compute
-            .embeddings(&self.token_embd, tokens, &mut scratch.x, 0)?;
 
         for (index, layer) in self.layers.iter().enumerate() {
             let _layer_span =
                 tracing::debug_span!("transformer_layer", layer = index, tokens = n, start)
                     .entered();
-            self.layer_forward(layer, index, n, start, kv, rope, scratch)?;
+            self.layer_forward(layer, index, n, start, kv, rope, scratch, capacity)?;
         }
         kv.len = start + n;
 
@@ -382,10 +470,14 @@ impl<'a> Model<'a> {
             &mut scratch.logits,
             0,
         )?;
-
-        let mut values = vec![0.0f32; config.n_vocab];
-        self.compute.download(&scratch.logits, &mut values)?;
         debug!(tokens = n, position = start + n, "forward pass complete");
+        Ok(())
+    }
+
+    /// The logits the pass just wrote, on the host.
+    fn read_logits(&self, scratch: &Scratch) -> Result<Vec<f32>, EngineError> {
+        let mut values = vec![0.0f32; self.config.n_vocab];
+        self.compute.download(&scratch.logits, &mut values)?;
         Ok(values)
     }
 
@@ -399,6 +491,7 @@ impl<'a> Model<'a> {
         kv: &mut KvCache,
         rope: &RopeTable,
         scratch: &mut Scratch,
+        capacity: usize,
     ) -> Result<(), EngineError> {
         let config = &self.config;
         let kv_dim = config.kv_dim();
@@ -464,6 +557,7 @@ impl<'a> Model<'a> {
             kv_dim,
             scores_stride: start + n,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
+            capacity,
         };
         self.compute.attend(
             &scratch.q,
@@ -532,6 +626,28 @@ impl<'a> Model<'a> {
             &mut scratch.projected,
         )?;
         Ok(())
+    }
+}
+
+/// The decode steps this session has captured, one per grid shape.
+///
+/// A captured step bakes its launch grid, so a wider context needs a new one;
+/// the graph is replayed until the context crosses into the next grid, which is
+/// what keeps the capture cost off the hot path.
+#[derive(Default)]
+pub struct DecodeGraphs {
+    captured: std::collections::HashMap<usize, Graph>,
+    steps: usize,
+}
+
+impl DecodeGraphs {
+    /// Graphs captured so far.
+    pub fn len(&self) -> usize {
+        self.captured.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.captured.is_empty()
     }
 }
 
