@@ -780,9 +780,34 @@ Kecepatan, 4,2B Q8_0, context 1024, diukur dengan `llm-cli bench`:
 | pp512 | 18,9 t/s | 91,1 t/s |
 | tg32 | 7,9 t/s | 26,5 t/s |
 
-VRAM 4,17 GiB terpakai, 4,49 GiB puncak. Teks yang dihasilkan GPU dan CPU
+VRAM 4,17 GiB terpakai, 4,49 GiB puncak pada konteks 8192. Teks yang dihasilkan GPU dan CPU
 identik untuk prompt uji (39 token, berhenti di EOS), dan tiap blok cocok
 sampai ~5e-3 — tingkat derau kuantisasi aktivasi, bukan selisih aritmetika.
+
+### Seberapa besar konteks yang muat
+
+File ini mendeklarasikan `qwen35.context_length = 262144`, tapi jendela yang bisa
+dilayani dibatasi kartunya, bukan modelnya. KV cache hanya tumbuh di 8 blok
+attention (24 blok lainnya menyimpan state tetap), jadi biayanya 32 KB per token
+dalam f16:
+
+| konteks | KV | bobot | total | RTX 4050 (6 GiB) |
+|---|---|---|---|---|
+| 8192 | 0,25 GiB | 4,18 GiB | 4,43 GiB | muat |
+| 32768 | 1,00 GiB | 4,18 GiB | 5,18 GiB | muat, 5,30 GiB puncak |
+| 40960 | 1,25 GiB | 4,18 GiB | 5,43 GiB | alokasi gagal |
+| 131072 | 4,00 GiB | 4,18 GiB | 8,18 GiB | tidak mungkin |
+
+Jadi batas praktis di kartu ini 32k. Di CPU 128k memang jalan (KV di RAM, 31 GB),
+tapi prefill 18 t/s berarti prompt 128k butuh sekitar dua jam — bukan pilihan
+untuk dipakai.
+
+Satu hal yang ikut menentukan: kernel prefill untuk head 256 masih yang serial,
+dan kernel itu menulis grid skor `n_head × token × kapasitas`. Dengan chunk tetap
+1024 token, konteks 32k akan meminta 2 GiB untuk grid saja. Karena itu chunk
+prefill menyusut mengikuti kapasitas (`Session::prefill_chunk`), dengan pagu
+128 MiB: 32k memakai chunk 64 token dan grid 137 MiB. Ongkosnya kecil — pp128
+turun dari 89,6 ke 85,7 t/s.
 
 ## Mixture of experts
 

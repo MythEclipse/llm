@@ -69,6 +69,11 @@ async function loadModel() {
   el("chat-meta").textContent = `${info.layers} layer · ${info.embedding}d · ctx ${info.context} · ${
     info.device ?? `${info.threads} thread`
   }`;
+  // The reply cap cannot exceed the window it is written into, and half of the
+  // window is the most a reply should ever take from the prompt.
+  const replyCap = Math.max(1, Math.min(16384, Math.floor(info.context / 2)));
+  el("max-tokens").max = String(replyCap);
+  if (Number(el("max-tokens").value) > replyCap) el("max-tokens").value = String(replyCap);
 
   el("model-info").innerHTML = [
     ["arsitektur", info.architecture],

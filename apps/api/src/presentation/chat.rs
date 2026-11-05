@@ -24,8 +24,11 @@ use crate::presentation::error::AppError;
 use crate::presentation::state::AppState;
 use crate::presentation::validation::validate;
 
-const DEFAULT_MAX_TOKENS: usize = 512;
-const MAX_MAX_TOKENS: usize = 4096;
+/// Long answers stop at end of sequence; this only bounds a runaway reply. The
+/// window is 32k on the shipped card, so half of it stays available for the
+/// prompt the answer is written against.
+const DEFAULT_MAX_TOKENS: usize = 8192;
+const MAX_MAX_TOKENS: usize = 16384;
 
 #[derive(Debug, Deserialize, Serialize, ZodSchema)]
 pub struct SendMessageRequest {

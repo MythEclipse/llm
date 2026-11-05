@@ -9,6 +9,17 @@ use tracing::{debug, instrument};
 /// small enough that the activation scratch stays a few megabytes.
 pub const PREFILL_CHUNK: usize = 1024;
 
+/// The narrowest chunk worth launching. Below this the per-call overhead of the
+/// projections outweighs the smaller attention scratch.
+const MIN_PREFILL_CHUNK: usize = 32;
+
+/// Bytes the prefill score grid may take. The serial prefill kernel writes
+/// `n_head × tokens × capacity` floats, so a fixed 1024-token chunk would ask
+/// for gigabytes once the context is large: at a 32k window that is 2 GiB. The
+/// chunk shrinks instead, because a bigger context is worth more than a wider
+/// prefill step.
+const SCORE_GRID_BYTES: usize = 128 << 20;
+
 pub struct Session<'a> {
     model: &'a Model<'a>,
     kv: KvCache,
@@ -76,14 +87,32 @@ impl<'a> Session<'a> {
         self.recurrent.reset();
     }
 
+    /// Prompt tokens this session processes per forward call.
+    ///
+    /// A plan that keeps its probabilities in registers asks for no score grid
+    /// and keeps the full chunk; one that writes a grid gets a chunk small
+    /// enough for the grid to stay inside its budget at this capacity.
+    pub fn prefill_chunk(&self) -> usize {
+        let heads = self.model.config.n_head;
+        let plan = self.model.compute().plan();
+        let mut chunk = PREFILL_CHUNK;
+        while chunk > MIN_PREFILL_CHUNK
+            && plan.score_floats(heads, chunk, self.capacity()) * 4 > SCORE_GRID_BYTES
+        {
+            chunk /= 2;
+        }
+        chunk
+    }
+
     /// Process a whole prompt and return the logits for its last token.
     #[instrument(skip(self, tokens), fields(tokens = tokens.len(), position = self.position()))]
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, EngineError> {
         if tokens.is_empty() {
             return Err(EngineError::Format("empty prompt".into()));
         }
+        let chunk_tokens = self.prefill_chunk();
         let mut logits = Vec::new();
-        for (chunk_index, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+        for (chunk_index, chunk) in tokens.chunks(chunk_tokens).enumerate() {
             debug!(chunk_index, chunk_tokens = chunk.len(), "prefill chunk");
             self.reserve_prefill(chunk.len())?;
             let Self {
