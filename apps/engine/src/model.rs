@@ -25,25 +25,70 @@ pub struct Config {
 }
 
 impl Config {
+    /// Geometry from the GGUF header.
+    ///
+    /// Keys are read under the model's own architecture (`qwen2.block_count`,
+    /// `llama.block_count`, …) because that is where a GGUF puts them; the
+    /// `llama.` spelling stays as a fallback for files that keep it. Fields the
+    /// format leaves optional (head counts, key length, rope base, epsilon,
+    /// vocabulary) fall back the way llama.cpp does, and a model whose block
+    /// type this engine does not implement is refused here rather than failing
+    /// halfway through a load.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, EngineError> {
-        let config = Self {
-            n_layers: gguf.meta_u64("llama.block_count")? as usize,
-            n_embd: gguf.meta_u64("llama.embedding_length")? as usize,
-            n_ff: gguf.meta_u64("llama.feed_forward_length")? as usize,
-            n_head: gguf.meta_u64("llama.attention.head_count")? as usize,
-            n_head_kv: gguf.meta_u64("llama.attention.head_count_kv")? as usize,
-            head_dim: gguf.meta_u64("llama.attention.key_length")? as usize,
-            n_rot: gguf.meta_u64("llama.rope.dimension_count")? as usize,
-            rope_base: gguf.meta_f32("llama.rope.freq_base")?,
-            eps: gguf.meta_f32("llama.attention.layer_norm_rms_epsilon")?,
-            n_vocab: gguf.meta_u64("llama.vocab_size")? as usize,
+        let architecture = gguf.meta_str("general.architecture").unwrap_or("llama");
+        let read = |name: &str| {
+            gguf.meta_u64_opt(&format!("{architecture}.{name}"))
+                .or_else(|| gguf.meta_u64_opt(&format!("llama.{name}")))
         };
-        if !config.n_head.is_multiple_of(config.n_head_kv) {
+        let read_float = |name: &str| {
+            gguf.meta_f32_opt(&format!("{architecture}.{name}"))
+                .or_else(|| gguf.meta_f32_opt(&format!("llama.{name}")))
+        };
+        let required = |name: &str| {
+            read(name).ok_or_else(|| EngineError::MissingMetadata(format!("{architecture}.{name}")))
+        };
+
+        let n_layers = required("block_count")? as usize;
+        let n_embd = required("embedding_length")? as usize;
+        let n_head = required("attention.head_count")? as usize;
+        let n_ff = required("feed_forward_length")? as usize;
+        let n_head_kv = read("attention.head_count_kv").unwrap_or(n_head as u64) as usize;
+        let head_dim = read("attention.key_length")
+            .map(|value| value as usize)
+            .unwrap_or_else(|| n_embd / n_head.max(1));
+        let n_rot = read("rope.dimension_count")
+            .map(|value| value as usize)
+            .unwrap_or(head_dim);
+        let rope_base = read_float("rope.freq_base").unwrap_or(10_000.0);
+        let eps = read_float("attention.layer_norm_rms_epsilon").unwrap_or(1e-6);
+        let n_vocab = match read("vocab_size") {
+            Some(value) => value as usize,
+            None => gguf.meta_i32_array("tokenizer.ggml.token_type")?.len(),
+        };
+
+        if !n_head.is_multiple_of(n_head_kv.max(1)) {
             return Err(EngineError::Format(
                 "query head count is not a multiple of kv head count".into(),
             ));
         }
-        Ok(config)
+        check_supported(
+            architecture,
+            head_dim,
+            gguf.has_key_prefix(&format!("{architecture}.ssm.")),
+        )?;
+
+        Ok(Self {
+            n_layers,
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv,
+            head_dim,
+            n_rot,
+            rope_base,
+            eps,
+            n_vocab,
+        })
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -54,6 +99,31 @@ impl Config {
     fn group_size(&self) -> usize {
         self.n_head / self.n_head_kv
     }
+}
+
+/// Whether this engine can run the model at all, decided from its header.
+///
+/// Every kernel here is written for a dense attention block with a head
+/// dimension of at most 128. A model that interleaves another block type (a
+/// state-space layer, for instance) needs a forward pass this engine does not
+/// have, and saying so at load is better than half-loading it.
+fn check_supported(
+    architecture: &str,
+    head_dim: usize,
+    has_state_space: bool,
+) -> Result<(), EngineError> {
+    if has_state_space {
+        return Err(EngineError::Unsupported(format!(
+            "architecture {architecture} interleaves state-space blocks with attention; \
+             this engine implements dense attention blocks only"
+        )));
+    }
+    if head_dim > 128 {
+        return Err(EngineError::Unsupported(format!(
+            "head_dim {head_dim} exceeds the 128 the attention kernels are written for"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -752,7 +822,36 @@ fn weight<'a>(
 
 #[cfg(test)]
 pub mod tests {
-    use super::Config;
+    use super::{Config, check_supported};
+    use crate::error::EngineError;
+
+    #[test]
+    fn a_dense_attention_block_is_supported() {
+        assert!(check_supported("qwen2", 128, false).is_ok());
+        assert!(check_supported("llama", 64, false).is_ok());
+    }
+
+    #[test]
+    fn a_head_dimension_no_kernel_covers_is_refused_by_name() {
+        let error = check_supported("qwen35", 256, false).unwrap_err();
+        match error {
+            EngineError::Unsupported(message) => {
+                assert!(message.contains("head_dim 256"), "{message}");
+            }
+            other => panic!("expected an unsupported error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_state_space_block_is_refused_with_the_reason() {
+        let error = check_supported("qwen35", 128, true).unwrap_err();
+        match error {
+            EngineError::Unsupported(message) => {
+                assert!(message.contains("state-space"), "{message}");
+            }
+            other => panic!("expected an unsupported error, got {other:?}"),
+        }
+    }
 
     /// The geometry of the model this engine ships with: 42 layers, 16 query
     /// heads over 2 kv heads, head_dim 128.

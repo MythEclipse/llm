@@ -217,6 +217,29 @@ impl GgufFile {
         }
     }
 
+    /// Same as [`Self::meta_u64`], but a missing key is not an error. Used for
+    /// fields a GGUF may leave out and every loader fills with a default.
+    pub fn meta_u64_opt(&self, key: &str) -> Option<u64> {
+        match self.meta.get(key) {
+            Some(MetaValue::UInt(value)) => Some(*value),
+            Some(MetaValue::Int(value)) if *value >= 0 => Some(*value as u64),
+            _ => None,
+        }
+    }
+
+    pub fn meta_f32_opt(&self, key: &str) -> Option<f32> {
+        match self.meta.get(key) {
+            Some(MetaValue::Float(value)) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    /// Whether any key starts with `prefix`, which is how a model declares a
+    /// block type this engine does not implement.
+    pub fn has_key_prefix(&self, prefix: &str) -> bool {
+        self.meta.keys().any(|key| key.starts_with(prefix))
+    }
+
     pub fn meta_str(&self, key: &str) -> Result<&str, EngineError> {
         match self.meta.get(key) {
             Some(MetaValue::Text(value)) => Ok(value),

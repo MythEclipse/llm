@@ -700,6 +700,15 @@ karena di sini "compiler"-nya `build.rs` + nvcc + satu tabel `const`.
 - **Angka menunjuk artefak.** Setiap keluaran `bench` mencetak identitas build dan
   identitas rencana; tanpa itu sebuah angka tidak bisa dibandingkan dengan angka
   lain.
+- **Loader membaca kunci milik arsitektur modelnya sendiri**, bukan `llama.*`
+  saja, dan menolak model yang bloknya tidak bisa dijalankan dengan alasan yang
+  jelas. Contoh nyata: `models/moe-expert-coder-4b-Q8_0.gguf` adalah model
+  hibrida (`qwen35.ssm.*` — lapisan state-space diselang-seling dengan
+  attention, head_dim 256), dan sekarang gagal saat load dengan
+  `architecture qwen35 interleaves state-space blocks with attention; this
+  engine implements dense attention blocks only`, bukan `MissingMetadata`.
+  Model dense dari keluarga lain (qwen2, llama, mistral) akan termuat selama
+  head_dim ≤ 128.
 - **Batas model 2B ini, dan di mana batasnya.** Pada percakapan yang memuat
   nama pengguna, model kadang menyebut dirinya dengan nama itu ("namaku Budi" →
   "Saya Budi!"), dan pada sebagian percakapan ia membeku mengulang jawaban
