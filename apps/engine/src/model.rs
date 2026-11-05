@@ -226,9 +226,12 @@ fn check_supported(architecture: &str, head_dim: usize) -> Result<(), EngineErro
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ModelDescription {
     pub config: Config,
+    /// The architecture the file declares, so a caller can report what it
+    /// actually loaded instead of assuming every file is llama-shaped.
+    pub architecture: String,
     pub tensors: usize,
     pub quantized_tensors: usize,
     pub weight_bytes: u64,
@@ -603,6 +606,11 @@ impl<'a> Model<'a> {
             }
         }
         ModelDescription {
+            architecture: self
+                .gguf
+                .meta_str("general.architecture")
+                .unwrap_or("llama")
+                .to_string(),
             config: self.config,
             tensors,
             quantized_tensors: quantized,

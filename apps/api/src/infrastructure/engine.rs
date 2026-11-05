@@ -63,7 +63,7 @@ impl LocalChatEngine {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "model".to_string()),
-            architecture: "llama".to_string(),
+            architecture: description.architecture.clone(),
             layers: config.n_layers,
             embedding: config.n_embd,
             feed_forward: config.n_ff,
