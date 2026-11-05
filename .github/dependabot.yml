@@ -1,0 +1,28 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    labels: [dependencies]
+    # Same rationale as the npm half in the other repos: a crate published
+    # minutes ago has not been built by anyone else yet.
+    cooldown:
+      default-days: 3
+    groups:
+      production-dependencies:
+        dependency-type: production
+      development-dependencies:
+        dependency-type: development
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+    cooldown:
+      default-days: 3
+    groups:
+      actions:
+        patterns: ["*"]
