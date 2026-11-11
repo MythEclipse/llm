@@ -14,9 +14,9 @@ llm-engine = { path = "../engine" }
 migration = { path = "../../.migrations" }
 axum = "0.8"
 tokio = { workspace = true }
-sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
-sea-orm-migration = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
-tower-http = { version = "0.6", features = ["fs"] }
+sea-orm = { version = "2.0", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "2.0", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+tower-http = { version = "0.7", features = ["fs"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { workspace = true }

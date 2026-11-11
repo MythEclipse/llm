@@ -8,7 +8,7 @@ license.workspace = true
 memmap2 = "0.9"
 rayon = "1"
 half = "2"
-fancy-regex = "0.16"
+fancy-regex = "0.20"
 tracing = { workspace = true }
 sha2 = { workspace = true }
 
